@@ -1,0 +1,28 @@
+[package]
+name = "rustty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Terminal Linux com render Vulkan e índice de scrollback na NPU Intel"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+fontdue = "0.9.5"
+libc = "0.2.191"
+nix = { version = "0.32.0", features = ["term", "poll", "process", "signal", "fs"] }
+pollster = "1.0.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-width = "0.2.3"
+vte = "0.15.0"
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "vulkan", "wgsl", "parking_lot"] }
+winit = "0.30.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

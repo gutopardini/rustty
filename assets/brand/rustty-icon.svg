@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Rustty — prompt e cursor</title>
+  <defs>
+    <linearGradient id="case" x1="72" y1="42" x2="430" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#303439"/>
+      <stop offset="1" stop-color="#191c20"/>
+    </linearGradient>
+    <linearGradient id="copper" x1="120" y1="142" x2="353" y2="358" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffc29a"/>
+      <stop offset="1" stop-color="#e58b60"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="116" fill="url(#case)"/>
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="none" stroke="#55514e" stroke-width="2"/>
+  <rect x="64" y="64" width="384" height="384" rx="79" fill="#131619"/>
+  <path d="M110 125h292" fill="none" stroke="#34383b" stroke-linecap="round" stroke-width="8"/>
+  <path id="prompt" d="M134 160 259 241c11 7 11 23 0 30l-125 81-22-34 96-62-96-62z" fill="url(#copper)"/>
+  <rect id="cursor" x="277" y="319" width="114" height="36" rx="9" fill="#f0a77d"/>
+</svg>

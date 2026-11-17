@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title">
+  <title id="title">Configurações</title>
+  <defs>
+    <linearGradient id="metal" x1="24" y1="10" x2="69" y2="89" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f2f6f8"/>
+      <stop offset="0.45" stop-color="#b3c0ca"/>
+      <stop offset="1" stop-color="#778691"/>
+    </linearGradient>
+    <mask id="opening">
+      <rect width="96" height="96" fill="white"/>
+      <circle cx="48" cy="48" r="13.5" fill="black"/>
+    </mask>
+  </defs>
+  <path d="M 35.75 18.44 L 39.18 17.24 L 39.27 6.92 L 56.73 6.92 L 56.82 17.24 L 60.25 18.44 L 60.25 18.44 L 63.51 20.01 L 70.87 12.78 L 83.22 25.13 L 75.99 32.49 L 77.56 35.75 L 77.56 35.75 L 78.76 39.18 L 89.08 39.27 L 89.08 56.73 L 78.76 56.82 L 77.56 60.25 L 77.56 60.25 L 75.99 63.51 L 83.22 70.87 L 70.87 83.22 L 63.51 75.99 L 60.25 77.56 L 60.25 77.56 L 56.82 78.76 L 56.73 89.08 L 39.27 89.08 L 39.18 78.76 L 35.75 77.56 L 35.75 77.56 L 32.49 75.99 L 25.13 83.22 L 12.78 70.87 L 20.01 63.51 L 18.44 60.25 L 18.44 60.25 L 17.24 56.82 L 6.92 56.73 L 6.92 39.27 L 17.24 39.18 L 18.44 35.75 L 18.44 35.75 L 20.01 32.49 L 12.78 25.13 L 25.13 12.78 L 32.49 20.01 L 35.75 18.44 Z" transform="translate(0 2)" fill="#000000" opacity=".22" mask="url(#opening)"/>
+  <path d="M 35.75 18.44 L 39.18 17.24 L 39.27 6.92 L 56.73 6.92 L 56.82 17.24 L 60.25 18.44 L 60.25 18.44 L 63.51 20.01 L 70.87 12.78 L 83.22 25.13 L 75.99 32.49 L 77.56 35.75 L 77.56 35.75 L 78.76 39.18 L 89.08 39.27 L 89.08 56.73 L 78.76 56.82 L 77.56 60.25 L 77.56 60.25 L 75.99 63.51 L 83.22 70.87 L 70.87 83.22 L 63.51 75.99 L 60.25 77.56 L 60.25 77.56 L 56.82 78.76 L 56.73 89.08 L 39.27 89.08 L 39.18 78.76 L 35.75 77.56 L 35.75 77.56 L 32.49 75.99 L 25.13 83.22 L 12.78 70.87 L 20.01 63.51 L 18.44 60.25 L 18.44 60.25 L 17.24 56.82 L 6.92 56.73 L 6.92 39.27 L 17.24 39.18 L 18.44 35.75 L 18.44 35.75 L 20.01 32.49 L 12.78 25.13 L 25.13 12.78 L 32.49 20.01 L 35.75 18.44 Z" fill="url(#metal)" stroke="#54616c" stroke-width="2.4" stroke-linejoin="round" mask="url(#opening)"/>
+  <circle cx="48" cy="48" r="19" fill="none" stroke="#667580" stroke-width="2" opacity=".65"/>
+  <path d="M 34.5 48 A 13.5 13.5 0 0 1 61.5 48" fill="none" stroke="#52606b" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M 34.5 49 A 13.5 13.5 0 0 0 61.5 49" fill="none" stroke="#f4f8fa" stroke-width="1.8" stroke-linecap="round" opacity=".7"/>
+</svg>

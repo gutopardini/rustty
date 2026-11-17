@@ -9,10 +9,13 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 fontdue = "0.9.5"
 libc = "0.2.191"
+memchr = "2.8"
 nix = { version = "0.32.0", features = ["term", "poll", "process", "signal", "fs"] }
+png = "0.18.1"
 pollster = "1.0.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

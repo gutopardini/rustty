@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Rustty
+GenericName=Terminal
+GenericName[pt_BR]=Terminal
+Comment=A GPU-accelerated terminal for Linux
+Comment[pt_BR]=Terminal para Linux com renderização acelerada por GPU
+Exec=rustty
+Icon=rustty
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=rustty
+Keywords=terminal;shell;command;console;

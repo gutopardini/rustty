@@ -7,11 +7,26 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::cell::{GlyphRect, GpuCell, Uniforms};
-use crate::color::DEFAULT_BG;
+use crate::color::{Rgb, DEFAULT_BG};
+use crate::confirm::{self, Dialog};
 use crate::font::{Atlas, Face};
 use crate::term::Snapshot;
 
+mod images;
+
+use images::Images;
+
 const MAX_GLYPHS: usize = 8192;
+const BAR_CELLS: usize = 1024;
+const AGENT_PIXELS: &[u8; 64 * 64 * crate::agent::ICON_COUNT as usize * 4] =
+    include_bytes!("../../assets/agents/atlas.rgba");
+
+struct DialogLayer {
+    uniforms: wgpu::Buffer,
+    cells: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    count: u32,
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -19,6 +34,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    images: Option<Images>,
     bind_layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
@@ -27,6 +43,8 @@ pub struct Renderer {
     glyph_buf: wgpu::Buffer,
     atlas_tex: wgpu::Texture,
     atlas_view: wgpu::TextureView,
+    _agent_tex: wgpu::Texture,
+    agent_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     gpu_cells: Vec<GpuCell>,
     cols: u16,
@@ -34,6 +52,20 @@ pub struct Renderer {
     cell_px_w: f32,
     cell_px_h: f32,
     seen_generation: u64,
+    bar_uniform: wgpu::Buffer,
+    bar_cells_buf: wgpu::Buffer,
+    bar_bind: wgpu::BindGroup,
+    bar_gpu: Vec<GpuCell>,
+    bar_count: u32,
+    title_uniform: wgpu::Buffer,
+    title_cells_buf: wgpu::Buffer,
+    title_bind: wgpu::BindGroup,
+    title_gpu: Vec<GpuCell>,
+    title_count: u32,
+    dialog: Option<DialogLayer>,
+    top_h: f32,
+    chrome_h: f32,
+    clear: Rgb,
 }
 
 impl Renderer {
@@ -129,6 +161,16 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -196,6 +238,37 @@ impl Renderer {
             view_formats: &[],
         });
         let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let agent_size = wgpu::Extent3d {
+            width: 64 * crate::agent::ICON_COUNT,
+            height: 64,
+            depth_or_array_layers: 1,
+        };
+        let agent_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("agent-icons"),
+            size: agent_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &agent_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            AGENT_PIXELS,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * crate::agent::ICON_COUNT * 4),
+                rows_per_image: Some(64),
+            },
+            agent_size,
+        );
+        let agent_view = agent_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -214,6 +287,51 @@ impl Renderer {
             &cell_buf,
             &glyph_buf,
             &atlas_view,
+            &agent_view,
+            &sampler,
+        );
+        let bar_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tab-uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bar_cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tab-cells"),
+            size: (BAR_CELLS * std::mem::size_of::<GpuCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bar_bind = make_bind(
+            &device,
+            &bind_layout,
+            &bar_uniform,
+            &bar_cells_buf,
+            &glyph_buf,
+            &atlas_view,
+            &agent_view,
+            &sampler,
+        );
+        let title_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("title-uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let title_cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("title-cells"),
+            size: (BAR_CELLS * std::mem::size_of::<GpuCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let title_bind = make_bind(
+            &device,
+            &bind_layout,
+            &title_uniform,
+            &title_cells_buf,
+            &glyph_buf,
+            &atlas_view,
+            &agent_view,
             &sampler,
         );
         let renderer = Self {
@@ -222,6 +340,7 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            images: None,
             bind_layout,
             bind,
             uniform_buf,
@@ -230,6 +349,8 @@ impl Renderer {
             glyph_buf,
             atlas_tex,
             atlas_view,
+            _agent_tex: agent_tex,
+            agent_view,
             sampler,
             gpu_cells: Vec::new(),
             cols: 0,
@@ -237,9 +358,176 @@ impl Renderer {
             cell_px_w: 1.0,
             cell_px_h: 1.0,
             seen_generation: 0,
+            bar_uniform,
+            bar_cells_buf,
+            bar_bind,
+            bar_gpu: vec![GpuCell { slot: 0, fg: 0, bg: 0, flags: 0 }; BAR_CELLS],
+            bar_count: 0,
+            title_uniform,
+            title_cells_buf,
+            title_bind,
+            title_gpu: vec![GpuCell { slot: 0, fg: 0, bg: 0, flags: 0 }; BAR_CELLS],
+            title_count: 0,
+            dialog: None,
+            top_h: 0.0,
+            chrome_h: 0.0,
+            clear: DEFAULT_BG,
         };
         renderer.clear_atlas();
         Ok(renderer)
+    }
+
+    pub fn set_insets(&mut self, top: f32, bottom: f32) {
+        self.top_h = top.max(0.0);
+        self.chrome_h = bottom.max(0.0);
+    }
+
+    pub fn set_clear(&mut self, color: Rgb) {
+        self.clear = color;
+    }
+
+    pub(crate) fn upload_dialog(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        dialog: Option<&Dialog>,
+    ) {
+        let Some(dialog) = dialog else {
+            self.dialog = None;
+            return;
+        };
+        let cells: Vec<_> = dialog
+            .cells
+            .iter()
+            .map(|cell| resolve(atlas, face, cell))
+            .collect();
+        self.flush_atlas(atlas);
+
+        let layer = self.dialog.get_or_insert_with(|| {
+            let uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("close-dialog-uniforms"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let cells = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("close-dialog-cells"),
+                size: (confirm::MAX_CELLS * std::mem::size_of::<GpuCell>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind = make_bind(
+                &self.device,
+                &self.bind_layout,
+                &uniforms,
+                &cells,
+                &self.glyph_buf,
+                &self.atlas_view,
+                &self.agent_view,
+                &self.sampler,
+            );
+            DialogLayer {
+                uniforms,
+                cells,
+                bind,
+                count: 0,
+            }
+        });
+
+        let surf_w = self.config.width as f32;
+        let cell_w = atlas.cell_w() as f32;
+        let cell_h = atlas.cell_h() as f32;
+        let uniforms = Uniforms {
+            cols: u32::from(dialog.cols),
+            rows: u32::from(dialog.rows),
+            atlas_w: Atlas::SIZE,
+            atlas_h: Atlas::SIZE,
+            pad_x: f32::from(dialog.origin_col) * cell_w,
+            pad_y: self.top_h + f32::from(dialog.origin_row) * cell_h,
+            cell_w,
+            cell_h,
+            surf_w,
+            surf_h: self.config.height as f32,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        self.queue.write_buffer(&layer.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        self.queue.write_buffer(&layer.cells, 0, bytemuck::cast_slice(&cells));
+        layer.count = cells.len() as u32;
+    }
+
+    pub fn stamp(&mut self, atlas: &mut Atlas, face: &Face, col: u16, row: u16, width: u16, cells: &[crate::cell::Cell]) {
+        if self.cols == 0 || width == 0 || self.gpu_cells.is_empty() {
+            return;
+        }
+        let mut dirty = Vec::new();
+        for (index, cell) in cells.iter().enumerate() {
+            let x = usize::from(col) + index % usize::from(width);
+            let y = usize::from(row) + index / usize::from(width);
+            if x >= usize::from(self.cols) || y >= usize::from(self.rows) {
+                continue;
+            }
+            let slot = y * usize::from(self.cols) + x;
+            if slot >= self.gpu_cells.len() {
+                continue;
+            }
+            self.gpu_cells[slot] = resolve(atlas, face, cell);
+            if dirty.last() != Some(&y) {
+                dirty.push(y);
+            }
+        }
+        self.flush_atlas(atlas);
+        for y in dirty {
+            let start = y * usize::from(self.cols);
+            let end = start + usize::from(self.cols);
+            let bytes = bytemuck::cast_slice(&self.gpu_cells[start..end]);
+            self.queue.write_buffer(
+                &self.cell_buf,
+                (start * std::mem::size_of::<GpuCell>()) as u64,
+                bytes,
+            );
+        }
+    }
+
+    pub fn upload_bar(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: crate::color::Rgb) {
+        self.cell_px_w = atlas.cell_w() as f32;
+        self.cell_px_h = atlas.cell_h() as f32;
+        let count = cells.len().min(self.bar_gpu.len());
+        for (index, cell) in cells.iter().take(count).enumerate() {
+            self.bar_gpu[index] = resolve(atlas, face, cell);
+        }
+        if count > 0 {
+            self.queue.write_buffer(
+                &self.bar_cells_buf,
+                0,
+                bytemuck::cast_slice(&self.bar_gpu[..count]),
+            );
+        }
+        self.flush_atlas(atlas);
+        self.bar_count = count as u32;
+        let uniform = self.bar_uniform.clone();
+        let pad_y = (self.config.height as f32 - self.chrome_h).max(0.0);
+        self.write_strip_uniforms(&uniform, self.bar_count.max(1), pad_y, self.chrome_h, strip.pack());
+    }
+
+    pub fn upload_title(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell]) {
+        self.cell_px_w = atlas.cell_w() as f32;
+        self.cell_px_h = atlas.cell_h() as f32;
+        let count = cells.len().min(self.title_gpu.len());
+        for (index, cell) in cells.iter().take(count).enumerate() {
+            self.title_gpu[index] = resolve(atlas, face, cell);
+        }
+        if count > 0 {
+            self.queue.write_buffer(
+                &self.title_cells_buf,
+                0,
+                bytemuck::cast_slice(&self.title_gpu[..count]),
+            );
+        }
+        self.flush_atlas(atlas);
+        self.title_count = count as u32;
+        let uniform = self.title_uniform.clone();
+        let height = self.top_h;
+        self.write_strip_uniforms(&uniform, self.title_count.max(1), 0.0, height, 0);
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -251,7 +539,14 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn upload(&mut self, atlas: &mut Atlas, face: &Face, snap: &Snapshot) {
+    pub fn upload(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        snap: &Snapshot,
+        composer: Option<[u16; 4]>,
+        accent: Rgb,
+    ) {
         if snap.cols == 0 || snap.rows == 0 {
             return;
         }
@@ -295,10 +590,16 @@ impl Renderer {
             }
             self.flush_atlas(atlas);
         }
-        self.write_uniforms(snap);
+        let grid = self.write_uniforms(snap, composer, accent);
+        if !snap.images.is_empty() {
+            self.images.get_or_insert_with(|| Images::new(&self.device, self.config.format));
+        }
+        if let Some(images) = &mut self.images {
+            images.upload(&self.device, &self.queue, &grid, &snap.images);
+        }
     }
 
-    pub fn render(&mut self) -> anyhow::Result<()> {
+    pub fn render(&mut self, show_images: bool) -> anyhow::Result<()> {
         let count = u32::from(self.cols) * u32::from(self.rows);
         if count == 0 {
             return Ok(());
@@ -327,9 +628,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(DEFAULT_BG.r) / 255.0,
-                            g: f64::from(DEFAULT_BG.g) / 255.0,
-                            b: f64::from(DEFAULT_BG.b) / 255.0,
+                            r: f64::from(self.clear.r) / 255.0,
+                            g: f64::from(self.clear.g) / 255.0,
+                            b: f64::from(self.clear.b) / 255.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -341,8 +642,25 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind, &[]);
-            pass.draw(0..6, 0..count);
+            if self.title_count > 0 {
+                pass.set_bind_group(0, &self.title_bind, &[]);
+                pass.draw(0..6, 0..self.title_count);
+            }
+            if self.bar_count > 0 {
+                pass.set_bind_group(0, &self.bar_bind, &[]);
+                pass.draw(0..6, 0..self.bar_count);
+            }
+            if count > 0 {
+                pass.set_bind_group(0, &self.bind, &[]);
+                pass.draw(0..6, 0..count);
+            }
+            if show_images && let Some(images) = &self.images {
+                images.draw(&mut pass);
+            }
+            if let Some(dialog) = &self.dialog {
+                pass.set_bind_group(0, &dialog.bind, &[]);
+                pass.draw(0..6, 0..dialog.count);
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
@@ -369,7 +687,7 @@ impl Renderer {
         self.rows = rows;
     }
 
-    fn write_uniforms(&self, snap: &Snapshot) {
+    fn write_uniforms(&self, snap: &Snapshot, composer: Option<[u16; 4]>, accent: Rgb) -> Uniforms {
         let (cursor_col, cursor_row, cursor_on) = match snap.cursor {
             Some((col, row)) => (u32::from(col), u32::from(row), 1),
             None => (0, 0, 0),
@@ -378,8 +696,6 @@ impl Renderer {
         let cell_h = self.cell_px_h.max(1.0);
         let surf_w = self.config.width as f32;
         let surf_h = self.config.height as f32;
-        let grid_w = f32::from(snap.cols) * cell_w;
-        let grid_h = f32::from(snap.rows) * cell_h;
         let uniforms = Uniforms {
             cols: u32::from(snap.cols),
             rows: u32::from(snap.rows),
@@ -389,16 +705,50 @@ impl Renderer {
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
             _reserved: 0,
-            pad_x: ((surf_w - grid_w) * 0.5).max(0.0),
-            pad_y: ((surf_h - grid_h) * 0.5).max(0.0),
+            // A topbar e a faixa de abas começam em x=0. Centralizar a grade
+            // empurra a rolagem para depois do fim da topbar.
+            pad_x: 0.0,
+            pad_y: self.top_h,
             cell_w,
             cell_h,
             surf_w,
             surf_h,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            scroll_top: snap.scroll_top,
+            scroll_h: snap.scroll_h,
+            composer: composer.map_or([0; 4], |bounds| bounds.map(u32::from)),
+            composer_accent: accent.pack(),
+            _composer_padding: [0; 3],
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        uniforms
+    }
+
+    fn write_strip_uniforms(&self, buf: &wgpu::Buffer, cols: u32, pad_y: f32, strip_h: f32, strip: u32) {
+        let cell_w = self.cell_px_w.max(1.0);
+        let glyph_h = self.cell_px_h.max(1.0);
+        let cell_h = strip_h.max(glyph_h);
+        let uniforms = Uniforms {
+            cols,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_on: 0,
+            atlas_w: Atlas::SIZE,
+            atlas_h: Atlas::SIZE,
+            _reserved: glyph_h.round() as u32,
+            pad_x: 0.0,
+            pad_y,
+            cell_w,
+            cell_h,
+            surf_w: self.config.width as f32,
+            surf_h: self.config.height as f32,
+            scroll_top: 0.0,
+            scroll_h: 0.0,
+            composer: [0; 4],
+            composer_accent: strip,
+            _composer_padding: [0; 3],
+        };
+        self.queue.write_buffer(buf, 0, bytemuck::bytes_of(&uniforms));
     }
 
     fn flush_atlas(&mut self, atlas: &mut Atlas) {
@@ -469,6 +819,7 @@ impl Renderer {
             &self.cell_buf,
             &self.glyph_buf,
             &self.atlas_view,
+            &self.agent_view,
             &self.sampler,
         );
     }
@@ -477,6 +828,8 @@ impl Renderer {
 fn resolve(atlas: &mut Atlas, face: &Face, cell: &crate::cell::Cell) -> GpuCell {
     let slot = if cell.flags & crate::cell::SPACER != 0 {
         0
+    } else if cell.flags & crate::cell::AGENT_ICON != 0 {
+        cell.cp.saturating_sub(crate::agent::ICON_BASE).min(crate::agent::ICON_COUNT - 1)
     } else {
         atlas.prepare(face, cell.cp, cell.flags)
     };
@@ -523,6 +876,7 @@ fn make_bind(
     cell_buf: &wgpu::Buffer,
     glyph_buf: &wgpu::Buffer,
     atlas_view: &wgpu::TextureView,
+    agent_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -549,6 +903,23 @@ fn make_bind(
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(agent_view),
+            },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tab_shader_is_valid_wgsl() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("shader.wgsl")).expect("shader");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator.validate(&module).expect("shader válido");
+    }
 }

@@ -18,6 +18,112 @@ impl Rgb {
 
 pub const DEFAULT_FG: Rgb = Rgb::new(0xe6, 0xe6, 0xe6);
 pub const DEFAULT_BG: Rgb = Rgb::new(0x12, 0x14, 0x1a);
+const DANGER_DARK: Rgb = Rgb::new(0xf6, 0xa3, 0x9a);
+const DANGER_LIGHT: Rgb = Rgb::new(0xa7, 0x36, 0x3d);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub bar: Rgb,
+    pub tab: Rgb,
+    pub tab_fg: Rgb,
+    pub panel: Rgb,
+    pub muted: Rgb,
+    pub accent: Rgb,
+    pub danger: Rgb,
+}
+
+pub const THEMES: &[Theme] = &[
+    Theme {
+        id: "rustty",
+        name: "Rustty",
+        fg: Rgb::new(0xed, 0xea, 0xe4),
+        bg: Rgb::new(0x13, 0x16, 0x19),
+        bar: Rgb::new(0x1b, 0x1e, 0x22),
+        tab: Rgb::new(0x25, 0x2a, 0x2e),
+        tab_fg: Rgb::new(0xb6, 0xb8, 0xbb),
+        panel: Rgb::new(0x25, 0x2a, 0x2e),
+        muted: Rgb::new(0xb6, 0xb8, 0xbb),
+        accent: Rgb::new(0xf0, 0xa7, 0x7d),
+        danger: DANGER_DARK,
+    },
+    Theme {
+        id: "noite",
+        name: "Noite",
+        fg: DEFAULT_FG,
+        bg: DEFAULT_BG,
+        bar: Rgb::new(0x10, 0x12, 0x16),
+        tab: Rgb::new(0x2a, 0x2e, 0x3a),
+        tab_fg: Rgb::new(0x9a, 0xa0, 0xb4),
+        panel: Rgb::new(0x1c, 0x20, 0x2c),
+        muted: Rgb::new(0x8b, 0x93, 0xa7),
+        accent: Rgb::new(0x7a, 0xa2, 0xf7),
+        danger: DANGER_DARK,
+    },
+    Theme {
+        id: "tinta",
+        name: "Tinta",
+        fg: Rgb::new(0xf2, 0xf2, 0xf2),
+        bg: Rgb::new(0x0c, 0x0c, 0x0c),
+        bar: Rgb::new(0x08, 0x08, 0x08),
+        tab: Rgb::new(0x24, 0x24, 0x24),
+        tab_fg: Rgb::new(0xa3, 0xa3, 0xa3),
+        panel: Rgb::new(0x16, 0x16, 0x16),
+        muted: Rgb::new(0x8a, 0x8a, 0x8a),
+        accent: Rgb::new(0xe8, 0xe8, 0xe8),
+        danger: DANGER_DARK,
+    },
+    Theme {
+        id: "papel",
+        name: "Papel",
+        fg: Rgb::new(0x1c, 0x1e, 0x24),
+        bg: Rgb::new(0xf4, 0xf1, 0xea),
+        bar: Rgb::new(0xe7, 0xe2, 0xd8),
+        tab: Rgb::new(0xd9, 0xd3, 0xc7),
+        tab_fg: Rgb::new(0x5c, 0x57, 0x4e),
+        panel: Rgb::new(0xfb, 0xf9, 0xf4),
+        muted: Rgb::new(0x6e, 0x67, 0x5c),
+        accent: Rgb::new(0x3d, 0x5a, 0x80),
+        danger: DANGER_LIGHT,
+    },
+    Theme {
+        id: "ambar",
+        name: "Âmbar",
+        fg: Rgb::new(0xe6, 0xb1, 0x5a),
+        bg: Rgb::new(0x14, 0x0e, 0x08),
+        bar: Rgb::new(0x10, 0x0c, 0x06),
+        tab: Rgb::new(0x2a, 0x1c, 0x10),
+        tab_fg: Rgb::new(0xa8, 0x84, 0x4a),
+        panel: Rgb::new(0x1c, 0x14, 0x0c),
+        muted: Rgb::new(0x8a, 0x6a, 0x3a),
+        accent: Rgb::new(0xf0, 0xc1, 0x4d),
+        danger: DANGER_DARK,
+    },
+    Theme {
+        id: "mar",
+        name: "Mar",
+        fg: Rgb::new(0xc6, 0xe4, 0xe0),
+        bg: Rgb::new(0x0c, 0x16, 0x18),
+        bar: Rgb::new(0x08, 0x12, 0x14),
+        tab: Rgb::new(0x16, 0x30, 0x33),
+        tab_fg: Rgb::new(0x7e, 0xa8, 0xa4),
+        panel: Rgb::new(0x10, 0x22, 0x26),
+        muted: Rgb::new(0x6d, 0x8f, 0x8c),
+        accent: Rgb::new(0x5f, 0xd0, 0xd0),
+        danger: DANGER_DARK,
+    },
+];
+
+pub fn theme(index: usize) -> Theme {
+    THEMES[index.min(THEMES.len() - 1)]
+}
+
+pub fn theme_index(id: &str) -> usize {
+    THEMES.iter().position(|theme| theme.id == id).unwrap_or(0)
+}
 
 const ANSI: [Rgb; 16] = [
     Rgb::new(0x1c, 0x1c, 0x1c),
@@ -70,5 +176,13 @@ mod tests {
         assert_eq!(indexed(16), Rgb::new(0, 0, 0));
         let last = indexed(231);
         assert!(last.r > 200 && last.g > 200 && last.b > 200);
+    }
+
+    #[test]
+    fn branded_default_keeps_existing_theme_ids() {
+        assert_eq!(theme(0).id, "rustty");
+        for id in ["noite", "tinta", "papel", "ambar", "mar"] {
+            assert_eq!(theme(theme_index(id)).id, id);
+        }
     }
 }

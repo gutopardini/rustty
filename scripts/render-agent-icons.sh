@@ -28,7 +28,7 @@ with TemporaryDirectory(prefix="rustty-icons-") as tmp:
             path = raster
         icon = Image.open(path).convert("RGBA")
         if name == "codex":
-            # A versão escura oficial precisa de uma superfície clara no tema escuro.
+            # The official dark version needs a light surface on the dark theme.
             tile = Image.new("RGBA", (56, 56))
             ImageDraw.Draw(tile).rounded_rectangle((0, 0, 55, 55), radius=10, fill="#edeae4")
             icon.thumbnail((48, 48), Image.Resampling.LANCZOS)

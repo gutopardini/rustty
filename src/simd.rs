@@ -23,8 +23,9 @@ fn hash_words(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Hash estável de uma linha. O caminho AVX2 carrega 32 bytes por iteração
-/// e reduz na mesma ordem do escalar, para o índice da NPU não depender da CPU.
+/// Stable hash of one line. The AVX2 path loads 32 bytes per iteration and
+/// reduces in the same order as the scalar path, so the NPU index does not
+/// depend on the CPU.
 pub fn hash_cells(cells: &[Cell]) -> u64 {
     let bytes: &[u8] = bytemuck::cast_slice(cells);
     if is_x86_feature_detected!("avx2") {

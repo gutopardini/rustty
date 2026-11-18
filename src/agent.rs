@@ -1,4 +1,4 @@
-//! Identifica o programa em primeiro plano de cada PTY, sem depender do título OSC.
+//! Identifies the foreground program of each PTY, without depending on the OSC title.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -24,7 +24,7 @@ impl Agent {
     }
 }
 
-/// Inspeciona apenas o grupo de processos que tem o controle do terminal.
+/// Inspects only the process group that owns the terminal.
 pub fn foreground(group: i32, shell: i32) -> Option<Agent> {
     if group <= 0 {
         return None;
@@ -52,8 +52,8 @@ fn foreground_in(proc_root: &Path, group: i32, shell: i32) -> Option<Agent> {
             queue.extend(children.split_whitespace().filter_map(|pid| pid.parse::<i32>().ok()));
         }
     }
-    // Um agente pode entregar temporariamente o PTY a um subprocesso em outro
-    // grupo. Só aceitamos ancestrais se a cadeia alcançar o shell desta aba.
+    // An agent can hand the PTY to a subprocess in another group for a moment.
+    // Ancestors count only when the chain reaches this tab's shell.
     let mut current = group;
     let mut ancestor_agent = None;
     for _ in 0..32 {
@@ -82,7 +82,7 @@ fn identify_process(path: &Path) -> Option<Agent> {
 
 fn stat_field(path: &Path, field: usize) -> Option<i32> {
     let stat = std::fs::read_to_string(path.join("stat")).ok()?;
-    // O nome entre parênteses pode conter espaços e até parênteses.
+    // The name in parentheses can contain spaces and further parentheses.
     stat.rsplit_once(')')?.1.split_whitespace().nth(field)?.parse().ok()
 }
 
@@ -121,7 +121,7 @@ fn identify(command: &[u8], exe: Option<&Path>) -> Option<Agent> {
     if name == "agent" && (cursor_binary || args.iter().skip(1).any(|arg| arg.contains("/cursor-agent/"))) {
         return Some(Agent::Cursor);
     }
-    // Alguns instaladores usam Node ou shell para chamar o arquivo real.
+    // Some installers use Node or a shell to launch the real file.
     if matches!(name, "node" | "nodejs" | "bun" | "bash" | "sh") {
         for arg in args.iter().skip(1).take(5).filter(|arg| arg.contains('/')) {
             let lower = arg.to_ascii_lowercase();

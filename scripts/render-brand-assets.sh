@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 icon="$root/assets/brand/rustty-icon.svg"
 
-# Os SVGs do ícone e do nome são as fontes; as assinaturas combinam os dois.
+# The icon and wordmark SVGs are the sources; the lockups combine the two.
 python3 - "$root" <<'PY'
 import copy
 import sys
@@ -21,12 +21,12 @@ word = ET.parse(brand / "rustty-wordmark.svg").getroot()
 prompt = icon.find(f"{{{svg}}}path[@id='prompt']")
 cursor = icon.find(f"{{{svg}}}rect[@id='cursor']")
 if prompt is None or cursor is None:
-    raise SystemExit("O ícone precisa dos elementos prompt e cursor")
+    raise SystemExit("The icon needs the prompt and cursor elements")
 mark = ET.Element(f"{{{svg}}}svg", {
     "width": "320", "height": "220", "viewBox": "96 146 310 220",
     "role": "img", "aria-labelledby": "title",
 })
-ET.SubElement(mark, f"{{{svg}}}title", {"id": "title"}).text = "Rustty — símbolo"
+ET.SubElement(mark, f"{{{svg}}}title", {"id": "title"}).text = "Rustty mark"
 for original in (prompt, cursor):
     shape = copy.deepcopy(original)
     shape.attrib.pop("id", None)
@@ -56,6 +56,6 @@ for filename, color in [("rustty-lockup.svg", "#edeae4"), ("rustty-lockup-light.
     ET.ElementTree(logo).write(brand / filename, encoding="unicode", xml_declaration=True)
 PY
 
-# O RGBA é incorporado ao binário para o ícone no X11.
+# The RGBA is embedded in the binary for the X11 icon.
 magick -background none -density 144 "$icon" -resize 512x512 -strip PNG32:"$root/assets/brand/rustty-icon.png"
 magick -background none -density 144 "$icon" -resize 64x64 -depth 8 RGBA:"$root/assets/brand/rustty-window.rgba"

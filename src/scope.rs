@@ -1,4 +1,4 @@
-//! Coloca cada shell em um scope de usuário próprio, quando há systemd.
+//! Puts each shell in its own user scope when systemd is available.
 
 use std::io;
 use std::path::Path;
@@ -14,7 +14,7 @@ pub(crate) fn enabled() -> bool {
         && Path::new("/run/systemd/system").is_dir()
 }
 
-/// O filho ainda está bloqueado antes de executar o shell, sem descendentes.
+/// The child is still blocked before exec, with no descendants.
 pub(crate) fn separate(pid: i32) -> io::Result<()> {
     let serial = NEXT_SCOPE.fetch_add(1, Ordering::Relaxed);
     let unit = format!("rustty-{}-{pid}-{serial}.scope", std::process::id());
@@ -35,7 +35,7 @@ pub(crate) fn separate(pid: i32) -> io::Result<()> {
             "2",
             "Description",
             "s",
-            "Sessão de terminal Rustty",
+            "Rustty terminal session",
             "PIDs",
             "au",
             "1",
@@ -51,7 +51,7 @@ pub(crate) fn separate(pid: i32) -> io::Result<()> {
         match request.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return Err(io::Error::other("systemd recusou o scope da aba"));
+                    return Err(io::Error::other("systemd refused the tab scope"));
                 }
                 break;
             }
@@ -70,7 +70,7 @@ pub(crate) fn separate(pid: i32) -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    // A chamada retorna quando o job é enfileirado; aguarde a migração real.
+    // The call returns when the job is queued; wait for the real migration.
     let cgroup_path = format!("/proc/{pid}/cgroup");
     loop {
         let cgroup = std::fs::read_to_string(&cgroup_path)?;
@@ -78,7 +78,7 @@ pub(crate) fn separate(pid: i32) -> io::Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "scope não foi aplicado a tempo"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "scope was not applied in time"));
         }
         std::thread::sleep(Duration::from_millis(5));
     }

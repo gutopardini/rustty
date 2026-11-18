@@ -1,17 +1,18 @@
-//! Rustty é um terminal Linux escrito do zero.
+//! Rustty is a performance-focused CLI for LLMs.
 //!
-//! O desenho segue metas de terminais acelerados por GPU: cache de glifos em
-//! VRAM, parser fora do caminho de apresentação e upload só das linhas que
-//! mudaram.
+//! The terminal is written in Rust. The cell grid is drawn on the GPU: glyphs
+//! stay in VRAM, the parser stays off the present path, and only dirty rows
+//! are uploaded. Scrollback is staged for the Intel NPU.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("Rustty só compila em Linux");
+compile_error!("Rustty builds on Linux only");
 
 pub mod agent;
 pub mod app;
 pub mod cell;
+mod clipboard;
 pub mod color;
 pub mod confirm;
 pub mod font;

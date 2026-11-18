@@ -3,7 +3,7 @@ name = "rustty"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Terminal Linux com render Vulkan e índice de scrollback na NPU Intel"
+description = "Performance-focused terminal for LLM CLIs, rendered on the GPU in Rust, with NPU plans"
 readme = "README.md"
 publish = false
 

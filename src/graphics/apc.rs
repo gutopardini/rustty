@@ -2,7 +2,7 @@ use memchr::{memchr3, memmem};
 
 use crate::term::Term;
 
-// Cada APC carrega no máximo 4096 bytes de imagem. Reserve espaço para os parâmetros.
+// Each APC carries at most 4096 bytes of image data. Leave room for the parameters.
 const MAX_APC: usize = 4096 + 256;
 const ESC: u8 = 0x1b;
 
@@ -24,8 +24,13 @@ enum State {
 }
 
 impl Parser {
-    // vte descarta o conteúdo dos APCs. Intercepte seu payload mantendo o estado VT ao redor.
-    pub(crate) fn advance(&mut self, term: &mut Term, mut bytes: &[u8]) {
+    /// Feed `bytes`. A completed Kitty graphics command is returned so the image can be
+    /// decoded without holding the terminal lock across the rest of the stream.
+    pub(crate) fn advance<'a>(
+        &mut self,
+        term: &mut Term,
+        mut bytes: &'a [u8],
+    ) -> (&'a [u8], Option<Vec<u8>>) {
         while !bytes.is_empty() {
             match self.state {
                 State::Text => {
@@ -34,6 +39,7 @@ impl Parser {
                         if bytes.last() == Some(&ESC) {
                             self.state = State::Escape;
                         }
+                        bytes = &[];
                         break;
                     };
                     self.vte.advance(term, &bytes[..start + 2]);
@@ -77,13 +83,16 @@ impl Parser {
                         if !self.overflow
                             && let Some(command) = self.apc.strip_prefix(b"G")
                         {
-                            term.graphics_command(command);
+                            let command = command.to_vec();
+                            self.clear_apc();
+                            return (bytes, Some(command));
                         }
                     }
                     self.clear_apc();
                 }
             }
         }
+        (bytes, None)
     }
 
     fn clear_apc(&mut self) {

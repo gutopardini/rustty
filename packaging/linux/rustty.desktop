@@ -2,9 +2,7 @@
 Type=Application
 Name=Rustty
 GenericName=Terminal
-GenericName[pt_BR]=Terminal
-Comment=A GPU-accelerated terminal for Linux
-Comment[pt_BR]=Terminal para Linux com renderização acelerada por GPU
+Comment=Performance-focused terminal for LLM CLIs
 Exec=rustty
 Icon=rustty
 Terminal=false

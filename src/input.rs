@@ -2,7 +2,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
-/// Bytes que vão para o PTY, ou uma ação local de scrollback.
+/// Bytes for the PTY, or a local scrollback action.
 #[derive(Debug)]
 pub enum Input {
     Bytes(Vec<u8>),
@@ -12,6 +12,8 @@ pub enum Input {
     NextTab,
     PrevTab,
     GotoTab(usize),
+    Copy,
+    Paste,
 }
 
 pub fn encode(event: &KeyEvent, mods: ModifiersState, app_cursor: bool, rows: u16) -> Option<Input> {
@@ -55,6 +57,15 @@ pub fn encode_parts(
     }
 
     if ctrl && !alt {
+        if shift {
+            if let Some(ch) = key_char(plain).or_else(|| key_char(logical)) {
+                match ch.to_ascii_lowercase() {
+                    'c' => return Some(Input::Copy),
+                    'v' => return Some(Input::Paste),
+                    _ => {}
+                }
+            }
+        }
         if let Some(action) = tab_action(logical, plain, shift) {
             return Some(action);
         }
@@ -179,7 +190,7 @@ fn function_key(logical: &Key, ctrl: bool, alt: bool, shift: bool, app_cursor: b
     };
     let param = modifier_param(ctrl, alt, shift);
     let bytes = match named {
-        // Ctrl+Enter e Shift+Enter descem uma linha sem enviar o prompt. Enter sozinho continua sendo CR.
+        // Ctrl+Enter and Shift+Enter insert a newline without submitting the prompt. Enter alone stays CR.
         NamedKey::Enter if ctrl || shift => b"\x1b\r".to_vec(),
         NamedKey::Enter => b"\r".to_vec(),
         NamedKey::Tab if shift && !ctrl => b"\x1b[Z".to_vec(),
@@ -285,6 +296,15 @@ mod tests {
             other => other.clone(),
         };
         encode_parts(&logical, text, modified, &plain, ElementState::Pressed, mods, false, 40)
+    }
+
+    #[test]
+    fn ctrl_shift_c_copies_and_v_pastes() {
+        let copy = Key::Character("c".into());
+        let paste = Key::Character("v".into());
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(matches!(press(copy, Some("\u{3}"), Some("\u{3}"), mods), Some(Input::Copy)));
+        assert!(matches!(press(paste, None, None, mods), Some(Input::Paste)));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! Raster FreeType para glifos de símbolo. O fontdue preenche contornos
-//! sobrepostos da Nerd Font com furos; o FreeType desenha o ícone inteiro.
+//! FreeType raster for symbol glyphs. fontdue fills overlapping Nerd Font
+//! contours with holes; FreeType draws the whole icon.
 
 use std::ffi::c_void;
 

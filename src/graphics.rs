@@ -48,6 +48,24 @@ pub(crate) enum Update {
     MoveCursor { cols: u16, rows: u16 },
 }
 
+pub(crate) enum Prepared {
+    Update(Update),
+    Decode(DecodeJob),
+}
+
+pub(crate) struct DecodeJob {
+    command: Command,
+    encoded: Vec<u8>,
+    row: u16,
+    col: u16,
+}
+
+impl DecodeJob {
+    pub(crate) fn id(&self) -> u32 {
+        self.command.id
+    }
+}
+
 impl Graphics {
     pub(crate) fn command(
         &mut self,
@@ -55,11 +73,11 @@ impl Graphics {
         row: u16,
         col: u16,
         replies: &mut Vec<u8>,
-    ) -> Update {
+    ) -> Prepared {
         let pending = self.upload.take();
         let mut parts = data.splitn(2, |byte| *byte == b';');
         let Some(command) = Command::parse(parts.next().unwrap_or_default()) else {
-            return Update::Unchanged;
+            return Prepared::Update(Update::Unchanged);
         };
         let payload = parts.next().unwrap_or_default();
 
@@ -73,16 +91,16 @@ impl Graphics {
                 }
                 _ => {}
             }
-            return if self.placements.len() == old_len {
+            return Prepared::Update(if self.placements.len() == old_len {
                 Update::Unchanged
             } else {
                 Update::Changed
-            };
+            });
         }
 
         let mut upload = if command.continuation {
             let Some(mut pending) = pending else {
-                return Update::Unchanged;
+                return Prepared::Update(Update::Unchanged);
             };
             if command.quiet.is_some() {
                 pending.command.quiet = command.quiet;
@@ -90,11 +108,11 @@ impl Graphics {
             pending
         } else {
             if !matches!(command.action, b'T' | b'q') {
-                return Update::Unchanged;
+                return Prepared::Update(Update::Unchanged);
             }
             if command.medium != b'd' {
                 command.reply(replies, "EINVAL:unsupported transmission medium");
-                return Update::Unchanged;
+                return Prepared::Update(Update::Unchanged);
             }
             Upload {
                 command,
@@ -106,16 +124,25 @@ impl Graphics {
             upload
                 .command
                 .reply(replies, "EFBIG:image payload exceeds limit");
-            return Update::Unchanged;
+            return Prepared::Update(Update::Unchanged);
         }
         upload.encoded.extend_from_slice(payload);
         if command.more {
             self.upload = Some(upload);
-            return Update::Unchanged;
+            return Prepared::Update(Update::Unchanged);
         }
 
-        let command = upload.command;
-        let Some(image) = decode(&command, &upload.encoded) else {
+        Prepared::Decode(DecodeJob {
+            command: upload.command,
+            encoded: upload.encoded,
+            row,
+            col,
+        })
+    }
+
+    pub(crate) fn finish(&mut self, job: DecodeJob, image: Option<Image>, replies: &mut Vec<u8>) -> Update {
+        let DecodeJob { command, row, col, .. } = job;
+        let Some(image) = image else {
             command.reply(replies, "EINVAL:invalid or unsupported image");
             return Update::Unchanged;
         };
@@ -248,6 +275,10 @@ impl Command {
     }
 }
 
+pub(crate) fn decode_job(job: &DecodeJob) -> Option<Image> {
+    decode(&job.command, &job.encoded)
+}
+
 fn decode(command: &Command, encoded: &[u8]) -> Option<Image> {
     let bytes = STANDARD.decode(encoded).ok()?;
     if command.format == 100 {
@@ -361,6 +392,39 @@ mod tests {
             assert_eq!(snap.cursor, Some((4, 1)));
             assert!(term.take_replies().is_empty());
         }
+    }
+
+    #[test]
+    fn codex_pet_frame_lands_on_the_saved_cursor_and_replaces_by_id() {
+        let rgba = [255, 96, 0, 128];
+        let mut png = Vec::new();
+        let mut encoder = png::Encoder::new(&mut png, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&rgba)
+            .unwrap();
+        let encoded = STANDARD.encode(png);
+        let frame = format!(
+            "\x1b_Ga=d,d=I,i=49374,q=2;\x1b\\\x1b7\x1b[4;3H\x1b_Ga=T,t=d,f=100,c=4,r=5,q=2,i=49374,m=0,C=1;{encoded}\x1b\\\x1b8"
+        );
+
+        let mut term = Term::new(20, 8);
+        term.advance(b"\x1b[2;5H");
+        term.advance(frame.as_bytes());
+        let snap = term.snapshot();
+        assert!(term.take_replies().is_empty());
+        assert_eq!(snap.cursor, Some((4, 1)));
+        let [image] = snap.images.as_slice() else {
+            panic!("expected the pet sprite");
+        };
+        assert_eq!((image.col, image.row), (2, 3));
+        assert_eq!((image.cols, image.rows), (4, 5));
+        assert_eq!(image.image.rgba, rgba);
+
+        term.advance(b"\x1b_Ga=d,d=I,i=49374,q=2;\x1b\\");
+        assert!(term.snapshot().images.is_empty());
     }
 
     #[test]

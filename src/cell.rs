@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-/// Célula da grade. 16 bytes, alinhada para upload e hash SIMD.
+/// Grid cell. 16 bytes, aligned for upload and SIMD hashing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Cell {
@@ -17,19 +17,19 @@ pub const WIDE: u32 = 1 << 3;
 pub const SPACER: u32 = 1 << 4;
 pub const ITALIC: u32 = 1 << 5;
 pub const DIM: u32 = 1 << 6;
-/// Célula interna da barra: índice de um ícone RGBA, não um caractere Unicode.
+/// Interior cell of the bar: an RGBA icon index, not a Unicode character.
 pub const AGENT_ICON: u32 = 1 << 7;
-/// Ícone de interface que ocupa quatro colunas na barra.
+/// Interface icon that occupies four columns in the bar.
 pub const QUAD: u32 = 1 << 8;
-/// Célula de botão com altura de duas linhas e glifo centralizado.
+/// Button cell, two rows tall, with a centered glyph.
 pub const TALL: u32 = 1 << 9;
-/// Corpo de uma aba. O shader desenha o retângulo arredondado.
+/// Body of a tab. The shader draws the rounded rectangle.
 pub const TAB: u32 = 1 << 10;
-/// Aba ativa: o topo fica reto e encosta no fundo do terminal.
+/// Active tab: the top stays square and meets the terminal background.
 pub const TAB_ACTIVE: u32 = 1 << 13;
-/// Células até a ponta esquerda, 4 bits.
+/// Cells to the left end, 4 bits.
 pub const TAB_FROM_LEFT_SHIFT: u32 = 14;
-/// Células até a ponta direita, 4 bits.
+/// Cells to the right end, 4 bits.
 pub const TAB_FROM_RIGHT_SHIFT: u32 = 18;
 
 impl Cell {
@@ -47,7 +47,7 @@ impl Cell {
     }
 }
 
-/// Célula já resolvida para a GPU: `slot` é o índice no atlas.
+/// Cell resolved for the GPU: `slot` is the atlas index.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuCell {
@@ -87,5 +87,15 @@ pub struct Uniforms {
     pub scroll_h: f32,
     pub composer: [u32; 4],
     pub composer_accent: u32,
-    pub _composer_padding: [u32; 3],
+    pub fill_bg: u32,
+    pub scroll_left: f32,
+    pub scroll_right: f32,
+    /// First selected cell, inclusive. Equal to `sel_hi` when nothing is selected.
+    pub sel_lo: u32,
+    /// One past the last selected cell.
+    pub sel_hi: u32,
+    pub _sel_pad0: u32,
+    pub _sel_pad1: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<Uniforms>() % 16 == 0);

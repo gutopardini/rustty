@@ -1,4 +1,4 @@
-//! Painel de aparência e o arquivo que guarda a escolha.
+//! Appearance panel and the file that stores the choice.
 
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ pub struct Ui {
     pub style: usize,
     pub fonts: Vec<FontChoice>,
     pub font: usize,
-    /// Diretório em que cada aba nova abre o shell.
+    /// Directory where each new tab starts its shell.
     pub cwd: Option<PathBuf>,
 }
 
@@ -74,7 +74,7 @@ impl Ui {
             font
         );
         if let Err(err) = std::fs::write(&path, text) {
-            tracing::warn!(%err, path = %path.display(), "não gravei a aparência");
+            tracing::warn!(%err, path = %path.display(), "appearance was not saved");
         }
     }
 
@@ -175,12 +175,12 @@ pub fn render_panel(grid_cols: u16, grid_rows: u16, theme: Theme, font_name: &st
     let mut zones = Vec::new();
     let width = usize::from(cols);
 
-    paint(&mut cells, width, 0, 1, "Aparência", theme.fg.pack(), theme.panel.pack(), 0);
+    paint(&mut cells, width, 0, 1, "Appearance", theme.fg.pack(), theme.panel.pack(), 0);
     let close_col = cols - 2;
     put(&mut cells, width, close_col, 0, '×', theme.muted.pack(), theme.panel.pack(), 0);
     zones.push(Zone { col: close_col, end: cols, row: 0, action: PanelHit::Close });
 
-    paint(&mut cells, width, 2, 1, "Fonte", theme.muted.pack(), theme.panel.pack(), 0);
+    paint(&mut cells, width, 2, 1, "Font", theme.muted.pack(), theme.panel.pack(), 0);
     paint(&mut cells, width, 3, 1, "[<]", theme.accent.pack(), theme.panel.pack(), 0);
     paint(&mut cells, width, 3, cols - 4, "[>]", theme.accent.pack(), theme.panel.pack(), 0);
     let fitted = fit(font_name, usize::from(cols).saturating_sub(10));
@@ -190,13 +190,13 @@ pub fn render_panel(grid_cols: u16, grid_rows: u16, theme: Theme, font_name: &st
 
     paint(&mut cells, width, 4, 1, "[-]", theme.accent.pack(), theme.panel.pack(), 0);
     paint(&mut cells, width, 4, cols - 4, "[+]", theme.accent.pack(), theme.panel.pack(), 0);
-    let size_label = if cols >= 24 { format!("Tamanho: {size:.0} px") } else { format!("{size:.0} px") };
+    let size_label = if cols >= 24 { format!("Size: {size:.0} px") } else { format!("{size:.0} px") };
     let size_col = cols.saturating_sub(size_label.chars().count() as u16) / 2;
     paint(&mut cells, width, 4, size_col, &size_label, theme.fg.pack(), theme.panel.pack(), 0);
     zones.push(Zone { col: 0, end: 5, row: 4, action: PanelHit::Smaller });
     zones.push(Zone { col: cols - 5, end: cols, row: 4, action: PanelHit::Larger });
 
-    paint(&mut cells, width, 6, 1, "Estilo", theme.muted.pack(), theme.panel.pack(), 0);
+    paint(&mut cells, width, 6, 1, "Style", theme.muted.pack(), theme.panel.pack(), 0);
     for (index, item) in THEMES.iter().enumerate() {
         let row = 7 + index as u16;
         if row >= rows {
@@ -269,14 +269,14 @@ mod tests {
     #[test]
     fn style_row_and_size_buttons_are_hits() {
         let theme = color::theme(0);
-        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0).expect("painel");
+        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0).expect("panel");
         assert_eq!(panel.hit(panel.origin_col + 1, panel.origin_row + 4), Some(PanelHit::Smaller));
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 2, panel.origin_row + 4), Some(PanelHit::Larger));
         assert_eq!(panel.hit(panel.origin_col + 4, panel.origin_row + 4), Some(PanelHit::Smaller));
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 5, panel.origin_row + 4), Some(PanelHit::Larger));
         let size_row = &panel.cells[usize::from(panel.cols) * 4..usize::from(panel.cols) * 5];
         let size_text: String = size_row.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
-        assert!(size_text.contains("Tamanho: 15 px"), "{size_text}");
+        assert!(size_text.contains("Size: 15 px"), "{size_text}");
         assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + 7), Some(PanelHit::Style(0)));
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 1, panel.origin_row), Some(PanelHit::Close));
         assert!(panel.contains(panel.origin_col, panel.origin_row));

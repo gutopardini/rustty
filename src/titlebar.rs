@@ -1,4 +1,4 @@
-//! Barra superior da janela, pintada com as cores do tema.
+//! Top bar of the window, painted with the theme colors.
 
 use std::ops::Range;
 

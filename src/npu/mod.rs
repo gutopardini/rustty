@@ -1,9 +1,9 @@
-//! Índice de scrollback residente no endereço virtual da NPU.
+//! Scrollback index resident in the NPU virtual address space.
 //!
-//! Cada linha que sai da tela vira um registro de 64 bytes (hash AVX2 +
-//! prévia). O anel fica num GEM buffer mapeado na NPU. Sem um grafo compilado
-//! o firmware não é posto para calcular — o dado já está no lugar para quando
-//! houver um command buffer `RTY1`.
+//! Each line that leaves the screen becomes a 64-byte record (AVX2 hash plus
+//! a preview). The ring lives in a GEM buffer mapped on the NPU. Without a
+//! compiled graph the firmware is not asked to compute. The data is already
+//! in place for an `RTY1` command buffer.
 
 mod device;
 
@@ -136,18 +136,18 @@ fn worker(rx: Receiver<Job>, status: Arc<Status>) {
                 clock_mhz = device.info.clock_hz / 1_000_000,
                 fw = format_args!("{:#x}", device.info.fw_api),
                 context = device.info.context_id,
-                "NPU Intel aberta"
+                "Intel NPU open"
             );
             status.present.store(true, Ordering::Relaxed);
             status.device_id.store(u64::from(device.info.device_id), Ordering::Relaxed);
             status.clock_mhz.store(device.info.clock_hz / 1_000_000, Ordering::Relaxed);
             if let Err(err) = device_loop(device, rx, &status) {
-                tracing::warn!(%err, "fila da NPU caiu, índice segue na CPU");
+                tracing::warn!(%err, "NPU queue dropped, index stays on the CPU");
                 status.present.store(false, Ordering::Relaxed);
             }
         }
         Err(err) => {
-            tracing::info!(%err, "sem NPU, índice de scrollback fica na CPU");
+            tracing::info!(%err, "no NPU, scrollback index stays on the CPU");
             host_loop(rx, &status);
         }
     }
@@ -160,7 +160,7 @@ fn device_loop(device: Device, rx: Receiver<Job>, status: &Status) -> std::io::R
     status.vpu_addr.store(vpu_addr, Ordering::Relaxed);
     let capacity = ((ring.size.saturating_sub(4096)) / ENTRY_BYTES) as u32;
     {
-        let slice = ring.as_mut_slice().expect("anel mapeado");
+        let slice = ring.as_mut_slice().expect("mapped ring");
         write_header(
             slice,
             &RingHeader {
@@ -248,10 +248,10 @@ fn maybe_submit_graph(device: &Device, queue: &device::CommandQueue, ring: &devi
     let path = std::path::PathBuf::from(path);
     match load_graph(&path) {
         Ok(commands) => match device.submit_graph(queue, &commands, ring) {
-            Ok(status_code) => tracing::info!(?path, status_code, "grafo NPU submetido"),
-            Err(err) => tracing::warn!(%err, ?path, "falha ao submeter grafo NPU"),
+            Ok(status_code) => tracing::info!(?path, status_code, "NPU graph submitted"),
+            Err(err) => tracing::warn!(%err, ?path, "failed to submit the NPU graph"),
         },
-        Err(err) => tracing::warn!(%err, ?path, "grafo NPU ilegível"),
+        Err(err) => tracing::warn!(%err, ?path, "NPU graph is unreadable"),
     }
 }
 

@@ -1,9 +1,9 @@
-//! Cliente do UAPI `intel_vpu` (`/dev/accel/accel*`).
+//! Client for the `intel_vpu` UAPI (`/dev/accel/accel*`).
 //!
-//! A NPU não executa código arbitrário: o firmware só roda command buffers
-//! compilados pelo compilador da Intel. Aqui abrimos o device, mapeamos um BO
-//! no endereço virtual da NPU e deixamos a fila turbo pronta. O índice de
-//! scrollback mora nesse BO. Um grafo `RTY1` opcional é submetido de verdade.
+//! The NPU does not run arbitrary code: the firmware only runs command buffers
+//! compiled by Intel's compiler. This opens the device, maps a BO into the NPU
+//! virtual address space, and leaves the turbo queue ready. The scrollback
+//! index lives in that BO. An optional `RTY1` graph is submitted for real.
 
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind};
@@ -222,7 +222,7 @@ impl Device {
         })
     }
 
-    /// Submete um command buffer compilado. `ring` entra como argumento.
+    /// Submits a compiled command buffer. `ring` is passed as an argument.
     pub fn submit_graph(
         &self,
         queue: &CommandQueue,
@@ -230,7 +230,7 @@ impl Device {
         ring: &Buffer,
     ) -> io::Result<u32> {
         if commands.is_empty() || commands.len() > 16 * 1024 * 1024 {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "command buffer vazio ou grande demais"));
+            return Err(io::Error::new(ErrorKind::InvalidInput, "command buffer is empty or too large"));
         }
         let preempt_size = self.info.preempt_bytes.max(4096);
         let cmd = self.create_buffer(commands.len().next_multiple_of(4096) as u64, true)?;
@@ -305,13 +305,13 @@ pub fn load_graph(path: &Path) -> io::Result<Vec<u8>> {
     if bytes.len() < 16 || &bytes[..4] != b"RTY1" {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
-            "grafo NPU precisa começar com RTY1",
+            "NPU graph must start with RTY1",
         ));
     }
     let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let end = 16 + len;
     if len == 0 || end > bytes.len() {
-        return Err(io::Error::new(ErrorKind::InvalidData, "tamanho do command buffer inválido"));
+        return Err(io::Error::new(ErrorKind::InvalidData, "invalid command buffer size"));
     }
     Ok(bytes[16..end].to_vec())
 }
@@ -339,7 +339,7 @@ fn open_path(path: &Path) -> io::Result<Device> {
     if name != "intel_vpu" {
         return Err(io::Error::new(
             ErrorKind::NotFound,
-            format!("{path:?} é {name}, não intel_vpu"),
+            format!("{path:?} is {name}, not intel_vpu"),
         ));
     }
     let info = NpuInfo {
@@ -440,7 +440,7 @@ mod tests {
         let device = match Device::open() {
             Ok(device) => device,
             Err(err) => {
-                eprintln!("NPU ausente, teste ignorado: {err}");
+                eprintln!("NPU absent, test skipped: {err}");
                 return;
             }
         };

@@ -19,8 +19,8 @@ pub struct GlyphUpload {
 pub struct Face {
     regular: Font,
     bold: Option<Font>,
-    /// Nerd Font Mono usada quando a fonte escolhida não tem o glifo, ou quando
-    /// o glifo dela não cabe na célula (ícones da variante proporcional).
+    /// Nerd Font Mono used when the chosen face has no glyph, or when its glyph
+    /// does not fit the cell (icons from the proportional variant).
     symbols: Option<Font>,
     symbols_bold: Option<Font>,
     regular_ft: Option<Mutex<crate::ft::Face>>,
@@ -92,7 +92,7 @@ impl Face {
         self.cell_h
     }
 
-    /// Rasteriza o glifo já posicionado dentro da célula (ou de duas, se for wide).
+    /// Rasterizes the glyph already positioned inside the cell (or two cells, if wide).
     pub fn raster_cell(&self, ch: char, bold: bool, wide: bool) -> Vec<u8> {
         let slots = if wide { 2 } else { 1 };
         let width = self.cell_w as usize * slots;
@@ -130,8 +130,8 @@ impl Face {
         if is_powerline_separator(ch) {
             stamp_fit(pixels, width, height, &image.pixels, image.width, image.height, Fit::Fill);
         } else if is_box_or_block(ch) {
-            // Esses glifos passam 1px da célula de propósito, para as linhas se encontrarem.
-            // Encolher (Contain) abre um vão no meio do desenho.
+            // These glyphs overflow the cell by 1px on purpose, so the lines meet.
+            // Shrinking (Contain) opens a gap in the middle of the drawing.
             stamp_at(
                 pixels,
                 width,
@@ -216,7 +216,7 @@ impl Face {
         Some((raster.0, raster.1, synthetic))
     }
 
-    /// `primary` escolhe a fonte da célula. O outro lado é a Nerd Font Mono.
+    /// `primary` chooses the cell face. The other side is Nerd Font Mono.
     fn hit(&self, ch: char, bold: bool, primary: bool) -> Option<(&Font, bool)> {
         let (regular, bold_face) = if primary {
             (&self.regular, self.bold.as_ref())
@@ -322,9 +322,9 @@ fn stamp_baseline(dst: &mut [u8], width: usize, height: usize, bitmap: &[u8], me
 
 #[derive(Clone, Copy)]
 enum Fit {
-    /// Estica a tinta até as bordas. Os separadores do Oh My Posh precisam encostar na célula.
+    /// Stretches the ink to the edges. Oh My Posh separators need to meet the cell.
     Fill,
-    /// Mantém a proporção e centra. Ícone largo demais deixa de ser cortado.
+    /// Keeps the proportion and centers. An icon that is too wide is no longer clipped.
     Contain,
 }
 
@@ -523,7 +523,7 @@ impl Atlas {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Rasteriza o ASCII e os glifos de prompt antes do primeiro frame.
+    /// Rasterizes ASCII and the prompt glyphs before the first frame.
     pub fn warm(&mut self, face: &Face) {
         for cp in 0x21u32..=0x7e {
             self.prepare(face, cp, 0);
@@ -747,7 +747,7 @@ fn symbol_font_path() -> Option<PathBuf> {
 }
 
 fn load_font(path: &Path) -> anyhow::Result<Font> {
-    let bytes = std::fs::read(path).with_context(|| format!("lendo {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Font::from_bytes(bytes, FontSettings::default()).map_err(|err| anyhow!("{err}"))
 }
 
@@ -775,7 +775,7 @@ fn font_file(bold: bool) -> anyhow::Result<PathBuf> {
     } else {
         "monospace"
     };
-    fc_match(fallback).ok_or_else(|| anyhow!("nenhuma fonte monoespaçada via fc-match"))
+    fc_match(fallback).ok_or_else(|| anyhow!("fc-match found no monospace font"))
 }
 
 fn fc_match(pattern: &str) -> Option<PathBuf> {
@@ -797,32 +797,32 @@ mod tests {
 
     #[test]
     fn capital_a_puts_ink_in_the_upper_half() {
-        let face = Face::load(32.0).expect("fonte");
+        let face = Face::load(32.0).expect("font");
         let pixels = face.raster_cell('A', false, false);
         let width = face.cell_w() as usize;
         let height = face.cell_h() as usize;
         assert_eq!(pixels.len(), width * height);
         let ink: usize = pixels.iter().map(|p| usize::from(*p > 0)).sum();
-        assert!(ink > 10, "glifo vazio");
+        assert!(ink > 10, "empty glyph");
         let upper: usize = pixels[..width * (height / 2)]
             .iter()
             .map(|p| usize::from(*p > 0))
             .sum();
-        assert!(upper > 0, "baseline ficou fora da célula");
+        assert!(upper > 0, "baseline fell outside the cell");
     }
 
     #[test]
     fn nerd_font_draws_powerline_diamonds() {
-        let face = Face::load(32.0).expect("fonte");
+        let face = Face::load(32.0).expect("font");
         for ch in ['\u{e0b6}', '\u{e0c6}', '\u{e0c7}'] {
             let pixels = face.raster_cell(ch, false, false);
             let ink: usize = pixels.iter().map(|p| usize::from(*p > 0)).sum();
-            assert!(ink > 8, "U+{cp:04X} saiu vazio na fonte do atlas", cp = u32::from(ch));
+            assert!(ink > 8, "U+{cp:04X} came out empty in the atlas font", cp = u32::from(ch));
         }
         let triangle = face.raster_cell('\u{e0b0}', false, false);
         let width = face.cell_w() as usize;
         let left: usize = (0..face.cell_h() as usize).map(|y| usize::from(triangle[y * width] > 16)).sum();
-        assert!(left > 2, "o separador não encosta na borda da célula");
+        assert!(left > 2, "the separator does not meet the cell edge");
     }
 
     #[test]
@@ -835,10 +835,10 @@ mod tests {
         for ch in ['\u{e0c6}', '\u{f07b}', '\u{f126}', '\u{ea7b}'] {
             let pixels = face.raster_cell(ch, false, false);
             let ink: usize = pixels.iter().map(|p| usize::from(*p > 0)).sum();
-            assert!(ink > 20, "U+{cp:04X} não veio da fonte de símbolos", cp = u32::from(ch));
+            assert!(ink > 20, "U+{cp:04X} did not come from the symbol font", cp = u32::from(ch));
         }
         let missing = face.raster_cell('\u{0378}', false, false);
-        assert!(missing.iter().all(|p| *p == 0), "código sem glifo desenhou a caixa .notdef");
+        assert!(missing.iter().all(|p| *p == 0), "a missing glyph drew the .notdef box");
     }
 
     #[test]
@@ -855,31 +855,31 @@ mod tests {
         let wide_face = Face::load_file(wide, 28.0).expect("nerd");
         let mono_face = Face::load_file(mono, 28.0).expect("nerd mono");
         let raw = load_font(wide).unwrap().rasterize('\u{f07b}', wide_face.px()).0;
-        assert!(raw.width > wide_face.cell_w() as usize, "a amostra já cabia na célula");
+        assert!(raw.width > wide_face.cell_w() as usize, "the sample already fit the cell");
         assert_eq!(
             wide_face.raster_cell('\u{f07b}', false, false),
             mono_face.raster_cell('\u{f07b}', false, false),
-            "o ícone proporcional foi cortado em vez de usar a variante que cabe na célula"
+            "the proportional icon was clipped instead of using the variant that fits the cell"
         );
     }
 
     #[test]
     fn box_drawing_meets_at_the_cell_edge() {
-        let face = Face::load(19.0).expect("fonte");
+        let face = Face::load(19.0).expect("font");
         let width = face.cell_w() as usize;
         let height = face.cell_h() as usize;
         let vertical = face.raster_cell('\u{2502}', false, false);
         let top = vertical[..width].iter().any(|p| *p > 16);
         let bottom = vertical[(height - 1) * width..].iter().any(|p| *p > 16);
-        assert!(top && bottom, "a linha vertical não atravessa a célula");
+        assert!(top && bottom, "the vertical line does not cross the cell");
         let horizontal = face.raster_cell('\u{2500}', false, false);
         let row = horizontal
             .chunks(width)
             .find(|row| row.iter().any(|p| *p > 16))
-            .expect("linha horizontal vazia");
-        assert!(row[0] > 16 && row[width - 1] > 16, "a linha horizontal não vai de borda a borda");
+            .expect("empty horizontal line");
+        assert!(row[0] > 16 && row[width - 1] > 16, "the horizontal line does not run edge to edge");
         let block = face.raster_cell('\u{2588}', false, false);
         let ink = block.iter().filter(|p| **p > 16).count();
-        assert!(ink * 10 > width * height * 8, "o bloco cheio foi encolhido dentro da célula");
+        assert!(ink * 10 > width * height * 8, "the full block was shrunk inside the cell");
     }
 }

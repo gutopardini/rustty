@@ -19,10 +19,10 @@ fn main() {
             println!("  heartbeat  {}", info.heartbeat);
             match device.create_buffer(4096, true) {
                 Ok(buffer) => println!("  bo         vpu {:#x}  {} bytes", buffer.vpu_addr, buffer.size),
-                Err(err) => println!("  bo         falhou: {err}"),
+                Err(err) => println!("  bo         failed: {err}"),
             }
         }
-        Err(err) => println!("NPU indisponível: {err}"),
+        Err(err) => println!("NPU unavailable: {err}"),
     }
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -42,6 +42,6 @@ fn main() {
             println!("  device     {:#06x}", info.device);
             println!("  driver     {} {}", info.driver, info.driver_info);
         }
-        Err(err) => println!("GPU Vulkan indisponível: {err}"),
+        Err(err) => println!("Vulkan GPU unavailable: {err}"),
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -16,7 +17,10 @@ struct Vertex {
 
 struct Sprite {
     image: Arc<Image>,
+    texture: wgpu::Texture,
     bind: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 pub(super) struct Images {
@@ -25,6 +29,10 @@ pub(super) struct Images {
     sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     sprites: Vec<Sprite>,
+    /// Textures whose last submit is old enough to overwrite.
+    free: Vec<Sprite>,
+    /// The previous two submits may still sample these.
+    retired: VecDeque<Vec<Sprite>>,
 }
 
 impl Images {
@@ -106,6 +114,8 @@ impl Images {
             sampler,
             vertex_buffer,
             sprites: Vec::new(),
+            free: Vec::new(),
+            retired: VecDeque::new(),
         }
     }
 
@@ -116,38 +126,53 @@ impl Images {
         grid: &Uniforms,
         placements: &[Placement],
     ) {
+        while self.retired.len() > 2 {
+            self.free.extend(self.retired.pop_front().unwrap());
+        }
         if placements.is_empty() {
-            self.sprites.clear();
+            if !self.sprites.is_empty() {
+                self.retired.push_back(std::mem::take(&mut self.sprites));
+            }
             return;
         }
-        let previous = std::mem::take(&mut self.sprites);
+        let mut previous = std::mem::take(&mut self.sprites);
         let mut vertices = Vec::with_capacity(placements.len() * VERTICES_PER_IMAGE);
         for placement in placements {
             let Some(quad) = image_vertices(grid, placement) else {
                 continue;
             };
             vertices.extend_from_slice(&quad);
-            let bind = previous
+            if let Some(index) = previous
                 .iter()
-                .find(|sprite| Arc::ptr_eq(&sprite.image, &placement.image))
-                .map(|sprite| sprite.bind.clone())
-                .unwrap_or_else(|| self.texture(device, queue, &placement.image));
-            self.sprites.push(Sprite {
-                image: Arc::clone(&placement.image),
-                bind,
-            });
+                .position(|sprite| Arc::ptr_eq(&sprite.image, &placement.image))
+            {
+                self.sprites.push(previous.swap_remove(index));
+                continue;
+            }
+            let image = &placement.image;
+            let sprite = if let Some(index) = self
+                .free
+                .iter()
+                .position(|sprite| sprite.width == image.width && sprite.height == image.height)
+            {
+                let mut sprite = self.free.swap_remove(index);
+                write_pixels(queue, &sprite.texture, image);
+                sprite.image = Arc::clone(image);
+                sprite
+            } else {
+                self.texture(device, queue, image)
+            };
+            self.sprites.push(sprite);
+        }
+        if !previous.is_empty() {
+            self.retired.push_back(previous);
         }
         if !vertices.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         }
     }
 
-    fn texture(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        image: &Image,
-    ) -> wgpu::BindGroup {
+    fn texture(&self, device: &wgpu::Device, queue: &wgpu::Queue, image: &Arc<Image>) -> Sprite {
         let size = wgpu::Extent3d {
             width: image.width,
             height: image.height,
@@ -163,18 +188,9 @@ impl Images {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            texture.as_image_copy(),
-            &image.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.width * 4),
-                rows_per_image: None,
-            },
-            size,
-        );
+        write_pixels(queue, &texture, image);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terminal image"),
             layout: &self.layout,
             entries: &[
@@ -187,7 +203,14 @@ impl Images {
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
-        })
+        });
+        Sprite {
+            image: Arc::clone(image),
+            texture,
+            bind,
+            width: image.width,
+            height: image.height,
+        }
     }
 
     pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -202,6 +225,23 @@ impl Images {
             pass.draw(start..start + VERTICES_PER_IMAGE as u32, 0..1);
         }
     }
+}
+
+fn write_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, image: &Image) {
+    queue.write_texture(
+        texture.as_image_copy(),
+        &image.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(image.width * 4),
+            rows_per_image: None,
+        },
+        wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 fn image_vertices(grid: &Uniforms, placement: &Placement) -> Option<[Vertex; VERTICES_PER_IMAGE]> {

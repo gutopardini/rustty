@@ -1,4 +1,4 @@
-//! Faixa de abas desenhada como uma linha de células no rodapé da janela.
+//! Tab strip drawn as one row of cells at the bottom of the window.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use std::ops::Range;
@@ -43,8 +43,8 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
     };
     let usable = cols - settings_width;
     let mut cells = vec![Cell::blank(theme.muted.pack(), theme.bar.pack()); cols];
-    // A faixa útil é dividida entre as abas. O resto da divisão vai para as primeiras,
-    // então a última sempre encosta no botão de configurações.
+    // The usable strip is split across the tabs. The remainder goes to the first
+    // tabs, so the last one always meets the settings button.
     let count = titles.len();
     let base = usable / count;
     let extra = usable % count;
@@ -72,15 +72,15 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
             };
         }
         let span = end - start;
-        // Abas largas ganham mais ar nas bordas e entre o ícone e o título.
-        // Nas estreitas o respiro volta ao mínimo para o título e o fechar caberem.
+        // Wide tabs get more air at the edges and between the icon and the title.
+        // Narrow tabs drop back to the minimum so the title and the close mark fit.
         let (lead, icon_gap, tail) = if span >= 20 { (4, 2, 4) } else { (1, 1, 1) };
         let close = if span >= lead + icon_gap + tail + 6 {
             Some((end - tail - 1) as u16)
         } else {
             None
         };
-        // Uma célula de respiro separa o título do botão de fechar.
+        // One breathing cell separates the title from the close button.
         let reserve = if close.is_some() { tail + 2 } else { 0 };
         let label_end = end.saturating_sub(reserve);
         let prefix = format!("{:lead$}{} ", "", index + 1, lead = lead);
@@ -103,7 +103,7 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
         paint(&mut cells[text_start..label_end], &fitted, fg, bg, flags);
         let number_at = start + lead;
         if active_tab && number_at < end.saturating_sub(reserve) {
-            // O número também identifica a aba ativa quando a barra está cheia.
+            // The number also marks the active tab when the bar is full.
             let prefix_end = (number_at + (index + 1).to_string().len()).min(end.saturating_sub(reserve));
             for cell in &mut cells[number_at..prefix_end] {
                 cell.fg = theme.accent.pack();
@@ -117,7 +117,7 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
                 flags,
             };
         }
-        // As pontas arredondam no shader. O vão entre elas separa abas da mesma cor.
+        // The shader rounds the ends. The gap between them separates tabs of the same color.
         mark_tab(&mut cells[start..end], active_tab);
         spans.push(TabSpan {
             start: start as u16,
@@ -247,10 +247,10 @@ mod tests {
         assert_eq!(bar.spans.len(), 2);
         assert_eq!(bar.spans[0].start, 0);
         assert_eq!(bar.spans[0].end, bar.spans[1].start);
-        let settings = bar.settings.as_ref().expect("botão de configurações");
+        let settings = bar.settings.as_ref().expect("settings button");
         assert!(bar.spans[1].end <= settings.start);
         assert_eq!(settings.end, 40);
-        let close = bar.spans[0].close.expect("coluna do fechar");
+        let close = bar.spans[0].close.expect("close column");
         assert_eq!(bar.cells[close as usize].cp, u32::from('×'));
         assert_ne!(bar.cells[bar.spans[0].start as usize].bg, bar.cells[bar.spans[1].start as usize].bg);
         assert_eq!(hit(&bar, bar.spans[0].start), Some(BarHit::Select(0)));
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn long_title_is_cut() {
-        let bar = render_bar(&["um titulo muito longo para a aba".into()], &[], 0, 16, crate::color::theme(0), false);
+        let bar = render_bar(&["a title too long for this tab".into()], &[], 0, 16, crate::color::theme(0), false);
         let cells = &bar.cells;
         let spans = &bar.spans;
         let text: String = cells
@@ -279,7 +279,7 @@ mod tests {
             .filter(|ch| *ch != '\0')
             .collect();
         assert!(text.contains('…'), "{text}");
-        let close = usize::from(spans[0].close.expect("coluna do fechar"));
+        let close = usize::from(spans[0].close.expect("close column"));
         assert_eq!(cells[close - 1].cp, 0);
     }
 
@@ -287,7 +287,7 @@ mod tests {
     fn single_tab_fills_up_to_settings_and_its_number_is_accented() {
         let theme = crate::color::theme(0);
         let bar = render_bar(&["shell".into()], &[], 0, 100, theme, false);
-        let settings = bar.settings.as_ref().expect("botão de configurações");
+        let settings = bar.settings.as_ref().expect("settings button");
         assert_eq!(bar.spans[0].start, 0);
         assert_eq!(bar.spans[0].end, settings.start);
         assert_eq!(bar.cells[4].cp, u32::from('1'));
@@ -301,11 +301,11 @@ mod tests {
     fn tabs_shrink_to_share_the_row() {
         let theme = crate::color::theme(0);
         let one = render_bar(&["shell".into()], &[], 0, 40, theme, false);
-        let titles: Vec<String> = (0..6).map(|index| format!("aba {index}")).collect();
+        let titles: Vec<String> = (0..6).map(|index| format!("tab {index}")).collect();
         let many = render_bar(&titles, &[], 0, 40, theme, false);
-        let settings = many.settings.as_ref().expect("botão de configurações");
+        let settings = many.settings.as_ref().expect("settings button");
         assert_eq!(one.spans[0].end, settings.start);
-        assert_eq!(many.spans.last().expect("abas").end, settings.start);
+        assert_eq!(many.spans.last().expect("tabs").end, settings.start);
         assert!(many.spans[0].end < one.spans[0].end);
         for pair in many.spans.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
@@ -351,7 +351,7 @@ mod tests {
                 assert_eq!((bar.cells[start + 1].flags >> TAB_FROM_LEFT_SHIFT) & 15, 1);
             }
         }
-        let settings = bar.settings.as_ref().expect("botão de configurações");
+        let settings = bar.settings.as_ref().expect("settings button");
         assert_eq!(bar.cells[usize::from(settings.start)].flags & TAB, 0);
     }
 

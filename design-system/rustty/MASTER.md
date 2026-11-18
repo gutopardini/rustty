@@ -1,42 +1,42 @@
-# Identidade visual — Rustty
+# Visual identity — Rustty
 
-## Ideia
+## Idea
 
-Rustty é um terminal Linux nativo para quem passa o dia no shell. O projeto combina uma grade de células renderizada com Vulkan, sessões independentes em abas e indexação do scrollback. A identidade deve transmitir precisão, agilidade e autonomia sem disputar atenção com o conteúdo do terminal.
+Rustty is a performance-focused CLI for LLMs: a native Linux terminal for people who spend the day in a shell. The project combines a Vulkan cell grid, independent tab sessions, and scrollback staged for the Intel NPU. The identity should feel precise, quick, and self-contained, and it should leave the terminal content in front.
 
-O sinal `>` representa o prompt; o bloco representa o cursor pronto para o próximo comando. O cobre remete ao nome Rustty e funciona como um ponto de orientação, não como cor de fundo para o texto. A caixa escura, de cantos arredondados e construção geométrica, aproxima o ícone de uma janela de terminal.
+The `>` mark is the prompt. The block is the cursor, ready for the next command. Copper points back to the name Rustty and works as a wayfinding color, never as a background for body text. The dark rounded box makes the icon read as a terminal window.
 
-**Expressão:** direto, técnico, calmo e acolhedor. Frase de apoio sugerida: “Seu fluxo, sem ruído.” Evitar metáforas de IA ou promessas de aceleração de NPU: a execução de um grafo depende de um command buffer compilado e configurado.
+**Voice:** direct, technical, calm, and welcoming. Suggested supporting line: “Your session, without the noise.” Describe the GPU as the path that draws the screen today. Describe the NPU as the plan for scrollback search. A graph runs only after a compiled command buffer is configured, so copy should not claim that the NPU is already executing one.
 
-## Marca
+## Brand
 
-- [Ícone vetorial](../../assets/brand/rustty-icon.svg): aplicação, lançadores e perfis. Preserve a proporção e a margem transparente original.
-- [Ícone PNG 512 px](../../assets/brand/rustty-icon.png): usos que não aceitam SVG.
-- [Símbolo sem caixa](../../assets/brand/rustty-mark.svg): composições sobre fundos escuros, sempre com contraste suficiente.
-- [Assinatura para fundo escuro](../../assets/brand/rustty-lockup.svg) e [para fundo claro](../../assets/brand/rustty-lockup-light.svg): ícone e nome juntos, sem alterar o espaçamento ou a proporção.
-- [Nome em vetor](../../assets/brand/rustty-wordmark.svg): desenho baseado em Red Hat Display Bold, convertido em curvas para não depender da fonte instalada. O nome de produto em texto corrido continua sendo **Rustty**.
+- [Vector icon](../../assets/brand/rustty-icon.svg): the application, launchers, and profiles. Keep the original proportion and transparent margin.
+- [512 px PNG icon](../../assets/brand/rustty-icon.png): places that cannot take SVG.
+- [Mark without the box](../../assets/brand/rustty-mark.svg): compositions on dark backgrounds, always with enough contrast.
+- [Lockup for dark backgrounds](../../assets/brand/rustty-lockup.svg) and [for light backgrounds](../../assets/brand/rustty-lockup-light.svg): icon and name together. Leave the spacing and proportion alone.
+- [Wordmark](../../assets/brand/rustty-wordmark.svg): drawn from Red Hat Display Bold and converted to curves so it does not depend on an installed font. In running text the product name stays **Rustty**.
 
-Em tamanhos pequenos, prefira o ícone sozinho. Não estique, rotacione, adicione contornos ou coloque o símbolo sobre fundos de baixo contraste. O ícone e o nome são as fontes para os demais arquivos: depois de editá-los, execute `scripts/render-brand-assets.sh` para regenerar o símbolo, as assinaturas, o PNG e o RGBA incorporado à janela. Ao alterar o ícone do Rustty, execute também `scripts/render-agent-icons.sh` para atualizar o ícone das abas. Os scripts requerem Python 3 e ImageMagick com suporte a SVG; o atlas das abas também usa Pillow.
+At small sizes, use the icon alone. Do not stretch, rotate, add strokes, or place the mark on a low-contrast background. The icon and the wordmark are the sources for the other files. After editing them, run `scripts/render-brand-assets.sh` to regenerate the mark, the lockups, the PNG, and the RGBA embedded in the window. After changing the Rustty icon, also run `scripts/render-agent-icons.sh` so the tab icon updates. The scripts need Python 3 and ImageMagick with SVG support. The tab atlas also uses Pillow.
 
-## Paleta do tema Rustty
+## Rustty theme palette
 
-Os valores são implementados em `src/color.rs`; outros temas continuam disponíveis e são identificados por seus próprios IDs.
+The values live in `src/color.rs`. The other themes stay available and are identified by their own IDs.
 
-| Papel | Cor | Uso |
+| Role | Color | Use |
 | --- | --- | --- |
-| Fundo | `#131619` | Área de trabalho e aba ativa |
-| Texto | `#EDEAE4` | Conteúdo padrão e textos principais |
-| Faixa | `#1B1E22` | Fundo da barra de abas |
-| Superfície | `#252A2E` | Abas inativas e painel de aparência |
-| Texto secundário | `#B6B8BB` | Títulos inativos e legendas |
-| Cobre | `#F0A77D` | Número da aba ativa, seleção e controles em evidência |
+| Background | `#131619` | Workspace and the active tab |
+| Text | `#EDEAE4` | Default content and primary text |
+| Bar | `#1B1E22` | Tab bar background |
+| Surface | `#252A2E` | Inactive tabs and the appearance panel |
+| Secondary text | `#B6B8BB` | Inactive titles and captions |
+| Copper | `#F0A77D` | Active tab number, selection, and emphasized controls |
 
-Pares principais medidos em contraste WCAG: texto/fundo **15,12:1**; cobre/superfície **7,26:1**; secundário/superfície **7,29:1**. A paleta ANSI continua independente, para não mudar as cores explicitamente pedidas pelos programas. Use o cobre com parcimônia e preserve o contraste dos textos ao criar novos componentes.
+Measured WCAG pairs: text on background **15.12:1**; copper on surface **7.26:1**; secondary on surface **7.29:1**. The ANSI palette stays independent, so programs keep the colors they request. Use copper sparingly, and keep text contrast when adding a component.
 
-## Tipografia e interface
+## Type and interface
 
-A assinatura usa Red Hat Display Bold em curvas. Na grade e nos controles do aplicativo, mantenha a fonte monoespaçada escolhida pela pessoa; JetBrains Mono é uma boa referência visual, mas não é uma dependência nem substitui uma preferência salva. Os tamanhos da grade seguem a configuração existente.
+The lockup uses Red Hat Display Bold as curves. In the grid and in the application controls, keep the monospace face the person chose. JetBrains Mono is a useful visual reference. It is not a dependency, and it does not replace a saved preference. Grid sizes follow the existing configuration.
 
-A barra é compacta e fica no rodapé, deixando espaço para os comandos. A aba ativa se conecta visualmente ao fundo do terminal e seu número recebe o cobre; o painel usa uma superfície um pouco mais clara. Os ícones dos agentes ocupam a mesma caixa quadrada, preservando a proporção de cada marca. A hierarquia também se apoia em posição, texto e fundo, sem depender apenas da cor. Usar espaçamento em múltiplos de células na interface nativa. Evitar efeitos luminosos, texturas e animações que atrapalhem a leitura ou tornem a resposta do terminal mais lenta.
+The bar is compact and sits at the bottom, leaving room for commands. The active tab connects visually to the terminal background, and its number takes copper. The panel uses a slightly lighter surface. Agent icons share one square box and keep each mark’s proportion. Hierarchy also comes from position, text, and background, not from color alone. Space the native interface in multiples of a cell. Skip glows, textures, and motion that get in the way of reading or slow the terminal down.
 
-A escolha do tema continua no painel de aparência (`Ctrl+,`) e em `ui.conf`. A identidade Rustty é o padrão quando ainda não há preferência; uma escolha anterior como `noite` ou `papel` permanece válida.
+Theme choice stays in the appearance panel (`Ctrl+,`) and in `ui.conf`. Rustty is the default when there is no preference yet. An earlier choice such as `noite` or `papel` remains valid.

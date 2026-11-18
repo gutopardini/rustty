@@ -1,4 +1,4 @@
-//! Confirmação para não encerrar várias sessões sem querer.
+//! Confirmation so several sessions are not closed by accident.
 
 use std::ops::Range;
 
@@ -8,8 +8,8 @@ use crate::color::Theme;
 const MAX_COLS: u16 = 44;
 const MAX_ROWS: u16 = 10;
 pub(crate) const MAX_CELLS: usize = MAX_COLS as usize * MAX_ROWS as usize;
-const CANCEL: &str = "Cancelar";
-const CLOSE_ALL: &str = "Fechar abas";
+const CANCEL: &str = "Cancel";
+const CLOSE_ALL: &str = "Close tabs";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
@@ -81,9 +81,9 @@ pub fn render(grid_cols: u16, grid_rows: u16, theme: Theme, tabs: usize) -> Opti
     let wide_actions = content > 2 * (CLOSE_ALL.len() as u16 + 4);
     let compact_pair_fits = content > 2 * (CANCEL.len() as u16 + 2);
     let labels = if wide_actions {
-        [CANCEL, if tabs == 1 { "Fechar aba" } else { CLOSE_ALL }]
+        [CANCEL, if tabs == 1 { "Close tab" } else { CLOSE_ALL }]
     } else if usize::from(content) >= CANCEL.len() && (height >= 3 || compact_pair_fits) {
-        [CANCEL, "Fechar"]
+        [CANCEL, "Close"]
     } else {
         ["Esc", "Enter"]
     };
@@ -104,9 +104,9 @@ pub fn render(grid_cols: u16, grid_rows: u16, theme: Theme, tabs: usize) -> Opti
         0
     };
     let warning = [
-        &["As sessões abertas serão encerradas."][..],
-        &["As sessões abertas", "serão encerradas."][..],
-        &["As sessões", "serão", "encerradas."][..],
+        &["Open sessions will be closed."][..],
+        &["Open sessions", "will be closed."][..],
+        &["Sessions", "will close."][..],
     ]
     .into_iter()
     .find(|lines| {
@@ -140,15 +140,15 @@ pub fn render(grid_cols: u16, grid_rows: u16, theme: Theme, tabs: usize) -> Opti
     };
 
     let title = match tabs {
-        1 => String::from("Fechar a aba?"),
-        _ => format!("Fechar {tabs} abas?"),
+        1 => String::from("Close this tab?"),
+        _ => format!("Close {tabs} tabs?"),
     };
     let left = usize::from(gutter);
     let right = usize::from(cols - gutter);
     let title = if !can_draw_actions {
-        "Fechar? Esc/Enter"
+        "Close? Esc/Enter"
     } else if title.chars().count() > usize::from(content) {
-        "Fechar?"
+        "Close?"
     } else {
         &title
     };
@@ -229,28 +229,69 @@ fn paint(cells: &mut [Cell], text: &str, fg: u32, flags: u32) {
 mod tests {
     use super::*;
 
+    fn hits(dialog: &Dialog, choice: Choice) -> Vec<(u16, u16)> {
+        let mut found = Vec::new();
+        for row in 0..dialog.rows {
+            for col in 0..dialog.cols {
+                if dialog.hit(dialog.origin_col + col, dialog.origin_row + row) == Some(choice) {
+                    found.push((col, row));
+                }
+            }
+        }
+        found
+    }
+
     #[test]
     fn both_button_rows_are_clickable_and_stay_inside_the_dialog() {
         let dialog = render(80, 24, crate::color::theme(0), 3).unwrap();
-        let col = dialog.origin_col;
-        let row = dialog.origin_row + 4;
-
-        for y in [row, row + 1] {
-            assert_eq!(dialog.hit(col + 13, y), Some(Choice::Cancel));
-            assert_eq!(dialog.hit(col + 27, y), Some(Choice::Close));
-            assert_eq!(dialog.hit(col + 26, y), None);
-            assert_eq!(dialog.hit(col + dialog.cols - 2, y), None);
-        }
-        assert_eq!(dialog.hit(col + 27, row + 2), None);
+        let cancel = hits(&dialog, Choice::Cancel);
+        let close = hits(&dialog, Choice::Close);
+        assert!(!cancel.is_empty());
+        assert!(!close.is_empty());
+        let cancel_rows: Vec<u16> = cancel.iter().map(|hit| hit.1).collect();
+        let close_rows: Vec<u16> = close.iter().map(|hit| hit.1).collect();
+        assert_eq!(cancel_rows.iter().min(), close_rows.iter().min());
+        assert_eq!(
+            cancel_rows.iter().max().unwrap() - cancel_rows.iter().min().unwrap(),
+            1
+        );
+        let gap_col = cancel.iter().map(|hit| hit.0).max().unwrap() + 1;
+        let gap_row = *cancel_rows.iter().min().unwrap();
+        assert_eq!(
+            dialog.hit(dialog.origin_col + gap_col, dialog.origin_row + gap_row),
+            None
+        );
+        assert_eq!(
+            dialog.hit(
+                dialog.origin_col + dialog.cols - 2,
+                dialog.origin_row + gap_row
+            ),
+            None
+        );
+        assert_eq!(
+            dialog.hit(
+                dialog.origin_col + close[0].0,
+                dialog.origin_row + close_rows.iter().max().unwrap() + 1
+            ),
+            None
+        );
         assert_eq!(dialog.hit(0, 0), None);
     }
 
     #[test]
     fn narrow_dialog_keeps_both_actions() {
         let dialog = render(16, 8, crate::color::theme(0), 2).unwrap();
-        assert_eq!(dialog.hit(3, dialog.origin_row + 5), Some(Choice::Cancel));
-        assert_eq!(dialog.hit(3, dialog.origin_row + 6), None);
-        assert_eq!(dialog.hit(3, dialog.origin_row + 7), Some(Choice::Close));
+        let cancel = hits(&dialog, Choice::Cancel);
+        let close = hits(&dialog, Choice::Close);
+        assert!(!cancel.is_empty());
+        assert!(!close.is_empty());
+        assert!(cancel.iter().all(|hit| hit.1 < close.iter().map(|hit| hit.1).min().unwrap()));
+        let between = cancel.iter().map(|hit| hit.1).max().unwrap() + 1;
+        assert!(between < close.iter().map(|hit| hit.1).min().unwrap());
+        assert_eq!(
+            dialog.hit(dialog.origin_col + cancel[0].0, dialog.origin_row + between),
+            None
+        );
         let compact = render(16, 2, crate::color::theme(0), 2).unwrap();
         assert_eq!(compact.hit(2, 1), Some(Choice::Cancel));
         assert_eq!(compact.hit(13, 1), Some(Choice::Close));

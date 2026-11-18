@@ -1,6 +1,6 @@
-//! Grade instanciada na GPU. Cada célula é um quad; o atlas de glifos fica em VRAM.
+//! Instanced grid on the GPU. Each cell is a quad, and the glyph atlas stays in VRAM.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use anyhow::Context;
 use winit::dpi::PhysicalSize;
@@ -51,6 +51,7 @@ pub struct Renderer {
     rows: u16,
     cell_px_w: f32,
     cell_px_h: f32,
+    scrollbar_visible: bool,
     seen_generation: u64,
     bar_uniform: wgpu::Buffer,
     bar_cells_buf: wgpu::Buffer,
@@ -66,6 +67,17 @@ pub struct Renderer {
     top_h: f32,
     chrome_h: f32,
     clear: Rgb,
+    selection: (u32, u32),
+    presented: Option<Presented>,
+}
+
+#[derive(Clone, Copy)]
+struct Presented {
+    cols: u16,
+    rows: u16,
+    cursor: Option<(u16, u16)>,
+    scroll_top: f32,
+    scroll_h: f32,
 }
 
 impl Renderer {
@@ -76,14 +88,14 @@ impl Renderer {
         });
         let surface = instance
             .create_surface(window.clone())
-            .context("criando surface Vulkan")?;
+            .context("creating the Vulkan surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
             apply_limit_buckets: false,
         }))
-        .context("nenhum adapter Vulkan")?;
+        .context("no Vulkan adapter")?;
         let info = adapter.get_info();
         tracing::info!(name = %info.name, backend = ?info.backend, device = info.device, "GPU");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -94,7 +106,7 @@ impl Renderer {
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
-        .context("abrindo device Vulkan")?;
+        .context("opening the Vulkan device")?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -108,11 +120,9 @@ impl Renderer {
                 )
             })
             .unwrap_or(caps.formats[0]);
-        let present_mode = if vsync {
-            wgpu::PresentMode::Fifo
-        } else {
-            wgpu::PresentMode::AutoNoVsync
-        };
+        // Mailbox still follows the display, but a newer frame replaces one that has not
+        // been shown. present() then returns without parking the key handler on vblank.
+        let present_mode = present_mode(vsync, &caps.present_modes);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -121,7 +131,7 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
-            desired_maximum_frame_latency: 1,
+            desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -357,6 +367,7 @@ impl Renderer {
             rows: 0,
             cell_px_w: 1.0,
             cell_px_h: 1.0,
+            scrollbar_visible: false,
             seen_generation: 0,
             bar_uniform,
             bar_cells_buf,
@@ -372,6 +383,8 @@ impl Renderer {
             top_h: 0.0,
             chrome_h: 0.0,
             clear: DEFAULT_BG,
+            selection: (0, 0),
+            presented: None,
         };
         renderer.clear_atlas();
         Ok(renderer)
@@ -488,7 +501,7 @@ impl Renderer {
         }
     }
 
-    pub fn upload_bar(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: crate::color::Rgb) {
+    pub fn upload_bar(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: Rgb, edge: Rgb) {
         self.cell_px_w = atlas.cell_w() as f32;
         self.cell_px_h = atlas.cell_h() as f32;
         let count = cells.len().min(self.bar_gpu.len());
@@ -506,10 +519,10 @@ impl Renderer {
         self.bar_count = count as u32;
         let uniform = self.bar_uniform.clone();
         let pad_y = (self.config.height as f32 - self.chrome_h).max(0.0);
-        self.write_strip_uniforms(&uniform, self.bar_count.max(1), pad_y, self.chrome_h, strip.pack());
+        self.write_strip_uniforms(&uniform, self.bar_count.max(1), pad_y, self.chrome_h, strip, edge);
     }
 
-    pub fn upload_title(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell]) {
+    pub fn upload_title(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: Rgb) {
         self.cell_px_w = atlas.cell_w() as f32;
         self.cell_px_h = atlas.cell_h() as f32;
         let count = cells.len().min(self.title_gpu.len());
@@ -527,7 +540,7 @@ impl Renderer {
         self.title_count = count as u32;
         let uniform = self.title_uniform.clone();
         let height = self.top_h;
-        self.write_strip_uniforms(&uniform, self.title_count.max(1), 0.0, height, 0);
+        self.write_strip_uniforms(&uniform, self.title_count.max(1), 0.0, height, strip, strip);
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -539,6 +552,29 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    /// `lo` is inclusive and `hi` is exclusive. `(0, 0)` clears the highlight.
+    pub fn set_selection(&mut self, span: (u32, u32)) {
+        self.selection = span;
+    }
+
+    /// Rewrites the uniforms from the last uploaded grid. The parser is not involved.
+    pub fn refresh_cached(&mut self, composer: Option<[u16; 4]>, accent: Rgb, scrollbar: Range<u32>) -> bool {
+        let Some(frame) = self.presented else {
+            return false;
+        };
+        self.write_uniforms(
+            frame.cols,
+            frame.rows,
+            frame.cursor,
+            frame.scroll_top,
+            frame.scroll_h,
+            composer,
+            accent,
+            scrollbar,
+        );
+        true
+    }
+
     pub fn upload(
         &mut self,
         atlas: &mut Atlas,
@@ -546,6 +582,7 @@ impl Renderer {
         snap: &Snapshot,
         composer: Option<[u16; 4]>,
         accent: Rgb,
+        scrollbar: Range<u32>,
     ) {
         if snap.cols == 0 || snap.rows == 0 {
             return;
@@ -590,7 +627,17 @@ impl Renderer {
             }
             self.flush_atlas(atlas);
         }
-        let grid = self.write_uniforms(snap, composer, accent);
+        self.scrollbar_visible = snap.scroll_h > 0.0 && !scrollbar.is_empty();
+        let grid = self.write_uniforms(
+            snap.cols,
+            snap.rows,
+            snap.cursor,
+            snap.scroll_top,
+            snap.scroll_h,
+            composer,
+            accent,
+            scrollbar,
+        );
         if !snap.images.is_empty() {
             self.images.get_or_insert_with(|| Images::new(&self.device, self.config.format));
         }
@@ -599,7 +646,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, show_images: bool) -> anyhow::Result<()> {
+    pub fn render(&mut self, show_terminal_overlays: bool) -> anyhow::Result<()> {
         let count = u32::from(self.cols) * u32::from(self.rows);
         if count == 0 {
             return Ok(());
@@ -612,7 +659,7 @@ impl Renderer {
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                anyhow::bail!("swapchain rejeitou o frame");
+                anyhow::bail!("swapchain rejected the frame");
             }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -644,18 +691,25 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             if self.title_count > 0 {
                 pass.set_bind_group(0, &self.title_bind, &[]);
-                pass.draw(0..6, 0..self.title_count);
+                pass.draw(0..6, 0..self.title_count + 1);
             }
             if self.bar_count > 0 {
                 pass.set_bind_group(0, &self.bar_bind, &[]);
-                pass.draw(0..6, 0..self.bar_count);
+                pass.draw(0..6, 0..self.bar_count + 1);
             }
             if count > 0 {
                 pass.set_bind_group(0, &self.bind, &[]);
                 pass.draw(0..6, 0..count);
             }
-            if show_images && let Some(images) = &self.images {
-                images.draw(&mut pass);
+            if show_terminal_overlays {
+                if let Some(images) = &self.images {
+                    images.draw(&mut pass);
+                }
+                if self.scrollbar_visible {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.bind, &[]);
+                    pass.draw(0..6, count..count + 1);
+                }
             }
             if let Some(dialog) = &self.dialog {
                 pass.set_bind_group(0, &dialog.bind, &[]);
@@ -687,8 +741,19 @@ impl Renderer {
         self.rows = rows;
     }
 
-    fn write_uniforms(&self, snap: &Snapshot, composer: Option<[u16; 4]>, accent: Rgb) -> Uniforms {
-        let (cursor_col, cursor_row, cursor_on) = match snap.cursor {
+    fn write_uniforms(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cursor: Option<(u16, u16)>,
+        scroll_top: f32,
+        scroll_h: f32,
+        composer: Option<[u16; 4]>,
+        accent: Rgb,
+        scrollbar: Range<u32>,
+    ) -> Uniforms {
+        self.presented = Some(Presented { cols, rows, cursor, scroll_top, scroll_h });
+        let (cursor_col, cursor_row, cursor_on) = match cursor {
             Some((col, row)) => (u32::from(col), u32::from(row), 1),
             None => (0, 0, 0),
         };
@@ -697,33 +762,37 @@ impl Renderer {
         let surf_w = self.config.width as f32;
         let surf_h = self.config.height as f32;
         let uniforms = Uniforms {
-            cols: u32::from(snap.cols),
-            rows: u32::from(snap.rows),
+            cols: u32::from(cols),
+            rows: u32::from(rows),
             cursor_col,
             cursor_row,
             cursor_on,
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
             _reserved: 0,
-            // A topbar e a faixa de abas começam em x=0. Centralizar a grade
-            // empurra a rolagem para depois do fim da topbar.
             pad_x: 0.0,
             pad_y: self.top_h,
             cell_w,
             cell_h,
             surf_w,
             surf_h,
-            scroll_top: snap.scroll_top,
-            scroll_h: snap.scroll_h,
+            scroll_top,
+            scroll_h,
             composer: composer.map_or([0; 4], |bounds| bounds.map(u32::from)),
             composer_accent: accent.pack(),
-            _composer_padding: [0; 3],
+            fill_bg: self.clear.pack(),
+            scroll_left: scrollbar.start as f32,
+            scroll_right: scrollbar.end as f32,
+            sel_lo: self.selection.0,
+            sel_hi: self.selection.1,
+            _sel_pad0: 0,
+            _sel_pad1: 0,
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         uniforms
     }
 
-    fn write_strip_uniforms(&self, buf: &wgpu::Buffer, cols: u32, pad_y: f32, strip_h: f32, strip: u32) {
+    fn write_strip_uniforms(&self, buf: &wgpu::Buffer, cols: u32, pad_y: f32, strip_h: f32, strip: Rgb, edge: Rgb) {
         let cell_w = self.cell_px_w.max(1.0);
         let glyph_h = self.cell_px_h.max(1.0);
         let cell_h = strip_h.max(glyph_h);
@@ -745,8 +814,14 @@ impl Renderer {
             scroll_top: 0.0,
             scroll_h: 0.0,
             composer: [0; 4],
-            composer_accent: strip,
-            _composer_padding: [0; 3],
+            composer_accent: strip.pack(),
+            fill_bg: edge.pack(),
+            scroll_left: 0.0,
+            scroll_right: 0.0,
+            sel_lo: 0,
+            sel_hi: 0,
+            _sel_pad0: 0,
+            _sel_pad1: 0,
         };
         self.queue.write_buffer(buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -911,8 +986,35 @@ fn make_bind(
     })
 }
 
+fn present_mode(vsync: bool, modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if !vsync {
+        if modes.contains(&wgpu::PresentMode::AutoNoVsync) {
+            return wgpu::PresentMode::AutoNoVsync;
+        }
+        if modes.contains(&wgpu::PresentMode::Immediate) {
+            return wgpu::PresentMode::Immediate;
+        }
+        return wgpu::PresentMode::Fifo;
+    }
+    if modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::present_mode;
+
+    #[test]
+    fn mailbox_keeps_vsync_without_queueing_frames() {
+        use wgpu::PresentMode::{AutoNoVsync, Fifo, Mailbox};
+        assert_eq!(present_mode(true, &[Fifo, Mailbox]), Mailbox);
+        assert_eq!(present_mode(true, &[Fifo]), Fifo);
+        assert_eq!(present_mode(false, &[Fifo, Mailbox, AutoNoVsync]), AutoNoVsync);
+    }
+
     #[test]
     fn tab_shader_is_valid_wgsl() {
         let module = wgpu::naga::front::wgsl::parse_str(include_str!("shader.wgsl")).expect("shader");
@@ -920,6 +1022,6 @@ mod tests {
             wgpu::naga::valid::ValidationFlags::all(),
             wgpu::naga::valid::Capabilities::all(),
         );
-        validator.validate(&module).expect("shader válido");
+        validator.validate(&module).expect("valid shader");
     }
 }

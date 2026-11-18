@@ -2,47 +2,68 @@
 
 <img src="assets/brand/rustty-lockup.svg" alt="Rustty" width="280">
 
-Terminal Linux nativo, em Rust. A tela sai por Vulkan e as abas ficam no rodapé.
+A performance-focused CLI for LLMs. Written in Rust, drawn on the GPU, with the NPU on the roadmap.
 
-<img src="docs/rustty-appearance.png" alt="Rustty com o painel de aparência" width="820">
+<img src="docs/rustty-appearance.png" alt="Rustty with the appearance panel open" width="820">
 
 </div>
 
-## Uso
+Rustty is a native Linux terminal for the model CLIs that stay open all day: Claude, Codex, Kiro, Antigravity, and Cursor. The cell grid is rendered with Vulkan. Glyphs live in VRAM, the parser stays off the present path, and only the rows that changed are uploaded. Scrollback is already staged in an Intel NPU buffer. The next step is to run search on that processor once a compiled command graph is in place.
 
-Abre um shell em cada aba. O diretório inicial fica em `~/.config/rustty/ui.conf`, na chave `cwd`.
+## Run
+
+Each tab is its own shell. The starting directory is `cwd` in `~/.config/rustty/ui.conf`.
 
 ```bash
 rustty
 ```
 
-A engrenagem no canto da faixa, ou `Ctrl+,`, abre fonte, tamanho e tema. A escolha fica no mesmo arquivo.
+The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. The choice is stored in the same file.
+
+`TERM` is `xterm-256color`. `TERM_PROGRAM` is `rustty-kitty`, so Codex can see that Kitty graphics are available and draw `/pets` in the session.
+
+## The screen
+
+The window is a grid of cells, not a texture of the whole frame. A dirty row is the unit of upload. Box drawing and Nerd Font symbols are rasterized to meet the cell edge, so prompts stay aligned. Images from the Kitty graphics protocol, including Codex pets, are composited on the GPU with the alpha of the PNG.
 
 <div align="center">
 
-<img src="docs/rustty-agents.png" alt="Abas com o programa em primeiro plano" width="820">
+<img src="docs/rustty-agents.png" alt="Tabs showing the CLI in the foreground" width="820">
 
 </div>
 
-Enquanto Claude, Codex, Kiro, Antigravity ou Cursor estão em primeiro plano, a aba mostra o ícone correspondente. No resto do tempo, mostra o do Rustty.
+While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab shows that icon. Otherwise it shows Rustty.
 
-## Atalhos
+## The NPU
 
-| Atalho | Efeito |
+`rustty-probe` reports the Vulkan device and, when present, the Intel NPU. Lines that leave the screen are hashed and written into a buffer mapped on that processor. The firmware does not run a graph until a compiled `RTY1` command buffer is submitted. That graph is the planned path for scrollback search. Until then, the index stays on the CPU and the screen stays on the GPU.
+
+`rustty-bench` measures the parser.
+
+## Keys
+
+| Shortcut | Action |
 | --- | --- |
-| `Ctrl+Shift+T` | abre uma aba |
-| `Ctrl+Shift+W` ou `Ctrl+Shift+Q` | fecha a aba |
-| `Ctrl+Shift+←` / `→` | aba anterior / próxima |
-| `Ctrl+PageUp` / `PageDown` | aba anterior / próxima |
-| `Ctrl+Shift+1` … `9` | vai para a aba |
-| `Shift+PageUp` / `PageDown` | rola o scrollback |
-| `Ctrl+,` | aparência |
+| `Ctrl+Shift+T` | open a tab |
+| `Ctrl+Shift+W` or `Ctrl+Shift+Q` | close the tab |
+| `Ctrl+Shift+←` / `→` | previous / next tab |
+| `Ctrl+PageUp` / `PageDown` | previous / next tab |
+| `Ctrl+Shift+1` … `9` | jump to a tab |
+| `Shift+PageUp` / `PageDown` | scroll the scrollback |
+| drag | select text; the selection is copied when the button is released |
+| double-click / triple-click | select a word / the line |
+| `Ctrl+Shift+C` | copy the selection |
+| `Ctrl+Shift+V` | paste |
+| middle-click | paste the primary selection |
+| `Ctrl+,` | appearance |
 
-O que não está nessa lista segue para o shell. `TERM` é `xterm-256color`.
+Anything else goes to the shell.
 
-## Instalação
+A click on an `http://` or `https://` address opens it in the browser. A click on a file path opens that file in the default application for its type. A trailing `:line` or `:line:column` is ignored, and a relative path is resolved from the shell's directory. An application that is already open receives the target. A new window appears only when none is open.
 
-Precisa de Rust, `pkg-config`, Vulkan e FreeType.
+## Install
+
+You need Rust, `pkg-config`, Vulkan, and FreeType.
 
 ```bash
 git clone https://github.com/gutopardini/rustty && cd rustty
@@ -52,10 +73,8 @@ install -Dm644 assets/brand/rustty-icon.svg "$HOME/.local/share/icons/hicolor/sc
 install -Dm644 packaging/linux/rustty.desktop "$HOME/.local/share/applications/rustty.desktop"
 ```
 
-`~/.local/bin` precisa estar no `PATH` da sessão gráfica.
+`~/.local/bin` needs to be on the `PATH` of the graphical session.
 
-`rustty-probe` mostra a GPU e, se existir, a NPU Intel. `rustty-bench` mede o parser.
-
-## Licença
+## License
 
 MIT.

@@ -5,7 +5,7 @@ use vte::{Params, Perform};
 
 use crate::cell::{Cell, BOLD, DIM, ITALIC, REVERSE, SPACER, UNDERLINE, WIDE};
 use crate::color::{self, Rgb, DEFAULT_BG, DEFAULT_FG};
-use crate::graphics::{Graphics, Parser, Placement, Update};
+use crate::graphics::{decode_job, DecodeJob, Graphics, Image, Parser, Placement, Prepared, Update};
 
 const MAX_SCROLLBACK: usize = 10_000;
 const MAX_PENDING: usize = 256;
@@ -34,8 +34,8 @@ struct Screen {
     graphics: Graphics,
     cols: u16,
     rows: u16,
-    /// Linha física que aparece no topo. Rolar a tela inteira gira este índice
-    /// em vez de deslocar `rows * cols` células.
+    /// Physical line shown at the top. Scrolling the whole screen rotates this
+    /// index instead of moving `rows * cols` cells.
     origin: u16,
 }
 
@@ -81,7 +81,7 @@ impl Screen {
     }
 }
 
-/// Foto da área visível para o render. Linhas sujas evitam reenviar a grade inteira.
+/// Snapshot of the visible area for rendering. Dirty rows avoid reuploading the whole grid.
 pub struct Snapshot {
     pub cols: u16,
     pub rows: u16,
@@ -94,6 +94,8 @@ pub struct Snapshot {
     pub title_changed: bool,
     pub suspended: bool,
     pub changed: bool,
+    /// Cells changed. A history view or a pet frame does not set this.
+    pub content_changed: bool,
     pub scroll_top: f32,
     pub scroll_h: f32,
 }
@@ -123,6 +125,14 @@ pub struct Term {
     app_cursor: bool,
     origin_mode: bool,
     pending_wrap: bool,
+    bracketed_paste: bool,
+    mouse_normal: bool,
+    mouse_button: bool,
+    mouse_any: bool,
+    mouse_sgr: bool,
+    mouse_pixels: bool,
+    /// Wheel sends cursor keys while the alternate screen is up.
+    alt_scroll: bool,
     parser: Parser,
     replies: Vec<u8>,
     cols: u16,
@@ -161,6 +171,13 @@ impl Term {
             app_cursor: false,
             origin_mode: false,
             pending_wrap: false,
+            bracketed_paste: false,
+            mouse_normal: false,
+            mouse_button: false,
+            mouse_any: false,
+            mouse_sgr: false,
+            mouse_pixels: false,
+            alt_scroll: false,
             parser: Parser::default(),
             replies: Vec::new(),
             cols,
@@ -221,7 +238,15 @@ impl Term {
         self.app_cursor
     }
 
-    /// Retorna o retângulo colorido do composer ativo do Codex, em células.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// Colored rectangle of the active Codex composer, in cells.
     pub(crate) fn codex_composer(&self) -> Option<[u16; 4]> {
         if !self.cursor_visible || self.suspend || self.view_offset != 0 {
             return None;
@@ -245,7 +270,7 @@ impl Term {
             return None;
         }
 
-        // Miniaturas e trechos estilizados podem ter outra cor dentro da caixa.
+        // Thumbnails and styled spans can use another color inside the box.
         let same_edges = |row| {
             self.cell(row, left).bg == bg
                 && self.cell(row, right - 1).bg == bg
@@ -269,15 +294,75 @@ impl Term {
         prompt.then_some([left, top, right, bottom])
     }
 
-    pub fn advance(&mut self, bytes: &[u8]) {
-        let mut parser = std::mem::take(&mut self.parser);
-        parser.advance(self, bytes);
-        self.parser = parser;
+    pub fn advance(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let (used, job) = self.advance_until_image(bytes);
+            if let Some(job) = job {
+                let image = decode_job(&job);
+                self.finish_image(job, image);
+            }
+            if used == 0 {
+                break;
+            }
+            bytes = &bytes[used..];
+        }
     }
 
-    pub(crate) fn graphics_command(&mut self, bytes: &[u8]) {
-        let screen = if self.alt_on { &mut self.alt } else { &mut self.primary };
-        match screen.graphics.command(bytes, self.cursor.row, self.cursor.col, &mut self.replies) {
+    /// Parse until the next image payload. Deletes and text are applied immediately.
+    pub(crate) fn advance_until_image(&mut self, mut bytes: &[u8]) -> (usize, Option<DecodeJob>) {
+        let mut consumed = 0;
+        while !bytes.is_empty() {
+            let (used, command) = {
+                let mut parser = std::mem::take(&mut self.parser);
+                let (rest, command) = parser.advance(self, bytes);
+                let used = bytes.len() - rest.len();
+                self.parser = parser;
+                (used, command)
+            };
+            if used == 0 {
+                break;
+            }
+            consumed += used;
+            if let Some(command) = command
+                && let Some(job) = self.prepare_graphics(&command)
+            {
+                return (consumed, Some(job));
+            }
+            bytes = &bytes[used..];
+        }
+        (consumed, None)
+    }
+
+    pub(crate) fn decode_image(job: &DecodeJob) -> Option<Image> {
+        decode_job(job)
+    }
+
+    fn prepare_graphics(&mut self, bytes: &[u8]) -> Option<DecodeJob> {
+        let prepared = {
+            let screen = if self.alt_on { &mut self.alt } else { &mut self.primary };
+            screen
+                .graphics
+                .command(bytes, self.cursor.row, self.cursor.col, &mut self.replies)
+        };
+        match prepared {
+            Prepared::Update(update) => {
+                self.apply_graphics_update(update);
+                None
+            }
+            Prepared::Decode(job) => Some(job),
+        }
+    }
+
+    pub(crate) fn finish_image(&mut self, job: DecodeJob, image: Option<Image>) {
+        let update = {
+            let screen = if self.alt_on { &mut self.alt } else { &mut self.primary };
+            screen.graphics.finish(job, image, &mut self.replies)
+        };
+        self.apply_graphics_update(update);
+    }
+
+    fn apply_graphics_update(&mut self, update: Update) {
+        match update {
             Update::Unchanged => {}
             Update::Changed => self.graphics_dirty = true,
             Update::MoveCursor { cols, rows } => {
@@ -313,22 +398,85 @@ impl Term {
         self.alt_on
     }
 
+    fn mouse_enabled(&self) -> bool {
+        self.mouse_normal || self.mouse_button || self.mouse_any
+    }
+
+    /// Bytes for the app that owns this screen. `None` means the wheel scrolls this tab's history.
+    /// `steps` follows winit: positive reveals older lines. `col` and `row` are 1-based.
+    pub fn wheel_bytes(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Option<Vec<u8>> {
+        if steps == 0 || !self.mouse_enabled() {
+            return None;
+        }
+        let up = steps > 0;
+        let n = steps.unsigned_abs().min(40);
+        let button: u16 = if up { 64 } else { 65 };
+        let (x, y) = if self.mouse_pixels {
+            (pixel.0.max(1), pixel.1.max(1))
+        } else {
+            (u32::from(col.max(1)), u32::from(row.max(1)))
+        };
+        let mut out = Vec::new();
+        for _ in 0..n {
+            if self.mouse_sgr || self.mouse_pixels {
+                let mut text = String::new();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut text,
+                    format_args!("\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m"),
+                );
+                out.extend(text.into_bytes());
+            } else {
+                let b = (button as u8).saturating_add(32);
+                let cx = (x.min(223) as u8).saturating_add(32);
+                let cy = (y.min(223) as u8).saturating_add(32);
+                out.extend_from_slice(&[0x1b, b'[', b'M', b, cx, cy]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Cursor keys for an app that asked to turn the wheel into arrows.
+    fn arrow_bytes(&self, steps: isize) -> Vec<u8> {
+        let up = steps > 0;
+        let seq: &[u8] = if self.app_cursor {
+            if up { b"\x1bOA" } else { b"\x1bOB" }
+        } else if up {
+            b"\x1b[A"
+        } else {
+            b"\x1b[B"
+        };
+        let n = steps.unsigned_abs().min(40) as usize;
+        let mut out = Vec::with_capacity(seq.len() * n);
+        for _ in 0..n {
+            out.extend_from_slice(seq);
+        }
+        out
+    }
+
+    /// What this tab's wheel should do. `Some` goes to the pty. `None` scrolls this tab's history.
+    pub fn wheel_write(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.wheel_bytes(steps, col, row, pixel) {
+            return Some(bytes);
+        }
+        if self.alt_on && self.alt_scroll {
+            return Some(self.arrow_bytes(steps));
+        }
+        None
+    }
+
     pub fn scroll_view(&mut self, delta: isize) {
         self.set_view((self.view_offset as isize + delta).clamp(0, self.scrollback.len() as isize) as usize);
     }
 
-    /// `from_top` 0 mostra o trecho mais antigo. 1 volta para o final da conversa.
+    /// `from_top` 0 shows the oldest span. 1 returns to the end of the session.
     pub fn scroll_to(&mut self, from_top: f32) {
         let max = self.scrollback.len() as f32;
         let offset = ((1.0 - from_top.clamp(0.0, 1.0)) * max).round() as usize;
         self.set_view(offset.min(self.scrollback.len()));
     }
 
-    /// Topo e altura do polegar, frações da grade. Sem histórico, os dois ficam em 0.
+    /// Thumb top and height, as fractions of the grid. With no history, both stay 0.
     pub fn scroll_metrics(&self) -> (f32, f32) {
-        if self.alt_on {
-            return (0.0, 0.0);
-        }
         let history = self.scrollback.len();
         if history == 0 {
             return (0.0, 0.0);
@@ -388,7 +536,8 @@ impl Term {
                 title: if title_changed { self.title.clone() } else { String::new() },
                 title_changed,
                 suspended: true,
-                changed: title_changed,
+                changed: true,
+                content_changed: false,
                 scroll_top: 0.0,
                 scroll_h: 0.0,
             };
@@ -430,6 +579,7 @@ impl Term {
             self.screen().graphics.placements.iter().cloned().collect()
         };
         let changed = full || !rows_dirty.is_empty() || title_changed || self.graphics_dirty;
+        let content_changed = self.damage_all || self.dirty.iter().any(|flag| *flag);
         let (scroll_top, scroll_h) = self.scroll_metrics();
         self.damage_all = false;
         self.graphics_dirty = false;
@@ -446,9 +596,98 @@ impl Term {
             title_changed,
             suspended: false,
             changed,
+            content_changed,
             scroll_top,
             scroll_h,
         }
+    }
+
+    /// Address or file path covering this cell of the visible screen.
+    /// A trailing `:line` or `:line:column` stays clickable, and the returned path omits it.
+    pub fn link_at(&self, row: u16, col: u16) -> Option<String> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let mut cells = Vec::with_capacity(usize::from(self.cols));
+        self.append_visible(row, &mut cells);
+        url_covering(&cells, usize::from(col))
+    }
+
+    /// Text covered by the two cells, in reading order. Trailing spaces on each line are dropped.
+    pub fn selected_text(&self, anchor: (u16, u16), focus: (u16, u16)) -> String {
+        let cols = self.cols.max(1);
+        let linear = |cell: (u16, u16)| {
+            let col = cell.0.min(cols - 1);
+            let row = cell.1.min(self.rows.saturating_sub(1));
+            u32::from(row) * u32::from(cols) + u32::from(col)
+        };
+        let (lo, hi) = {
+            let a = linear(anchor);
+            let b = linear(focus);
+            if a <= b { (a, b) } else { (b, a) }
+        };
+        let row0 = (lo / u32::from(cols)) as u16;
+        let row1 = (hi / u32::from(cols)) as u16;
+        let col0 = (lo % u32::from(cols)) as u16;
+        let col1 = (hi % u32::from(cols)) as u16;
+        let mut lines = Vec::new();
+        for row in row0..=row1 {
+            let from = if row == row0 { col0 } else { 0 };
+            let to = if row == row1 { col1 } else { cols - 1 };
+            let mut line = String::new();
+            for glyph in self.glyphs(row) {
+                if glyph.end < from || glyph.start > to {
+                    continue;
+                }
+                line.push(glyph.ch);
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    /// The word under this cell, or the cell itself when it is not part of a word.
+    pub fn word_span(&self, col: u16, row: u16) -> ((u16, u16), (u16, u16)) {
+        let glyphs = self.glyphs(row);
+        let Some(index) = glyphs.iter().position(|glyph| glyph.start <= col && col <= glyph.end) else {
+            return ((col, row), (col, row));
+        };
+        if !is_word(glyphs[index].ch) {
+            let glyph = &glyphs[index];
+            return ((glyph.start, row), (glyph.end, row));
+        }
+        let mut from = index;
+        let mut to = index;
+        while from > 0 && is_word(glyphs[from - 1].ch) {
+            from -= 1;
+        }
+        while to + 1 < glyphs.len() && is_word(glyphs[to + 1].ch) {
+            to += 1;
+        }
+        ((glyphs[from].start, row), (glyphs[to].end, row))
+    }
+
+    fn glyphs(&self, row: u16) -> Vec<Glyph> {
+        let mut cells = Vec::new();
+        self.append_visible(row, &mut cells);
+        let mut glyphs = Vec::new();
+        let mut col = 0u16;
+        for cell in cells {
+            if cell.flags & SPACER != 0 {
+                continue;
+            }
+            let width: u16 = if cell.flags & WIDE != 0 { 2 } else { 1 };
+            let ch = char::from_u32(cell.cp)
+                .filter(|ch| cell.cp != 0 && !ch.is_control())
+                .unwrap_or(' ');
+            let end = col.saturating_add(width.saturating_sub(1));
+            glyphs.push(Glyph { start: col, end, ch });
+            col = col.saturating_add(width);
+        }
+        glyphs
     }
 
     fn append_visible(&self, row: u16, dst: &mut Vec<Cell>) {
@@ -562,7 +801,7 @@ impl Term {
         let start = usize::from(top) * cols;
         let end = start + height * cols;
         let blank = self.blank();
-        if lines > 0 && !self.alt_on && top == 0 {
+        if lines > 0 && top == 0 {
             for row in 0..shift_rows {
                 let mut line = self.alloc_line();
                 let from = row * cols;
@@ -591,7 +830,7 @@ impl Term {
         }
     }
 
-    /// Rola a tela inteira girando a origem. Uma linha custa uma cópia de `cols` células.
+    /// Scrolls the whole screen by rotating the origin. One line costs a copy of `cols` cells.
     fn scroll_full(&mut self, lines: i16) {
         let shift_rows = (lines.unsigned_abs() as usize).min(usize::from(self.rows));
         if shift_rows == 0 {
@@ -603,12 +842,10 @@ impl Term {
         let cols = usize::from(self.cols);
         if lines > 0 {
             for _ in 0..shift_rows {
-                if !self.alt_on {
-                    let mut line = self.alloc_line();
-                    let start = self.screen().line_start(0);
-                    line.extend_from_slice(&self.screen().cells[start..start + cols]);
-                    self.remember(line);
-                }
+                let mut line = self.alloc_line();
+                let start = self.screen().line_start(0);
+                line.extend_from_slice(&self.screen().cells[start..start + cols]);
+                self.remember(line);
                 let screen = self.screen_mut();
                 screen.origin = ((usize::from(screen.origin) + 1) % rows) as u16;
                 let cleared = screen.line_start(height - 1);
@@ -757,6 +994,13 @@ impl Term {
         self.app_cursor = false;
         self.origin_mode = false;
         self.pending_wrap = false;
+        self.bracketed_paste = false;
+        self.mouse_normal = false;
+        self.mouse_button = false;
+        self.mouse_any = false;
+        self.mouse_sgr = false;
+        self.mouse_pixels = false;
+        self.alt_scroll = false;
         self.suspend = false;
         self.damage_all();
     }
@@ -870,7 +1114,13 @@ impl Term {
                     self.mark(self.cursor.row);
                 }
                 47 | 1047 | 1049 => self.set_alt(enable),
-                2004 => {}
+                1000 => self.mouse_normal = enable,
+                1002 => self.mouse_button = enable,
+                1003 => self.mouse_any = enable,
+                1006 => self.mouse_sgr = enable,
+                1007 => self.alt_scroll = enable,
+                1016 => self.mouse_pixels = enable,
+                2004 => self.bracketed_paste = enable,
                 2026 => {
                     self.suspend = enable;
                     if !enable {
@@ -1174,7 +1424,7 @@ impl Term {
         self.mark(row);
     }
 
-    /// Caminho comum: ASCII de uma coluna, sem wrap e sem glifo largo por baixo.
+    /// Common path: one-column ASCII, with no wrap and no wide glyph underneath.
     #[inline(always)]
     fn put_ascii(&mut self, ch: char) -> bool {
         let byte = ch as u32;
@@ -1202,14 +1452,196 @@ impl Term {
     }
 }
 
-/// Colunas que o glifo ocupa. Uso privado (Nerd Font / Oh My Posh) é sempre 1:
-/// o unicode-width marca essa faixa como ambígua e o prompt conta cada diamante
-/// como uma coluna.
+struct Glyph {
+    start: u16,
+    end: u16,
+    ch: char,
+}
+
+fn is_word(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(ch, '_' | '-' | '.' | '/' | ':' | '@' | '+' | '%' | '~' | '?' | '=' | '&' | '#')
+}
+
+/// Columns the glyph occupies. Private-use glyphs (Nerd Font / Oh My Posh) are
+/// always 1: unicode-width marks that range as ambiguous, and the prompt counts
+/// each diamond as one column.
 fn columns(ch: char) -> u16 {
     if is_private_use(ch) {
         return 1;
     }
     UnicodeWidthChar::width(ch).unwrap_or(0) as u16
+}
+
+fn url_covering(cells: &[Cell], col: usize) -> Option<String> {
+    let mut text = String::new();
+    let mut columns = Vec::new();
+    let mut cursor = 0usize;
+    for cell in cells {
+        if cell.flags & SPACER != 0 {
+            cursor += 1;
+            continue;
+        }
+        let ch = char::from_u32(cell.cp).filter(|ch| !ch.is_control()).unwrap_or(' ');
+        let width = if cell.flags & WIDE != 0 { 2 } else { 1 };
+        columns.push((text.len(), cursor, cursor + width));
+        text.push(ch);
+        cursor += width;
+    }
+    let mut index = 0;
+    while index < text.len() {
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        if matches!(ch, '"' | '\'' | '`') {
+            let start = index + ch.len_utf8();
+            if let Some(rel) = text[start..].find(ch) {
+                let end = start + rel;
+                if let Some(target) = classify_link(&text[start..end]) {
+                    if covers(&columns, start, end, col) {
+                        return Some(target);
+                    }
+                }
+                index = end + ch.len_utf8();
+                continue;
+            }
+        }
+        if is_link_delim(ch) {
+            index += ch.len_utf8();
+            continue;
+        }
+        let start = index;
+        let mut end = start;
+        for ch in text[start..].chars() {
+            if is_link_delim(ch) {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        if let Some(target) = classify_link(&text[start..end]) {
+            if covers(&columns, start, end, col) {
+                return Some(target);
+            }
+        }
+        index = end.max(start + 1);
+    }
+    None
+}
+
+fn is_link_delim(ch: char) -> bool {
+    ch.is_whitespace()
+        || ch.is_control()
+        || matches!(ch, '<' | '>' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';')
+}
+
+fn covers(columns: &[(usize, usize, usize)], start: usize, end: usize, col: usize) -> bool {
+    let mut from = None;
+    let mut to = 0usize;
+    for &(byte, col_from, col_to) in columns {
+        if byte >= start && byte < end {
+            if from.is_none() {
+                from = Some(col_from);
+            }
+            to = col_to;
+        }
+    }
+    from.is_some_and(|from| (from..to).contains(&col))
+}
+
+/// URL, or a file path with a trailing `:line` or `:line:column` removed.
+fn classify_link(raw: &str) -> Option<String> {
+    let token = raw.trim_end_matches(['.', ',', '!', '?', ';']);
+    if token.starts_with("https://") || token.starts_with("http://") {
+        let scheme = if token.starts_with("https://") { "https://".len() } else { "http://".len() };
+        return (token.len() > scheme).then(|| token.to_string());
+    }
+    if let Some(path) = file_url_path(token) {
+        return is_file_token(&path).then_some(path);
+    }
+    let located = strip_location(token);
+    let path = located.trim_end_matches(['.', ',', '!', '?', ';', ':']);
+    is_file_token(path).then(|| path.to_string())
+}
+
+fn strip_location(token: &str) -> &str {
+    let once = strip_number(token);
+    let twice = once.and_then(strip_number);
+    if let Some(path) = twice {
+        if is_file_token(path) {
+            return path;
+        }
+    }
+    if let Some(path) = once {
+        if is_file_token(path) {
+            return path;
+        }
+    }
+    token
+}
+
+fn strip_number(token: &str) -> Option<&str> {
+    let (head, tail) = token.rsplit_once(':')?;
+    (!tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())).then_some(head)
+}
+
+fn file_url_path(token: &str) -> Option<String> {
+    let rest = token.strip_prefix("file://")?;
+    let path = if let Some(stripped) = rest.strip_prefix("//") {
+        stripped
+    } else if rest.starts_with('/') {
+        rest
+    } else if let Some((host, path)) = rest.split_once('/') {
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            path
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    let path = if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
+    Some(percent_decode(&path))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_file_token(path: &str) -> bool {
+    if path.is_empty() || path.contains("://") || path.starts_with("//") || path.contains('\0') {
+        return false;
+    }
+    if matches!(path, "." | ".." | "~" | "/") {
+        return false;
+    }
+    if path.starts_with("~/") || path.starts_with('/') || path.contains('/') {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if let Some((stem, ext)) = name.rsplit_once('.') {
+        if !stem.is_empty()
+            && !ext.is_empty()
+            && ext.len() <= 10
+            && ext.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    name.starts_with('.') && name.len() > 1 && !name.contains(['/', ' '])
 }
 
 fn is_private_use(ch: char) -> bool {
@@ -1352,6 +1784,33 @@ mod tests {
     }
 
     #[test]
+    fn alt_screen_scrolls_its_own_history() {
+        let mut term = Term::new(4, 2);
+        term.advance(b"\x1b[?1049haaaa\r\nbbbb\r\ncccc");
+        assert!(term.alt_screen());
+        assert_eq!(text(&term), "bbbb\ncccc");
+        assert!(term.wheel_write(1, 1, 1, (1, 1)).is_none());
+        term.scroll_view(1);
+        let snap = term.snapshot();
+        let row0: String = snap.cells.iter().take(4).map(cell_char).collect();
+        assert_eq!(row0, "aaaa");
+        assert!(snap.scroll_h > 0.0);
+    }
+
+    #[test]
+    fn mouse_wheel_is_reported_for_the_program_that_asked() {
+        let mut term = Term::new(8, 4);
+        term.advance(b"\x1b[?1000h\x1b[?1006h");
+        let up = term.wheel_write(1, 3, 2, (9, 8)).expect("sgr");
+        assert_eq!(up, b"\x1b[<64;3;2M\x1b[<64;3;2m");
+        term.advance(b"\x1b[?1006l");
+        let legacy = term.wheel_write(-1, 1, 1, (1, 1)).expect("x10");
+        assert_eq!(legacy, b"\x1b[Ma!!");
+        term.advance(b"\x1b[?1000l\x1b[?1007h\x1b[?1049h");
+        assert_eq!(term.wheel_write(2, 1, 1, (1, 1)).as_deref(), Some(&b"\x1b[A\x1b[A"[..]));
+    }
+
+    #[test]
     fn scroll_view_reveals_the_line_that_left() {
         let mut term = Term::new(4, 2);
         term.advance(b"aaaa\r\nbbbb\r\ncccc");
@@ -1391,6 +1850,36 @@ mod tests {
     }
 
     #[test]
+    fn selection_reads_across_lines_and_wide_characters() {
+        let mut term = Term::new(6, 2);
+        term.advance(b"ab cd\r\nxy");
+        assert_eq!(term.selected_text((1, 0), (0, 1)), "b cd\nx");
+        assert_eq!(term.word_span(3, 0), ((3, 0), (4, 0)));
+        let mut wide = Term::new(4, 1);
+        wide.advance("你a".as_bytes());
+        assert_eq!(wide.selected_text((1, 0), (2, 0)), "你a");
+        assert_eq!(wide.word_span(1, 0), ((0, 0), (2, 0)));
+    }
+
+    #[test]
+    fn selection_reads_the_scrolled_line() {
+        let mut term = Term::new(4, 1);
+        term.advance(b"abcd\r\nefgh");
+        term.scroll_view(1);
+        assert_eq!(term.selected_text((0, 0), (3, 0)), "abcd");
+    }
+
+    #[test]
+    fn bracketed_paste_follows_the_mode() {
+        let mut term = Term::new(8, 2);
+        assert!(!term.bracketed_paste());
+        term.advance(b"\x1b[?2004h");
+        assert!(term.bracketed_paste());
+        term.advance(b"\x1b[?2004l");
+        assert!(!term.bracketed_paste());
+    }
+
+    #[test]
     fn wide_char_uses_spacer() {
         let mut term = Term::new(4, 1);
         term.advance("你".as_bytes());
@@ -1412,6 +1901,33 @@ mod tests {
     }
 
     #[test]
+    fn click_on_a_url_returns_that_address() {
+        let mut term = Term::new(80, 2);
+        term.advance(b"veja https://github.com/gutopardini/rustty. e http://exemplo.test/a)\n");
+        assert_eq!(term.link_at(0, 4), None);
+        assert_eq!(
+            term.link_at(0, 6).as_deref(),
+            Some("https://github.com/gutopardini/rustty")
+        );
+        let second = term.link_at(0, 46).expect("second address");
+        assert_eq!(second, "http://exemplo.test/a");
+        assert_eq!(term.link_at(0, 70), None);
+    }
+
+    #[test]
+    fn click_on_a_path_returns_the_file_without_the_line() {
+        let mut term = Term::new(80, 2);
+        term.advance(b"veja src/app.rs:120:4 e /tmp/notas.md.\n");
+        assert_eq!(term.link_at(0, 5).as_deref(), Some("src/app.rs"));
+        assert_eq!(term.link_at(0, 16).as_deref(), Some("src/app.rs"));
+        assert_eq!(term.link_at(0, 24).as_deref(), Some("/tmp/notas.md"));
+        term.advance(b"\r\n`README.md` \"~/proj/a b.rs\" file:///tmp/a%20b.txt");
+        assert_eq!(term.link_at(1, 1).as_deref(), Some("README.md"));
+        assert_eq!(term.link_at(1, 14).as_deref(), Some("~/proj/a b.rs"));
+        assert_eq!(term.link_at(1, 32).as_deref(), Some("/tmp/a b.txt"));
+    }
+
+    #[test]
     fn osc_title() {
         let mut term = Term::new(8, 2);
         term.advance(b"\x1b]2;Rustty\x07");
@@ -1421,7 +1937,7 @@ mod tests {
     #[test]
     fn oh_my_posh_diamonds_keep_truecolor() {
         let mut term = Term::new(80, 4);
-        // O bash consome \[ \] antes de escrever no PTY. O que chega é SGR + PUA.
+        // Bash consumes \[ \] before writing to the PTY. What arrives is SGR + PUA.
         term.advance(
             b"\x1b[32m\xee\x83\x87\x1b[0m\x1b[42m\x1b[38;2;255;255;255m rustty \x1b[0m\x1b[32m\xee\x83\x86\x1b[0m ",
         );

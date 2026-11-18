@@ -15,7 +15,7 @@ fn report(name: &str, bytes: &[u8]) {
     term.advance(bytes);
     let elapsed = start.elapsed().as_secs_f64().max(1e-9);
     let mb = bytes.len() as f64 / (1024.0 * 1024.0);
-    println!("{name:<8} {mb:6.2} MiB em {elapsed:7.3} s   {:>7.1} MiB/s", mb / elapsed);
+    println!("{name:<8} {mb:6.2} MiB in {elapsed:7.3} s   {:>7.1} MiB/s", mb / elapsed);
 }
 
 fn ascii(megabytes: usize) -> Vec<u8> {
@@ -29,7 +29,7 @@ fn ascii(megabytes: usize) -> Vec<u8> {
 
 fn unicode(megabytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(megabytes * 1024 * 1024);
-    let line = "ação não é ASCII — 你\r\n".as_bytes();
+    let line = "café is not ASCII — 你\r\n".as_bytes();
     while out.len() < megabytes * 1024 * 1024 {
         out.extend_from_slice(line);
     }

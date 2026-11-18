@@ -17,6 +17,13 @@ struct Uniforms {
     scroll_h: f32,
     composer: vec4<u32>,
     composer_accent: u32,
+    fill_bg: u32,
+    scroll_left: f32,
+    scroll_right: f32,
+    sel_lo: u32,
+    sel_hi: u32,
+    _sel_pad0: u32,
+    _sel_pad1: u32,
 }
 
 struct Cell {
@@ -41,6 +48,8 @@ struct Glyph {
 @group(0) @binding(5) var agent_icons: texture_2d<f32>;
 
 const CURSOR_CELL: u32 = 0x80000000u;
+const EXTRA_QUAD: u32 = 0x40000000u;
+const SELECTED: u32 = 0x20000000u;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -61,6 +70,24 @@ fn unpack_color(color: u32) -> vec4<f32> {
     );
 }
 
+fn clip_position(p: vec2<f32>) -> vec4<f32> {
+    let ndc_x = p.x / max(u.surf_w, 1.0) * 2.0 - 1.0;
+    let ndc_y = 1.0 - p.y / max(u.surf_h, 1.0) * 2.0;
+    return vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+}
+
+// The instance after the grid fills the leftover strip or draws the scrollbar.
+fn fill_quad(corner: vec2<f32>) -> VsOut {
+    let strip = u._reserved != 0u;
+    let left = select(u.scroll_left, f32(u.cols) * u.cell_w, strip);
+    let right = select(u.scroll_right, u.surf_w, strip);
+    let bottom = select(u.surf_h - u.pad_y, u.pad_y + u.cell_h, strip);
+    let start = vec2<f32>(left, u.pad_y);
+    let end = max(start, vec2<f32>(right, bottom));
+    return VsOut(clip_position(mix(start, end, corner)), vec2<f32>(0.0), vec4<f32>(0.0),
+        unpack_color(u.fill_bg), corner, EXTRA_QUAD, 0u);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsOut {
     var out: VsOut;
@@ -73,6 +100,9 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vi];
+    if (inst == u.cols * u.rows) {
+        return fill_quad(corner);
+    }
     let cell = cells[inst];
     let spacer = (cell.flags & 16u) != 0u;
     if (spacer || u.cols == 0u) {
@@ -97,8 +127,6 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
     if ((cell.flags & 32u) != 0u) {
         px = px + (1.0 - corner.y) * u.cell_w * 0.22;
     }
-    let ndc_x = px / max(u.surf_w, 1.0) * 2.0 - 1.0;
-    let ndc_y = 1.0 - py / max(u.surf_h, 1.0) * 2.0;
 
     var uv = vec2<f32>(0.5 / f32(max(u.atlas_w, 1u)), 0.5 / f32(max(u.atlas_h, 1u)));
     if (cell.slot != 0u && (cell.flags & 128u) == 0u) {
@@ -126,19 +154,33 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
         fg = bg;
         bg = swapped;
     }
+    let selected = u.sel_hi > u.sel_lo && inst >= u.sel_lo && inst < u.sel_hi;
+    if (selected) {
+        fg = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+        bg = vec4<f32>(0.23, 0.45, 0.85, 1.0);
+    }
 
-    out.clip = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    out.clip = clip_position(vec2<f32>(px, py));
     out.uv = uv;
     out.fg = fg;
     out.bg = bg;
     out.local = corner;
-    out.flags = cell.flags | select(0u, CURSOR_CELL, on_cursor);
+    out.flags = cell.flags | select(0u, CURSOR_CELL, on_cursor) | select(0u, SELECTED, selected);
     out.slot = cell.slot;
     return out;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.flags == EXTRA_QUAD) {
+        if (u._reserved != 0u) {
+            return in.bg;
+        }
+        let track = mix(in.bg, vec4<f32>(0.42, 0.44, 0.50, 1.0), 0.45);
+        let thumb = vec4<f32>(0.86, 0.88, 0.93, 1.0);
+        let on_thumb = in.local.y >= u.scroll_top && in.local.y <= u.scroll_top + u.scroll_h;
+        return select(track, thumb, on_thumb);
+    }
     if ((in.flags & 128u) != 0u) {
         let icon_cols = select(2.0, 4.0, (in.flags & 256u) != 0u);
         let bounds = vec2<f32>(u.cell_w * icon_cols, u.cell_h);
@@ -166,7 +208,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     }
     var bg = tab_color(in.bg, in.local, in.flags);
     ink = ink * tab_cover(in.local, in.flags);
-    if (u.composer.z != 0u && (in.flags & (CURSOR_CELL | 1u)) == 0u) {
+    if (u.composer.z != 0u && (in.flags & (CURSOR_CELL | SELECTED | 1u)) == 0u) {
         let pad = vec2<f32>(u.pad_x, u.pad_y);
         let cell_size = vec2<f32>(u.cell_w, u.cell_h);
         let edge = in.clip.xy - (pad + vec2<f32>(u.composer.xy) * cell_size);
@@ -186,17 +228,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     var color = mix(bg, in.fg, ink);
     if ((in.flags & 4u) != 0u && in.local.y > 0.86) {
         color = in.fg;
-    }
-    if (u.scroll_h > 0.0) {
-        let grid_right = u.pad_x + f32(u.cols) * u.cell_w;
-        let grid_h = f32(u.rows) * u.cell_h;
-        let y = (in.clip.y - u.pad_y) / max(grid_h, 1.0);
-        if (in.clip.x >= grid_right - 5.0 && in.clip.x <= grid_right - 1.0 && y >= 0.0 && y <= 1.0) {
-            color = mix(color, vec4<f32>(0.42, 0.44, 0.50, 1.0), 0.45);
-            if (y >= u.scroll_top && y <= u.scroll_top + u.scroll_h) {
-                color = vec4<f32>(0.86, 0.88, 0.93, 1.0);
-            }
-        }
     }
     return color;
 }

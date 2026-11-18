@@ -1,13 +1,13 @@
-# Ícones das abas
+# Tab icons
 
-Os arquivos em `source/` são usados somente para identificar o CLI em execução na aba. As marcas pertencem aos respectivos titulares.
+The files in `source/` exist only to identify the CLI running in a tab. The marks belong to their owners.
 
-| Agente | Origem |
+| Agent | Source |
 | --- | --- |
-| Claude | [Ícone do aplicativo Claude](https://claude.ai/images/claude_app_icon.png) |
-| Codex | Ícone distribuído no plugin oficial OpenAI `cloud-environment`, no arquivo `assets/codex.svg` |
-| Kiro | [Ícone do site Kiro](https://kiro.dev/icon.svg) |
-| Antigravity | [Ícone do site Google Antigravity](https://antigravity.google/favicon.svg) |
-| Cursor | [Ícone do site Cursor](https://cursor.com/marketing-static/favicon.svg) |
+| Claude | [Claude application icon](https://claude.ai/images/claude_app_icon.png) |
+| Codex | Icon shipped in the official OpenAI `cloud-environment` plugin, file `assets/codex.svg` |
+| Kiro | [Kiro site icon](https://kiro.dev/icon.svg) |
+| Antigravity | [Google Antigravity site icon](https://antigravity.google/favicon.svg) |
+| Cursor | [Cursor site icon](https://cursor.com/marketing-static/favicon.svg) |
 
-O atlas mantém a ordem Claude, Codex, Kiro, Antigravity, Cursor, a engrenagem de configurações e o ícone do Rustty. Cada imagem fica numa caixa transparente de 64 × 64, sem distorcer a proporção original. Para recriá-lo, execute `scripts/render-agent-icons.sh`; são necessários Python 3, Pillow e ImageMagick com suporte a SVG. O aplicativo incorpora o atlas e não depende desses programas em execução.
+The atlas order is Claude, Codex, Kiro, Antigravity, Cursor, the settings gear, and the Rustty icon. Each image sits in a transparent 64 × 64 box without distorting its original proportion. Rebuild it with `scripts/render-agent-icons.sh`. That needs Python 3, Pillow, and ImageMagick with SVG support. The application embeds the atlas and does not need those programs at runtime.

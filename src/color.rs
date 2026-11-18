@@ -1,4 +1,4 @@
-/// Cor empacotada em `0x00BBGGRR` para o shader.
+/// Color packed as `0x00BBGGRR` for the shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
     pub r: u8,
@@ -52,7 +52,7 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         id: "noite",
-        name: "Noite",
+        name: "Night",
         fg: DEFAULT_FG,
         bg: DEFAULT_BG,
         bar: Rgb::new(0x10, 0x12, 0x16),
@@ -65,7 +65,7 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         id: "tinta",
-        name: "Tinta",
+        name: "Ink",
         fg: Rgb::new(0xf2, 0xf2, 0xf2),
         bg: Rgb::new(0x0c, 0x0c, 0x0c),
         bar: Rgb::new(0x08, 0x08, 0x08),
@@ -78,7 +78,7 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         id: "papel",
-        name: "Papel",
+        name: "Paper",
         fg: Rgb::new(0x1c, 0x1e, 0x24),
         bg: Rgb::new(0xf4, 0xf1, 0xea),
         bar: Rgb::new(0xe7, 0xe2, 0xd8),
@@ -91,7 +91,7 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         id: "ambar",
-        name: "Âmbar",
+        name: "Amber",
         fg: Rgb::new(0xe6, 0xb1, 0x5a),
         bg: Rgb::new(0x14, 0x0e, 0x08),
         bar: Rgb::new(0x10, 0x0c, 0x06),
@@ -104,7 +104,7 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         id: "mar",
-        name: "Mar",
+        name: "Sea",
         fg: Rgb::new(0xc6, 0xe4, 0xe0),
         bg: Rgb::new(0x0c, 0x16, 0x18),
         bar: Rgb::new(0x08, 0x12, 0x14),
@@ -148,7 +148,7 @@ pub fn ansi(index: u8) -> Rgb {
     ANSI[usize::from(index.min(15))]
 }
 
-/// Paleta 256: 16 ANSI, cubo 6×6×6 e rampa de cinza.
+/// 256-color palette: 16 ANSI colors, a 6×6×6 cube, and a gray ramp.
 pub fn indexed(index: u8) -> Rgb {
     match index {
         0..=15 => ansi(index),

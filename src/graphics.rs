@@ -60,12 +60,6 @@ pub(crate) struct DecodeJob {
     col: u16,
 }
 
-impl DecodeJob {
-    pub(crate) fn id(&self) -> u32 {
-        self.command.id
-    }
-}
-
 impl Graphics {
     pub(crate) fn command(
         &mut self,

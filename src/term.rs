@@ -8,7 +8,6 @@ use crate::color::{self, Rgb, DEFAULT_BG, DEFAULT_FG};
 use crate::graphics::{decode_job, DecodeJob, Graphics, Image, Parser, Placement, Prepared, Update};
 
 const MAX_SCROLLBACK: usize = 10_000;
-const MAX_PENDING: usize = 256;
 
 #[derive(Clone, Copy)]
 struct Pen {
@@ -30,54 +29,23 @@ struct Cursor {
 }
 
 struct Screen {
-    cells: Vec<Cell>,
+    /// One owned row per visual line. Scrolling rotates these vectors, so a
+    /// linefeed copies the row that leaves and not the rows that stay.
+    lines: Vec<Vec<Cell>>,
     graphics: Graphics,
     cols: u16,
     rows: u16,
-    /// Physical line shown at the top. Scrolling the whole screen rotates this
-    /// index instead of moving `rows * cols` cells.
-    origin: u16,
 }
 
 impl Screen {
     fn new(cols: u16, rows: u16, blank: Cell) -> Self {
+        let cols_n = usize::from(cols);
         Self {
-            cells: vec![blank; usize::from(cols) * usize::from(rows)],
+            lines: (0..rows).map(|_| vec![blank; cols_n]).collect(),
             graphics: Graphics::default(),
             cols,
             rows,
-            origin: 0,
         }
-    }
-
-    #[inline]
-    fn physical_row(&self, row: u16) -> usize {
-        (usize::from(self.origin) + usize::from(row)) % usize::from(self.rows)
-    }
-
-    #[inline]
-    fn index(&self, row: u16, col: u16) -> usize {
-        self.physical_row(row) * usize::from(self.cols) + usize::from(col)
-    }
-
-    #[inline]
-    fn line_start(&self, row: u16) -> usize {
-        self.physical_row(row) * usize::from(self.cols)
-    }
-
-    fn linearize(&mut self) {
-        if self.origin == 0 {
-            return;
-        }
-        let cols = usize::from(self.cols);
-        let rows = usize::from(self.rows);
-        let origin = usize::from(self.origin);
-        let mut rotated = vec![self.cells[0]; rows * cols];
-        let tail = (rows - origin) * cols;
-        rotated[..tail].copy_from_slice(&self.cells[origin * cols..]);
-        rotated[tail..].copy_from_slice(&self.cells[..origin * cols]);
-        self.cells = rotated;
-        self.origin = 0;
     }
 }
 
@@ -112,7 +80,9 @@ pub struct Term {
     scroll_bot: u16,
     scrollback: VecDeque<Vec<Cell>>,
     line_pool: Vec<Vec<Cell>>,
-    pending_count: usize,
+    /// Packed scrollback records waiting for the NPU thread. Filled when a
+    /// line leaves the top, so the reader never clones the row.
+    pending: Vec<[u8; 64]>,
     view_offset: usize,
     title: String,
     title_dirty: bool,
@@ -158,7 +128,7 @@ impl Term {
             scroll_bot: rows - 1,
             scrollback: VecDeque::new(),
             line_pool: Vec::new(),
-            pending_count: 0,
+            pending: Vec::new(),
             view_offset: 0,
             title: "Rustty".to_string(),
             title_dirty: true,
@@ -200,11 +170,15 @@ impl Term {
                 cell.bg = new_bg;
             }
         };
-        for cell in &mut self.primary.cells {
-            repaint(cell);
+        for line in &mut self.primary.lines {
+            for cell in line {
+                repaint(cell);
+            }
         }
-        for cell in &mut self.alt.cells {
-            repaint(cell);
+        for line in &mut self.alt.lines {
+            for cell in line {
+                repaint(cell);
+            }
         }
         for line in &mut self.scrollback {
             for cell in line {
@@ -379,14 +353,10 @@ impl Term {
         std::mem::take(&mut self.replies)
     }
 
-    pub fn take_indexed_lines(&mut self) -> Vec<Vec<Cell>> {
-        let n = self.pending_count.min(self.scrollback.len());
-        self.pending_count = 0;
-        if n == 0 {
-            return Vec::new();
-        }
-        let start = self.scrollback.len() - n;
-        self.scrollback.range(start..).cloned().collect()
+    /// Records for lines that left the top since the last take. Each record is
+    /// the 64-byte NPU entry, already hashed.
+    pub fn take_index_records(&mut self) -> Vec<[u8; 64]> {
+        std::mem::take(&mut self.pending)
     }
 
     pub fn damage_all(&mut self) {
@@ -475,11 +445,12 @@ impl Term {
         self.set_view(offset.min(self.scrollback.len()));
     }
 
-    /// Thumb top and height, as fractions of the grid. With no history, both stay 0.
+    /// Thumb top and height, as fractions of the track. With no history the thumb
+    /// fills the track, so the bar stays on screen.
     pub fn scroll_metrics(&self) -> (f32, f32) {
         let history = self.scrollback.len();
         if history == 0 {
-            return (0.0, 0.0);
+            return (0.0, 1.0);
         }
         let rows = usize::from(self.rows).max(1);
         let total = history + rows;
@@ -693,9 +664,7 @@ impl Term {
     fn append_visible(&self, row: u16, dst: &mut Vec<Cell>) {
         let cols = usize::from(self.cols);
         if self.view_offset == 0 {
-            let screen = self.screen();
-            let start = screen.line_start(row);
-            dst.extend_from_slice(&screen.cells[start..start + cols]);
+            dst.extend_from_slice(&self.screen().lines[usize::from(row)]);
             return;
         }
         let blank = Cell::blank(self.default_fg.pack(), self.default_bg.pack());
@@ -710,9 +679,7 @@ impl Term {
             dst.resize(dst.len() + (cols - n), blank);
         } else {
             let live = (index - history) as u16;
-            let screen = self.screen();
-            let start = screen.line_start(live);
-            dst.extend_from_slice(&screen.cells[start..start + cols]);
+            dst.extend_from_slice(&self.screen().lines[usize::from(live)]);
         }
     }
 
@@ -738,21 +705,12 @@ impl Term {
         }
     }
 
-    fn touch_output(&mut self) {
-        if self.view_offset != 0 {
-            self.view_offset = 0;
-            self.damage_all = true;
-        }
-    }
-
     fn cell(&self, row: u16, col: u16) -> Cell {
-        let screen = self.screen();
-        screen.cells[screen.index(row, col)]
+        self.screen().lines[usize::from(row)][usize::from(col)]
     }
 
     fn write_cell(&mut self, row: u16, col: u16, cell: Cell) {
-        let index = self.screen().index(row, col);
-        self.screen_mut().cells[index] = cell;
+        self.screen_mut().lines[usize::from(row)][usize::from(col)] = cell;
         self.mark(row);
     }
 
@@ -789,77 +747,53 @@ impl Term {
         }
         let rows = self.rows;
         self.screen_mut().graphics.scroll(top, bot, lines, rows);
-        if top == 0 && bot + 1 == self.rows {
-            self.scroll_full(lines);
+        let height = usize::from(bot - top) + 1;
+        let shift = (lines.unsigned_abs() as usize).min(height);
+        if shift == 0 {
             return;
         }
-        self.screen_mut().linearize();
-        let cols = usize::from(self.cols);
-        let height = usize::from(bot - top) + 1;
-        let shift_rows = (lines.unsigned_abs() as usize).min(height);
-        let shift = shift_rows * cols;
-        let start = usize::from(top) * cols;
-        let end = start + height * cols;
         let blank = self.blank();
-        if lines > 0 && top == 0 {
-            for row in 0..shift_rows {
+        let cols = usize::from(self.cols);
+        let start = usize::from(top);
+        let up = lines > 0;
+        let keep_history = up && top == 0;
+        let mut fresh = Vec::new();
+        if keep_history {
+            fresh.reserve(shift);
+            for _ in 0..shift {
                 let mut line = self.alloc_line();
-                let from = row * cols;
-                line.extend_from_slice(&self.screen().cells[from..from + cols]);
-                self.remember(line);
+                line.resize(cols, blank);
+                fresh.push(line);
             }
         }
+        let mut leaving = Vec::new();
         {
-            let cells = &mut self.screen_mut().cells;
-            if lines > 0 {
-                if shift < end - start {
-                    cells.copy_within(start + shift..end, start);
-                    cells[end - shift..end].fill(blank);
-                } else {
-                    cells[start..end].fill(blank);
+            let band = &mut self.screen_mut().lines[start..start + height];
+            if up {
+                if keep_history {
+                    for (slot, line) in band[..shift].iter_mut().zip(fresh) {
+                        leaving.push(std::mem::replace(slot, line));
+                    }
                 }
-            } else if shift < end - start {
-                cells.copy_within(start..end - shift, start + shift);
-                cells[start..start + shift].fill(blank);
+                band.rotate_left(shift);
+                if !keep_history {
+                    for line in &mut band[height - shift..] {
+                        line.fill(blank);
+                    }
+                }
             } else {
-                cells[start..end].fill(blank);
+                band.rotate_right(shift);
+                for line in &mut band[..shift] {
+                    line.fill(blank);
+                }
             }
+        }
+        for line in leaving {
+            self.remember(line);
         }
         for row in top..=bot {
             self.mark(row);
         }
-    }
-
-    /// Scrolls the whole screen by rotating the origin. One line costs a copy of `cols` cells.
-    fn scroll_full(&mut self, lines: i16) {
-        let shift_rows = (lines.unsigned_abs() as usize).min(usize::from(self.rows));
-        if shift_rows == 0 {
-            return;
-        }
-        let blank = self.blank();
-        let height = self.rows;
-        let rows = usize::from(height);
-        let cols = usize::from(self.cols);
-        if lines > 0 {
-            for _ in 0..shift_rows {
-                let mut line = self.alloc_line();
-                let start = self.screen().line_start(0);
-                line.extend_from_slice(&self.screen().cells[start..start + cols]);
-                self.remember(line);
-                let screen = self.screen_mut();
-                screen.origin = ((usize::from(screen.origin) + 1) % rows) as u16;
-                let cleared = screen.line_start(height - 1);
-                screen.cells[cleared..cleared + cols].fill(blank);
-            }
-        } else {
-            let screen = self.screen_mut();
-            for _ in 0..shift_rows {
-                screen.origin = ((usize::from(screen.origin) + rows - 1) % rows) as u16;
-                let cleared = screen.line_start(0);
-                screen.cells[cleared..cleared + cols].fill(blank);
-            }
-        }
-        self.dirty.fill(true);
     }
 
     fn alloc_line(&mut self) -> Vec<Cell> {
@@ -879,20 +813,25 @@ impl Term {
     }
 
     fn remember(&mut self, line: Vec<Cell>) {
+        self.pending.push(crate::npu::pack_entry(&line));
         self.scrollback.push_back(line);
         while self.scrollback.len() > MAX_SCROLLBACK {
             if let Some(old) = self.scrollback.pop_front() {
                 self.recycle(old);
             }
         }
-        self.pending_count = (self.pending_count + 1).min(MAX_PENDING);
+        // A scrolled view is a distance from the live bottom. A new history line
+        // would slide that view toward the output unless the distance grows with it.
+        if self.view_offset > 0 {
+            self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+        }
     }
 
     fn forget_history(&mut self) {
         while let Some(line) = self.scrollback.pop_front() {
             self.recycle(line);
         }
-        self.pending_count = 0;
+        self.pending.clear();
         self.view_offset = 0;
     }
 
@@ -901,10 +840,9 @@ impl Term {
             return;
         }
         let blank = self.blank();
-        let end_col = to.min(self.cols);
-        let start = self.screen().line_start(row) + usize::from(from);
-        let end = self.screen().line_start(row) + usize::from(end_col);
-        self.screen_mut().cells[start..end].fill(blank);
+        let end_col = usize::from(to.min(self.cols));
+        let line = &mut self.screen_mut().lines[usize::from(row)];
+        line[usize::from(from)..end_col].fill(blank);
         self.mark(row);
     }
 
@@ -925,7 +863,6 @@ impl Term {
         if width == 0 {
             return;
         }
-        self.touch_output();
         if self.pending_wrap && self.autowrap {
             self.carriage_return();
             self.linefeed();
@@ -1142,7 +1079,6 @@ impl Perform for Term {
     }
 
     fn execute(&mut self, byte: u8) {
-        self.touch_output();
         match byte {
             b'\n' | 0x0b | 0x0c => self.linefeed(),
             b'\r' => self.carriage_return(),
@@ -1171,7 +1107,6 @@ impl Perform for Term {
         if ignore {
             return;
         }
-        self.touch_output();
         if intermediates == [b'?'] {
             match action {
                 'h' => self.dec_mode(params, true),
@@ -1266,7 +1201,9 @@ impl Perform for Term {
                         }
                         let blank = self.blank();
                         let screen = self.screen_mut();
-                        screen.cells.fill(blank);
+                        for line in &mut screen.lines {
+                            line.fill(blank);
+                        }
                         screen.graphics = Graphics::default();
                         self.dirty.fill(true);
                     }
@@ -1397,12 +1334,9 @@ impl Term {
             return;
         }
         let blank = self.blank();
-        let start = self.screen().line_start(row);
-        {
-            let line = &mut self.screen_mut().cells[start..start + cols];
-            line.copy_within(col + n..cols, col);
-            line[cols - n..].fill(blank);
-        }
+        let line = &mut self.screen_mut().lines[usize::from(row)];
+        line.copy_within(col + n..cols, col);
+        line[cols - n..].fill(blank);
         self.mark(row);
     }
 
@@ -1415,12 +1349,9 @@ impl Term {
             return;
         }
         let blank = self.blank();
-        let start = self.screen().line_start(row);
-        {
-            let line = &mut self.screen_mut().cells[start..start + cols];
-            line.copy_within(col..cols - n, col + n);
-            line[col..col + n].fill(blank);
-        }
+        let line = &mut self.screen_mut().lines[usize::from(row)];
+        line.copy_within(col..cols - n, col + n);
+        line[col..col + n].fill(blank);
         self.mark(row);
     }
 
@@ -1428,7 +1359,7 @@ impl Term {
     #[inline(always)]
     fn put_ascii(&mut self, ch: char) -> bool {
         let byte = ch as u32;
-        if byte < 0x20 || byte >= 0x7f || self.view_offset != 0 || self.pending_wrap {
+        if byte < 0x20 || byte >= 0x7f || self.pending_wrap {
             return false;
         }
         let row = self.cursor.row;
@@ -1436,11 +1367,12 @@ impl Term {
         if col + 1 >= self.cols {
             return false;
         }
-        let index = self.screen().index(row, col);
-        if self.screen().cells[index].flags & (WIDE | SPACER) != 0 {
+        let row_i = usize::from(row);
+        let col_i = usize::from(col);
+        if self.screen().lines[row_i][col_i].flags & (WIDE | SPACER) != 0 {
             return false;
         }
-        self.screen_mut().cells[index] = Cell {
+        self.screen_mut().lines[row_i][col_i] = Cell {
             cp: byte,
             fg: self.pen.fg.pack(),
             bg: self.pen.bg.pack(),
@@ -1675,14 +1607,10 @@ fn apply_color(pen: &mut Pen, foreground: bool, spec: &[u16]) {
 
 fn resize_screen(screen: &mut Screen, cols: u16, rows: u16, blank: Cell) {
     let mut next = Screen::new(cols, rows, blank);
-    let copy_rows = screen.rows.min(rows);
-    let copy_cols = screen.cols.min(cols);
+    let copy_rows = usize::from(screen.rows.min(rows));
+    let copy_cols = usize::from(screen.cols.min(cols));
     for row in 0..copy_rows {
-        for col in 0..copy_cols {
-            let src = screen.index(row, col);
-            let dst = next.index(row, col);
-            next.cells[dst] = screen.cells[src];
-        }
+        next.lines[row][..copy_cols].copy_from_slice(&screen.lines[row][..copy_cols]);
     }
     next.graphics = std::mem::take(&mut screen.graphics);
     *screen = next;
@@ -1714,6 +1642,10 @@ mod tests {
         assert_eq!(term.codex_composer(), None);
         term.advance(b"\x1b[?25h\x1b[5;1H");
         assert_eq!(term.codex_composer(), None);
+    }
+
+    fn record_first(entry: &[u8; 64]) -> u32 {
+        u32::from_le_bytes(entry[12..16].try_into().unwrap())
     }
 
     fn cell_char(cell: &Cell) -> char {
@@ -1811,6 +1743,39 @@ mod tests {
     }
 
     #[test]
+    fn fresh_screen_still_reports_a_scrollbar() {
+        let mut term = Term::new(10, 4);
+        assert_eq!(term.scroll_metrics(), (0.0, 1.0));
+        let snap = term.snapshot();
+        assert_eq!(snap.scroll_top, 0.0);
+        assert_eq!(snap.scroll_h, 1.0);
+    }
+
+    #[test]
+    fn streaming_output_leaves_a_scrolled_view_where_it_is() {
+        let mut term = Term::new(4, 2);
+        term.advance(b"aaaa\r\nbbbb\r\ncc");
+        term.scroll_view(1);
+        term.advance(b"\x1b[2;3H");
+        assert_eq!(term.view_offset(), 1);
+        term.advance(b"X");
+        assert_eq!(term.view_offset(), 1);
+        let snap = term.snapshot();
+        let row0: String = snap.cells.iter().take(4).map(cell_char).collect();
+        assert_eq!(row0, "aaaa");
+
+        term.advance(b"\r\ndddd");
+        assert_eq!(term.view_offset(), 2);
+        let snap = term.snapshot();
+        let row0: String = snap.cells.iter().take(4).map(cell_char).collect();
+        assert_eq!(row0, "aaaa");
+
+        term.scroll_to(1.0);
+        assert_eq!(term.view_offset(), 0);
+        assert_eq!(text(&term), "ccX\ndddd");
+    }
+
+    #[test]
     fn scroll_view_reveals_the_line_that_left() {
         let mut term = Term::new(4, 2);
         term.advance(b"aaaa\r\nbbbb\r\ncccc");
@@ -1832,21 +1797,43 @@ mod tests {
         let mut term = Term::new(3, 2);
         term.advance(b"aaa\r\nbbb\r\nccc");
         assert_eq!(text(&term), "bbb\nccc");
-        let indexed = term.take_indexed_lines();
+        let indexed = term.take_index_records();
         assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0][0].cp, u32::from(b'a'));
+        assert_eq!(record_first(&indexed[0]), u32::from(b'a'));
     }
 
     #[test]
-    fn ring_scroll_keeps_visual_order_after_the_origin_wraps() {
+    fn region_scroll_below_the_top_keeps_the_row_above() {
         let mut term = Term::new(3, 3);
         term.advance(b"aaa\r\nbbb\r\nccc\r\nddd");
         assert_eq!(text(&term), "bbb\nccc\nddd");
         term.advance(b"\x1b[2;3r\x1b[3;1H\x1b[S");
         assert_eq!(text(&term), "bbb\nddd");
-        let indexed = term.take_indexed_lines();
+        let indexed = term.take_index_records();
         assert_eq!(indexed.len(), 1);
-        assert_eq!(indexed[0][0].cp, u32::from(b'a'));
+        assert_eq!(record_first(&indexed[0]), u32::from(b'a'));
+    }
+
+    #[test]
+    fn region_scroll_from_the_top_indexes_every_line_and_keeps_the_status() {
+        let mut term = Term::new(6, 4);
+        term.advance(b"\x1b[1;3r\x1b[4;1H######\x1b[1;1H");
+        for _ in 0..300 {
+            term.advance(b"ab\r\n");
+        }
+        assert_eq!(term.cell(3, 0).cp, u32::from(b'#'));
+        assert_eq!(term.cell(3, 5).cp, u32::from(b'#'));
+        let indexed = term.take_index_records();
+        assert_eq!(indexed.len(), 298);
+        assert_eq!(record_first(&indexed[0]), u32::from(b'a'));
+    }
+
+    #[test]
+    fn insert_line_opens_a_blank_row_without_indexing_it() {
+        let mut term = Term::new(4, 3);
+        term.advance(b"aaaa\r\nbbbb\r\ncccc\x1b[1;1H\x1b[L");
+        assert_eq!(text(&term), "\naaaa\nbbbb");
+        assert!(term.take_index_records().is_empty());
     }
 
     #[test]

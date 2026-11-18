@@ -62,7 +62,7 @@ impl Status {
 }
 
 enum Job {
-    Line(Vec<Cell>),
+    Records(Vec<[u8; 64]>),
     Stop,
 }
 
@@ -88,8 +88,8 @@ impl Scheduler {
         }
     }
 
-    pub fn index_line(&self, line: Vec<Cell>) {
-        self.indexer().index_line(line);
+    pub fn index_records(&self, records: Vec<[u8; 64]>) {
+        self.indexer().index_records(records);
     }
 
     pub fn indexer(&self) -> Indexer {
@@ -107,11 +107,15 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    pub fn index_line(&self, line: Vec<Cell>) {
-        match self.tx.try_send(Job::Line(line)) {
+    pub fn index_records(&self, records: Vec<[u8; 64]>) {
+        if records.is_empty() {
+            return;
+        }
+        let dropped = records.len() as u64;
+        match self.tx.try_send(Job::Records(records)) {
             Ok(()) => {}
-            Err(TrySendError::Full(Job::Line(_))) => {
-                self.status.dropped.fetch_add(1, Ordering::Relaxed);
+            Err(TrySendError::Full(Job::Records(_))) => {
+                self.status.dropped.fetch_add(dropped, Ordering::Relaxed);
             }
             Err(_) => {}
         }
@@ -185,20 +189,17 @@ fn device_loop(device: Device, rx: Receiver<Job>, status: &Status) -> std::io::R
     while let Ok(job) = rx.recv() {
         match job {
             Job::Stop => break,
-            Job::Line(line) => {
-                let entry = pack_entry(&line);
-                let slot = (write_index as usize) % capacity as usize;
-                let offset = 4096 + slot * ENTRY_BYTES;
-                if let Some(slice) = ring.as_mut_slice() {
-                    slice[offset..offset + ENTRY_BYTES].copy_from_slice(&entry);
+            Job::Records(records) => {
+                for entry in &records {
+                    let slot = (write_index as usize) % capacity as usize;
+                    let offset = 4096 + slot * ENTRY_BYTES;
+                    if let Some(slice) = ring.as_mut_slice() {
+                        slice[offset..offset + ENTRY_BYTES].copy_from_slice(entry);
+                    }
+                    write_index = write_index.wrapping_add(1);
+                    indexed += 1;
                 }
-                write_index = write_index.wrapping_add(1);
-                indexed += 1;
-                let heartbeat = if indexed % 128 == 0 {
-                    device.heartbeat().unwrap_or(0)
-                } else {
-                    status.heartbeat.load(Ordering::Relaxed)
-                };
+                let heartbeat = device.heartbeat().unwrap_or(0);
                 status.indexed.store(indexed, Ordering::Relaxed);
                 status.heartbeat.store(heartbeat, Ordering::Relaxed);
                 if let Some(slice) = ring.as_mut_slice() {
@@ -233,9 +234,8 @@ fn host_loop(rx: Receiver<Job>, status: &Status) {
     while let Ok(job) = rx.recv() {
         match job {
             Job::Stop => break,
-            Job::Line(line) => {
-                let _ = hash_cells(&line);
-                status.indexed.fetch_add(1, Ordering::Relaxed);
+            Job::Records(records) => {
+                status.indexed.fetch_add(records.len() as u64, Ordering::Relaxed);
             }
         }
     }
@@ -255,13 +255,19 @@ fn maybe_submit_graph(device: &Device, queue: &device::CommandQueue, ring: &devi
     }
 }
 
-fn pack_entry(line: &[Cell]) -> [u8; ENTRY_BYTES] {
-    let hash = hash_cells(line);
+pub(crate) fn pack_entry(line: &[Cell]) -> [u8; ENTRY_BYTES] {
+    // A row is `cols` cells wide. The tail is blank padding; hashing it made a
+    // fast dump spend more time on zeros than on the text that left the screen.
+    let end = line
+        .iter()
+        .rposition(|cell| cell.cp != 0 || cell.flags != 0)
+        .map_or(0, |index| index + 1);
+    let hash = hash_cells(&line[..end]);
     let mut preview = [0u8; 48];
     let mut ink = 0u16;
     let mut filled = 0usize;
     let mut first = 0u32;
-    for cell in line {
+    for cell in &line[..end] {
         if cell.cp == 0 {
             continue;
         }
@@ -314,5 +320,22 @@ mod tests {
         let entry = pack_entry(&line);
         assert_eq!(&entry[16..17], b"A");
         assert_ne!(u64::from_le_bytes(entry[..8].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn trailing_blanks_do_not_change_the_hash() {
+        let glyph = Cell {
+            cp: u32::from('A'),
+            fg: 1,
+            bg: 2,
+            flags: 0,
+        };
+        let mut wide = vec![glyph];
+        wide.resize(200, Cell::blank(0, 0));
+        let wide_entry = pack_entry(&wide);
+        let short_entry = pack_entry(std::slice::from_ref(&glyph));
+        assert_eq!(wide_entry[..8], short_entry[..8]);
+        assert_eq!(u16::from_le_bytes(wide_entry[8..10].try_into().unwrap()), 200);
+        assert_eq!(&wide_entry[16..17], b"A");
     }
 }

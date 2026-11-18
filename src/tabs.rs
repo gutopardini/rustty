@@ -1,7 +1,9 @@
 //! Tab strip drawn as one row of cells at the bottom of the window.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use std::borrow::Cow;
 use std::ops::Range;
+
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::Agent;
 use crate::cell::{
@@ -84,7 +86,6 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
         let reserve = if close.is_some() { tail + 2 } else { 0 };
         let label_end = end.saturating_sub(reserve);
         let prefix = format!("{:lead$}{} ", "", index + 1, lead = lead);
-        let icon = agents.get(index).copied().flatten().map(Agent::icon).unwrap_or(crate::agent::RUSTTY_ICON);
         let can_fit_prefix_and_icon = start + prefix.width() + 2 <= label_end;
         let mut text_start = start;
         if can_fit_prefix_and_icon {
@@ -92,14 +93,13 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
             text_start = (start + prefix.width()).min(label_end);
         }
         if text_start + 2 <= label_end {
-            cells[text_start] = Cell { cp: icon, fg, bg, flags: AGENT_ICON | WIDE };
-            cells[text_start + 1] = Cell { cp: 0, fg, bg, flags: SPACER };
+            paint_icon(&mut cells[text_start..label_end], agents.get(index).copied().flatten(), fg, bg);
             text_start += 2;
             if text_start < label_end {
                 text_start = (text_start + icon_gap).min(label_end);
             }
         }
-        let fitted = fit_title(title, label_end.saturating_sub(text_start));
+        let (fitted, _) = fit_title(title, label_end.saturating_sub(text_start));
         paint(&mut cells[text_start..label_end], &fitted, fg, bg, flags);
         let number_at = start + lead;
         if active_tab && number_at < end.saturating_sub(reserve) {
@@ -159,13 +159,21 @@ pub fn hit(bar: &Bar, col: u16) -> Option<BarHit> {
     None
 }
 
-fn fit_title(title: &str, width: usize) -> String {
-    let title = if title.is_empty() { "shell" } else { title };
-    if title.width() <= width {
-        return title.to_string();
-    }
+pub(crate) fn paint_icon(cells: &mut [Cell], agent: Option<Agent>, fg: u32, bg: u32) {
+    let cp = agent.map_or(crate::agent::RUSTTY_ICON, Agent::icon);
+    cells[0] = Cell { cp, fg, bg, flags: AGENT_ICON | WIDE };
+    cells[1] = Cell { cp: 0, fg, bg, flags: SPACER };
+}
+
+pub(crate) fn fit_title(title: &str, width: usize) -> (Cow<'_, str>, usize) {
     if width == 0 {
-        return String::new();
+        return (Cow::Borrowed(""), 0);
+    }
+    let title = if title.is_empty() { "shell" } else { title };
+    // Count the same cells as paint, including when the title has emoji or wide characters.
+    let title_width = title.chars().filter_map(UnicodeWidthChar::width).sum();
+    if title_width <= width {
+        return (Cow::Borrowed(title), title_width);
     }
     let mut out = String::new();
     let mut used = 0;
@@ -180,10 +188,8 @@ fn fit_title(title: &str, width: usize) -> String {
         out.push(ch);
         used += ch_width;
     }
-    if out.width() < title.width() {
-        out.push('…');
-    }
-    out
+    out.push('…');
+    (Cow::Owned(out), used + 1)
 }
 
 fn mark_tab(cells: &mut [Cell], active: bool) {
@@ -206,7 +212,7 @@ fn mark_tab(cells: &mut [Cell], active: bool) {
     }
 }
 
-fn paint(cells: &mut [Cell], text: &str, fg: u32, bg: u32, flags: u32) {
+pub(crate) fn paint(cells: &mut [Cell], text: &str, fg: u32, bg: u32, flags: u32) {
     let mut col = 0;
     for ch in text.chars() {
         if col >= cells.len() {
@@ -223,14 +229,14 @@ fn paint(cells: &mut [Cell], text: &str, fg: u32, bg: u32, flags: u32) {
             cp: ch as u32,
             fg,
             bg,
-            flags,
+            flags: flags | if width == 2 { WIDE } else { 0 },
         };
         if width == 2 {
             cells[col + 1] = Cell {
                 cp: 0,
                 fg,
                 bg,
-                flags: crate::cell::SPACER,
+                flags: SPACER,
             };
         }
         col += width;

@@ -98,6 +98,11 @@ impl Face {
         let width = self.cell_w as usize * slots;
         let height = self.cell_h as usize;
         let mut pixels = vec![0u8; width * height];
+        // Block elements are the charge bars of Claude, Codex, and the other CLIs.
+        // A font glyph stops short of the cell and the theme background shows in the seam.
+        if draw_block(&mut pixels, width, height, ch) {
+            return pixels;
+        }
         if is_symbol(ch) && self.draw_symbol(&mut pixels, width, height, ch, bold) {
             return pixels;
         }
@@ -248,6 +253,88 @@ fn is_powerline_separator(ch: char) -> bool {
 
 fn is_box_or_block(ch: char) -> bool {
     matches!(ch, '\u{2500}'..='\u{259F}')
+}
+
+/// Fills U+2580–U+259F with hard coverage so a run of blocks is one solid color.
+fn draw_block(pixels: &mut [u8], width: usize, height: usize, ch: char) -> bool {
+    if width == 0 || height == 0 || !matches!(ch, '\u{2580}'..='\u{259F}') {
+        return false;
+    }
+    let x_of = |parts: usize| (width * parts) / 8;
+    let y_of = |parts: usize| (height * parts) / 8;
+    let mut fill = |x0: usize, x1: usize, y0: usize, y1: usize| {
+        for y in y0..y1.min(height) {
+            for x in x0..x1.min(width) {
+                pixels[y * width + x] = 255;
+            }
+        }
+    };
+    match ch {
+        '\u{2580}' => fill(0, width, 0, height.div_ceil(2)),
+        '\u{2581}' => fill(0, width, height - y_of(1), height),
+        '\u{2582}' => fill(0, width, height - y_of(2), height),
+        '\u{2583}' => fill(0, width, height - y_of(3), height),
+        '\u{2584}' => fill(0, width, height / 2, height),
+        '\u{2585}' => fill(0, width, height - y_of(5), height),
+        '\u{2586}' => fill(0, width, height - y_of(6), height),
+        '\u{2587}' => fill(0, width, height - y_of(7), height),
+        '\u{2588}' => fill(0, width, 0, height),
+        '\u{2589}' => fill(0, x_of(7), 0, height),
+        '\u{258A}' => fill(0, x_of(6), 0, height),
+        '\u{258B}' => fill(0, x_of(5), 0, height),
+        '\u{258C}' => fill(0, width.div_ceil(2), 0, height),
+        '\u{258D}' => fill(0, x_of(3), 0, height),
+        '\u{258E}' => fill(0, x_of(2), 0, height),
+        '\u{258F}' => fill(0, x_of(1), 0, height),
+        '\u{2590}' => fill(width / 2, width, 0, height),
+        '\u{2594}' => fill(0, width, 0, y_of(1).max(1)),
+        '\u{2595}' => fill(width - x_of(1).max(1), width, 0, height),
+        '\u{2596}' => fill(0, width.div_ceil(2), height / 2, height),
+        '\u{2597}' => fill(width / 2, width, height / 2, height),
+        '\u{2598}' => fill(0, width.div_ceil(2), 0, height.div_ceil(2)),
+        '\u{2599}' => {
+            fill(0, width.div_ceil(2), 0, height);
+            fill(width / 2, width, height / 2, height);
+        }
+        '\u{259A}' => {
+            fill(0, width.div_ceil(2), 0, height.div_ceil(2));
+            fill(width / 2, width, height / 2, height);
+        }
+        '\u{259B}' => {
+            fill(0, width, 0, height.div_ceil(2));
+            fill(0, width.div_ceil(2), height / 2, height);
+        }
+        '\u{259C}' => {
+            fill(0, width, 0, height.div_ceil(2));
+            fill(width / 2, width, height / 2, height);
+        }
+        '\u{259D}' => fill(width / 2, width, 0, height.div_ceil(2)),
+        '\u{259E}' => {
+            fill(width / 2, width, 0, height.div_ceil(2));
+            fill(0, width.div_ceil(2), height / 2, height);
+        }
+        '\u{259F}' => {
+            fill(width / 2, width, 0, height);
+            fill(0, width.div_ceil(2), height / 2, height);
+        }
+        '\u{2591}' | '\u{2592}' | '\u{2593}' => {
+            let level = ch as u32 - 0x2591;
+            for y in 0..height {
+                for x in 0..width {
+                    let on = match level {
+                        0 => (x + 2 * y) % 4 == 0,
+                        1 => (x + y) % 2 == 0,
+                        _ => (x + 2 * y) % 4 != 0,
+                    };
+                    if on {
+                        pixels[y * width + x] = 255;
+                    }
+                }
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 fn is_symbol(ch: char) -> bool {
@@ -879,7 +966,15 @@ mod tests {
             .expect("empty horizontal line");
         assert!(row[0] > 16 && row[width - 1] > 16, "the horizontal line does not run edge to edge");
         let block = face.raster_cell('\u{2588}', false, false);
-        let ink = block.iter().filter(|p| **p > 16).count();
-        assert!(ink * 10 > width * height * 8, "the full block was shrunk inside the cell");
+        assert!(
+            block.iter().all(|pixel| *pixel == 255),
+            "the full block let the theme background through"
+        );
+        let left = face.raster_cell('\u{258C}', false, false);
+        let split = width.div_ceil(2);
+        for row in left.chunks(width) {
+            assert!(row[..split].iter().all(|pixel| *pixel == 255));
+            assert!(row[split..].iter().all(|pixel| *pixel == 0));
+        }
     }
 }

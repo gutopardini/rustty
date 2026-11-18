@@ -32,7 +32,7 @@ The window is a grid of cells, not a texture of the whole frame. A dirty row is 
 
 </div>
 
-While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab shows that icon. Otherwise it shows Rustty.
+While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab shows that icon. Otherwise it shows Rustty. The title bar mirrors the active tab's icon and title.
 
 ## The NPU
 

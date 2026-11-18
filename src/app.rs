@@ -26,7 +26,6 @@ use crate::font::{Atlas, Face};
 use crate::gpu::Renderer;
 use crate::input::{self, Input};
 use crate::npu::{Indexer, Scheduler};
-use crate::graphics::DecodeJob;
 use crate::pty::Pty;
 use crate::settings::{self, Panel, PanelHit, Ui};
 use crate::tabs::{self, Bar, BarHit};
@@ -118,8 +117,20 @@ fn publish_frame(term: &mut Term, frames: &Mutex<Option<Snapshot>>) -> bool {
     if slot.is_some() {
         term.damage_all();
     }
-    let snap = term.snapshot();
-    if snap.changed || snap.title_changed {
+    let mut snap = term.snapshot();
+    if snap.suspended && let Some(ready) = slot.as_mut() {
+        // A partial synchronized update must leave the last complete frame drawable.
+        if snap.title_changed {
+            ready.title = snap.title;
+            ready.title_changed = true;
+        }
+        return true;
+    }
+    if (!snap.suspended && snap.changed) || snap.title_changed {
+        if !snap.title_changed && let Some(previous) = slot.as_mut().filter(|old| old.title_changed) {
+            snap.title = std::mem::take(&mut previous.title);
+            snap.title_changed = true;
+        }
         *slot = Some(snap);
     }
     slot.is_some()
@@ -146,20 +157,17 @@ fn pty_loop(
     frames: Arc<Mutex<Option<Snapshot>>>,
 ) {
     let mut buf = [0u8; 64 * 1024];
-    // Newest image per id. While a key is in flight we keep the previous picture on screen.
-    let mut held: Vec<DecodeJob> = Vec::new();
     loop {
         let mut master_flags = PollFlags::POLLIN | PollFlags::POLLHUP;
         if pty.has_writes() {
             master_flags |= PollFlags::POLLOUT;
         }
-        let timeout = if held.is_empty() { PollTimeout::NONE } else { PollTimeout::from(40u16) };
         let (master_ready, wake_ready) = {
             let mut fds = [
                 PollFd::new(fd.as_fd(), master_flags),
                 PollFd::new(pty.wake_fd(), PollFlags::POLLIN),
             ];
-            match nix::poll::poll(&mut fds, timeout) {
+            match nix::poll::poll(&mut fds, PollTimeout::NONE) {
                 Ok(_) => {}
                 Err(Errno::EINTR) => continue,
                 Err(err) => {
@@ -212,7 +220,10 @@ fn pty_loop(
                         }
                         offset += used;
                         if let Some(job) = job {
-                            keep_latest_image(&mut held, job);
+                            // Decode outside the lock, then apply before parsing the next command.
+                            let image = Term::decode_image(&job);
+                            let mut term = term.lock().unwrap_or_else(|err| err.into_inner());
+                            term.finish_image(job, image);
                         }
                     }
                     saw_output = true;
@@ -225,28 +236,18 @@ fn pty_loop(
                 }
             }
         }
-        if !held.is_empty() && !pty.typing() {
-            for job in held.drain(..) {
-                let image = Term::decode_image(&job);
-                let mut term = term.lock().unwrap_or_else(|err| err.into_inner());
-                term.finish_image(job, image);
-            }
-            saw_output = true;
-        }
         if !saw_output {
             continue;
         }
-        let (lines, replies, draw) = {
+        let (records, replies, draw) = {
             let mut term = term.lock().unwrap_or_else(|err| err.into_inner());
-            let lines = term.take_indexed_lines();
+            let records = term.take_index_records();
             let replies = term.take_replies();
             // The grid is published here, on the reader thread. The window only swaps it in.
             let draw = visible.load(Ordering::Relaxed) && publish_frame(&mut term, &frames);
-            (lines, replies, draw)
+            (records, replies, draw)
         };
-        for line in lines {
-            indexer.index_line(line);
-        }
+        indexer.index_records(records);
         if !replies.is_empty() {
             let _ = pty.write_all(&replies);
             pty.flush_writes();
@@ -257,12 +258,6 @@ fn pty_loop(
             let _ = proxy.send_event(Wake::Frame(id));
         }
     }
-}
-
-fn keep_latest_image(held: &mut Vec<DecodeJob>, job: DecodeJob) {
-    let id = job.id();
-    held.retain(|old| old.id() != id);
-    held.push(job);
 }
 
 struct Tab {
@@ -280,6 +275,8 @@ struct App {
     proxy: EventLoopProxy<Wake>,
     window: Option<Arc<Window>>,
     gpu: Option<Renderer>,
+    /// The tab whose complete frame is currently on the GPU.
+    presented_tab: Option<u64>,
     face: Face,
     atlas: Atlas,
     mods: ModifiersState,
@@ -473,44 +470,23 @@ impl App {
         self.focus_tab(active);
     }
 
-    fn note_title(&mut self, id: u64) -> bool {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return false;
-        };
-        // The reader owns this lock while it parses. Waiting here stalls every key.
-        let Ok(term) = self.tabs[index].session.term.try_lock() else {
-            return false;
-        };
-        let title = term.title().to_string();
-        drop(term);
-        if title.is_empty() || title == self.tabs[index].title {
-            return false;
-        }
-        self.tabs[index].title = title;
-        self.bar_dirty = true;
-        if index == self.active {
-            if let Some(window) = &self.window {
-                window.set_title(&self.tabs[self.active].title);
-            }
-        }
-        true
-    }
-
     fn refresh_agents(&mut self) {
         let mut changed = false;
-        for tab in &mut self.tabs {
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
             let pty = &tab.session.pty;
             let agent = pty.foreground_group().and_then(|group| agent::foreground(group, pty.shell_pid()));
             if agent != tab.agent {
                 tab.agent = agent;
                 changed = true;
             }
-            if let Ok(term) = tab.session.term.try_lock() {
-                let title = term.title().to_string();
-                if !title.is_empty() && title != tab.title {
-                    tab.title = title;
-                    changed = true;
-                }
+            // The active title arrives with the published terminal frame.
+            if index != self.active
+                && let Ok(term) = tab.session.term.try_lock()
+                && !term.title().is_empty()
+                && term.title() != tab.title
+            {
+                tab.title = term.title().to_owned();
+                changed = true;
             }
         }
         if changed {
@@ -563,9 +539,9 @@ impl App {
         gpu.set_insets(chrome_h, chrome_h);
         gpu.set_clear(theme.bg);
         gpu.set_selection(selection);
-        let suspended = snap.as_ref().is_some_and(|snap| snap.suspended);
         if let Some(snap) = snap.as_ref().filter(|snap| !snap.suspended) {
             gpu.upload(&mut self.atlas, &self.face, snap, composer, theme.accent, scrollbar.track());
+            self.presented_tab = Some(self.tabs[active].id);
         } else {
             gpu.refresh_cached(composer, theme.accent, scrollbar.track());
         }
@@ -577,8 +553,8 @@ impl App {
             self.bar = tabs::render_bar(&titles, &agents, active, cols, theme, settings_lit);
             let edge = if settings_lit && self.bar.settings.is_some() { theme.tab } else { theme.bar };
             gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, edge);
-            let title = self.tabs.get(active).map(|tab| tab.title.as_str()).unwrap_or("Rustty");
-            self.title_bar = titlebar::render(title, cols, theme, window.is_maximized());
+            let tab = &self.tabs[active];
+            self.title_bar = titlebar::render(&tab.title, tab.agent, cols, theme, window.is_maximized());
             gpu.upload_title(&mut self.atlas, &self.face, &self.title_bar.cells, theme.bar);
             self.bar_dirty = false;
         }
@@ -614,7 +590,7 @@ impl App {
             gpu.upload_dialog(&mut self.atlas, &self.face, self.close_dialog.as_ref());
             self.confirm_dirty = false;
         }
-        if let Err(err) = gpu.render(show_terminal && !suspended) {
+        if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(self.tabs[active].id)) {
             tracing::warn!(%err, "frame");
         }
     }
@@ -779,7 +755,6 @@ impl App {
         match action {
             Some(Input::Bytes(bytes)) => {
                 self.clear_selection();
-                self.tabs[active].session.pty.note_input();
                 if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
                     tracing::warn!(%err, "pty write");
                 }
@@ -843,7 +818,6 @@ impl App {
             self.tabs[active].session.wheel(steps, col, row, pixel)
         };
         if let Some(bytes) = report {
-            self.tabs[active].session.pty.note_input();
             if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
                 tracing::warn!(%err, "pty write");
             }
@@ -868,7 +842,8 @@ impl App {
         };
         let active = self.active.min(self.tabs.len() - 1);
         let moved = self.tabs[active].session.update(|term| {
-            if term.scroll_metrics().1 == 0.0 {
+            let height = term.scroll_metrics().1;
+            if height <= 0.0 || height >= 1.0 {
                 return false;
             }
             term.scroll_to(fraction);
@@ -1153,7 +1128,6 @@ impl App {
         let bracketed = self.key_bracketed;
         let bytes = clipboard::paste_bytes(&text, bracketed);
         self.clear_selection();
-        self.tabs[active].session.pty.note_input();
         if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
             tracing::warn!(%err, "pty write");
         }
@@ -1512,9 +1486,8 @@ impl ApplicationHandler<Wake> for App {
                 if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
                     tab.session.frame_pending.store(false, Ordering::Release);
                 }
-                let title_changed = self.note_title(id);
                 let active = self.tabs.get(self.active).is_some_and(|tab| tab.id == id);
-                if active || title_changed {
+                if active {
                     self.redraw();
                 }
             }
@@ -1577,6 +1550,7 @@ pub fn run() -> anyhow::Result<()> {
         proxy,
         window: None,
         gpu: None,
+        presented_tab: None,
         face,
         atlas,
         mods: ModifiersState::empty(),
@@ -1629,7 +1603,33 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PhysicalSize, ResizeDirection, Scrollbar, bar_contains_y, bar_height, existing_file, resize_edge, strip_col};
+    use super::{
+        Mutex, PhysicalSize, ResizeDirection, Scrollbar, Term, bar_contains_y, bar_height,
+        existing_file, publish_frame, resize_edge, strip_col,
+    };
+
+    #[test]
+    fn synchronized_pet_replacement_keeps_the_complete_frame_visible() {
+        let frames = Mutex::new(None);
+        let mut term = Term::new(20, 8);
+        term.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=49374,c=4,r=5,q=2,C=1;/wAA/w==\x1b\\");
+        assert!(publish_frame(&mut term, &frames));
+
+        term.advance(b"\x1b[?2026h\x1b]2;New subject\x07\x1b_Ga=d,d=I,i=49374,q=2;\x1b\\");
+        assert!(publish_frame(&mut term, &frames));
+        let previous = frames.lock().unwrap().take().unwrap();
+        assert!(!previous.suspended);
+        assert_eq!(previous.title, "New subject");
+        assert_eq!(previous.images[0].image.rgba, [255, 0, 0, 255]);
+
+        term.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=49374,c=4,r=5,q=2,C=1;AAD//w==\x1b\\");
+        assert!(!publish_frame(&mut term, &frames));
+        term.advance(b"\x1b[?2026l");
+        assert!(publish_frame(&mut term, &frames));
+        let current = frames.lock().unwrap().take().unwrap();
+        assert_eq!(current.images.len(), 1);
+        assert_eq!(current.images[0].image.rgba, [0, 0, 255, 255]);
+    }
 
     #[test]
     fn bottom_bar_scales_and_uses_its_full_height_for_clicks() {

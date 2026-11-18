@@ -2,10 +2,10 @@
 
 use std::ops::Range;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
+use crate::agent::Agent;
 use crate::cell::{Cell, BOLD};
 use crate::color::Theme;
+use crate::tabs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TitleBar {
@@ -23,7 +23,7 @@ pub enum TitleHit {
     Close,
 }
 
-pub fn render(title: &str, cols: u16, theme: Theme, maximized: bool) -> TitleBar {
+pub fn render(title: &str, agent: Option<Agent>, cols: u16, theme: Theme, maximized: bool) -> TitleBar {
     let cols = usize::from(cols);
     let bg = theme.bar.pack();
     let fg = theme.fg.pack();
@@ -41,11 +41,15 @@ pub fn render(title: &str, cols: u16, theme: Theme, maximized: bool) -> TitleBar
         paint_button(&mut cells, maximize.clone(), mark, fg, bg);
         paint_button(&mut cells, close.clone(), '\u{00D7}', fg, bg);
     }
-    let room = origin;
-    let label = fit_title(if title.is_empty() { "Rustty" } else { title }, room);
-    let label_w = label.width();
-    let x = room.saturating_sub(label_w) / 2;
-    paint(&mut cells[x..room], &label, fg, bg);
+    // Leave room for the subject before adding the two-cell icon and a gap.
+    let prefix = if origin >= 6 { 3 } else { 0 };
+    let (label, label_width) = tabs::fit_title(title, origin - prefix);
+    let width = prefix + label_width;
+    let start = ((cols - width) / 2).min(origin - width);
+    if prefix > 0 {
+        tabs::paint_icon(&mut cells[start..origin], agent, fg, bg);
+    }
+    tabs::paint(&mut cells[start + prefix..origin], &label, fg, bg, BOLD);
     TitleBar {
         cells,
         minimize: shrink(minimize, buttons == 3),
@@ -87,56 +91,6 @@ fn paint_button(cells: &mut [Cell], range: Range<usize>, mark: char, fg: u32, bg
     };
 }
 
-fn fit_title(title: &str, width: usize) -> String {
-    if title.width() <= width {
-        return title.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in title.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width == 0 {
-            continue;
-        }
-        if used + ch_width >= width {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    if out.width() < title.width() && !out.is_empty() {
-        out.pop();
-        out.push('…');
-    }
-    out
-}
-
-fn paint(cells: &mut [Cell], text: &str, fg: u32, bg: u32) {
-    let mut col = 0;
-    for ch in text.chars() {
-        if col >= cells.len() {
-            break;
-        }
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width == 0 {
-            continue;
-        }
-        if col + width > cells.len() {
-            break;
-        }
-        cells[col] = Cell {
-            cp: ch as u32,
-            fg,
-            bg,
-            flags: 0,
-        };
-        col += width;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,23 +99,36 @@ mod tests {
     fn title_bar_uses_the_theme_and_keeps_the_buttons_on_the_right() {
         let noite = crate::color::theme(crate::color::theme_index("noite"));
         let papel = crate::color::theme(crate::color::theme_index("papel"));
-        let bar = render("shell", 80, noite, false);
+        let bar = render("Codex subject", Some(Agent::Codex), 80, noite, false);
         assert_eq!(bar.cells[0].bg, noite.bar.pack());
         assert_ne!(bar.cells[0].bg, papel.bar.pack());
         assert_eq!(bar.cells[bar.close.start as usize + 1].cp, u32::from('\u{00D7}'));
         assert_eq!(bar.cells[bar.maximize.start as usize + 1].cp, u32::from('\u{25A1}'));
-        assert!(bar.cells.iter().any(|cell| cell.cp == u32::from('s')));
+        let start = (80 - "Codex subject".len() - 3) / 2;
+        assert_eq!(bar.cells[start].cp, Agent::Codex.icon());
+        assert_eq!(bar.cells[start].flags, crate::cell::AGENT_ICON | crate::cell::WIDE);
+        assert_eq!(bar.cells[start + 3].cp, u32::from('C'));
         assert_eq!(hit(&bar, bar.close.start), TitleHit::Close);
         assert_eq!(hit(&bar, 4), TitleHit::Drag);
-        let restored = render("shell", 80, noite, true);
+        let restored = render("shell", None, 80, noite, true);
         assert_eq!(restored.cells[restored.maximize.start as usize + 1].cp, u32::from('\u{29C9}'));
     }
 
     #[test]
     fn narrow_title_bar_drops_the_buttons_instead_of_overlapping_the_title() {
         let theme = crate::color::theme(0);
-        let bar = render("Rustty", 4, theme, false);
+        let bar = render("Rustty", None, 4, theme, false);
         assert!(bar.close.is_empty());
         assert!(bar.cells.iter().any(|cell| cell.cp == u32::from('R')));
+    }
+
+    #[test]
+    fn title_and_icon_fit_before_the_window_controls() {
+        let bar = render("東京の長い話題", None, 16, crate::color::theme(0), false);
+        assert_eq!(bar.cells[1].cp, crate::agent::RUSTTY_ICON);
+        assert_eq!(bar.cells[4].cp, u32::from('東'));
+        assert_eq!(bar.cells[5].flags, crate::cell::SPACER);
+        assert_eq!(bar.cells[6].cp, u32::from('…'));
+        assert_eq!(bar.minimize.start, 7);
     }
 }

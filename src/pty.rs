@@ -6,7 +6,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -25,7 +24,6 @@ pub struct Pty {
     write_lock: Mutex<()>,
     wake_read: OwnedFd,
     wake_write: OwnedFd,
-    last_input: Mutex<Option<Instant>>,
 }
 
 impl Pty {
@@ -49,22 +47,8 @@ impl Pty {
             .map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
         let name = shell.rsplit('/').next().unwrap_or("bash");
         let argv0 = CString::new(format!("-{name}")).map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
-        let mut env = Vec::new();
-        for (key, value) in std::env::vars() {
-            if matches!(key.as_str(), "TERM" | "COLORTERM" | "TERM_PROGRAM") {
-                continue;
-            }
-            if let Ok(pair) = CString::new(format!("{key}={value}")) {
-                env.push(pair);
-            }
-        }
-        env.push(CString::new("TERM=xterm-256color").unwrap());
-        env.push(CString::new("COLORTERM=truecolor").unwrap());
-        // Terminfo stays xterm. Codex enables /pets only when the program name
-        // contains "kitty", "ghostty", or "wezterm", and it ignores TERM once
-        // TERM_PROGRAM is set. The suffix advertises the graphics protocol.
-        env.push(CString::new("TERM_PROGRAM=rustty-kitty").unwrap());
-        // Build the vectors before fork: the child cannot allocate in a multithreaded process.
+        // Built before fork: the child cannot allocate in a multithreaded process.
+        let env = shell_environment(std::env::vars());
         let argv = [argv0.as_ptr(), std::ptr::null()];
         let mut envp: Vec<*const libc::c_char> = env.iter().map(|entry| entry.as_ptr()).collect();
         envp.push(std::ptr::null());
@@ -132,7 +116,6 @@ impl Pty {
                     write_lock: Mutex::new(()),
                     wake_read,
                     wake_write,
-                    last_input: Mutex::new(None),
                 })
             }
         }
@@ -148,18 +131,6 @@ impl Pty {
 
     pub fn shell_pid(&self) -> i32 {
         self.child.as_raw()
-    }
-
-    pub fn note_input(&self) {
-        *self.last_input.lock().unwrap_or_else(|err| err.into_inner()) = Some(Instant::now());
-    }
-
-    /// True for a short window after a key, while pet frames should stay on the previous picture.
-    pub(crate) fn typing(&self) -> bool {
-        self.last_input
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(120))
     }
 
     /// Write immediately. A full input buffer only queues the remainder; the event loop does not wait.
@@ -282,6 +253,38 @@ fn io_err(err: Errno) -> io::Error {
     io::Error::from_raw_os_error(err as i32)
 }
 
+/// The parent terminal's prompt does not belong to this shell. Kitty exports
+/// `ENV` pointing at its own bash integration and a `PROMPT_COMMAND` that is
+/// already initialized. Oh My Posh then sees that hook and skips its own, so a
+/// Rustty opened from Kitty comes up with the plain prompt. The shell starts
+/// clean and loads Oh My Posh because `TERM_PROGRAM` matches `rustty*`.
+fn pass_to_shell(key: &str) -> bool {
+    match key {
+        "TERM" | "COLORTERM" | "TERM_PROGRAM" | "TERMINFO" | "ENV" | "BASH_ENV" | "PS0"
+        | "PS1" | "PS2" | "PROMPT_COMMAND" | "POWERLINE_COMMAND" => false,
+        _ => !key.starts_with("KITTY_") && !key.starts_with("POSH_"),
+    }
+}
+
+fn shell_environment(vars: impl IntoIterator<Item = (String, String)>) -> Vec<CString> {
+    let mut env = Vec::new();
+    for (key, value) in vars {
+        if !pass_to_shell(&key) {
+            continue;
+        }
+        if let Ok(pair) = CString::new(format!("{key}={value}")) {
+            env.push(pair);
+        }
+    }
+    env.push(CString::new("TERM=xterm-256color").unwrap());
+    env.push(CString::new("COLORTERM=truecolor").unwrap());
+    // Terminfo stays xterm. Codex enables /pets only when the program name
+    // contains "kitty", "ghostty", or "wezterm", and it ignores TERM once
+    // TERM_PROGRAM is set. The suffix advertises the graphics protocol.
+    env.push(CString::new("TERM_PROGRAM=rustty-kitty").unwrap());
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +396,35 @@ mod tests {
         let printed = PathBuf::from(text.lines().next().expect("missing directory"));
         assert_eq!(printed.canonicalize().unwrap(), work.canonicalize().unwrap());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shell_starts_without_the_parent_terminal_prompt() {
+        let env = shell_environment([
+            ("HOME", "/home/guto"),
+            ("PATH", "/usr/bin"),
+            ("TERM", "xterm-kitty"),
+            ("COLORTERM", "truecolor"),
+            ("TERM_PROGRAM", "kitty"),
+            ("TERMINFO", "/kitty/terminfo"),
+            ("ENV", "/kitty/shell-integration/bash/kitty.bash"),
+            ("BASH_ENV", "/kitty/shell-integration/bash/kitty.bash"),
+            ("KITTY_PID", "1"),
+            ("KITTY_SHELL_INTEGRATION", "enabled"),
+            ("KITTY_BASH_INJECT", "1"),
+            ("PROMPT_COMMAND", "_omp_hook"),
+            ("PS1", "plain"),
+            ("POSH_SHELL", "bash"),
+            ("POWERLINE_COMMAND", "oh-my-posh"),
+        ].map(|(key, value)| (key.to_string(), value.to_string())));
+        let text = env.iter().map(|entry| entry.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("HOME=/home/guto"));
+        assert!(text.contains("PATH=/usr/bin"));
+        assert!(text.contains("TERM=xterm-256color"));
+        assert!(text.contains("COLORTERM=truecolor"));
+        assert!(text.contains("TERM_PROGRAM=rustty-kitty"));
+        for dropped in ["KITTY_", "TERMINFO=", "ENV=", "BASH_ENV=", "PROMPT_COMMAND=", "PS1=", "POSH_", "POWERLINE_COMMAND="] {
+            assert!(!text.contains(dropped), "{dropped} leaked into {text}");
+        }
     }
 }

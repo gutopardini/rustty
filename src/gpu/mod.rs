@@ -12,8 +12,10 @@ use crate::confirm::{self, Dialog};
 use crate::font::{Atlas, Face};
 use crate::term::Snapshot;
 
+mod frame;
 mod images;
 
+use frame::Frame;
 use images::Images;
 
 const MAX_GLYPHS: usize = 8192;
@@ -64,8 +66,13 @@ pub struct Renderer {
     title_gpu: Vec<GpuCell>,
     title_count: u32,
     dialog: Option<DialogLayer>,
+    left_w: f32,
     top_h: f32,
+    /// Space between the title bar and the first row.
+    grid_pad_top: f32,
     chrome_h: f32,
+    /// Rounded corners. Absent when the surface cannot be transparent.
+    frame: Option<Frame>,
     clear: Rgb,
     selection: (u32, u32),
     presented: Option<Presented>,
@@ -76,6 +83,7 @@ struct Presented {
     cols: u16,
     rows: u16,
     cursor: Option<(u16, u16)>,
+    composer: Option<[u16; 4]>,
     scroll_top: f32,
     scroll_h: f32,
 }
@@ -132,10 +140,16 @@ impl Renderer {
             height: size.height.max(1),
             present_mode,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            // Premultiplied alpha lets the corners be transparent.
+            alpha_mode: if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else {
+                caps.alpha_modes[0]
+            },
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+        tracing::info!(alpha = ?config.alpha_mode, "surface");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustty-cells"),
@@ -344,6 +358,8 @@ impl Renderer {
             &agent_view,
             &sampler,
         );
+        let frame = (config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied)
+            .then(|| Frame::new(&device, config.format));
         let renderer = Self {
             surface,
             device,
@@ -380,8 +396,11 @@ impl Renderer {
             title_gpu: vec![GpuCell { slot: 0, fg: 0, bg: 0, flags: 0 }; BAR_CELLS],
             title_count: 0,
             dialog: None,
+            left_w: 0.0,
             top_h: 0.0,
+            grid_pad_top: 0.0,
             chrome_h: 0.0,
+            frame,
             clear: DEFAULT_BG,
             selection: (0, 0),
             presented: None,
@@ -390,9 +409,19 @@ impl Renderer {
         Ok(renderer)
     }
 
-    pub fn set_insets(&mut self, top: f32, bottom: f32) {
+    /// `top` and `bottom` are the bars. `pad_top` is the space between the top bar and the first row.
+    pub fn set_insets(&mut self, left: f32, top: f32, pad_top: f32, bottom: f32) {
+        self.left_w = left.max(0.0);
         self.top_h = top.max(0.0);
+        self.grid_pad_top = pad_top.max(0.0);
         self.chrome_h = bottom.max(0.0);
+    }
+
+    /// Corner radius in pixels. Zero for a maximized window.
+    pub fn set_corner_radius(&mut self, radius: f32) {
+        if let Some(frame) = &mut self.frame {
+            frame.set_radius(radius);
+        }
     }
 
     pub fn set_clear(&mut self, color: Rgb) {
@@ -455,8 +484,8 @@ impl Renderer {
             rows: u32::from(dialog.rows),
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
-            pad_x: f32::from(dialog.origin_col) * cell_w,
-            pad_y: self.top_h + f32::from(dialog.origin_row) * cell_h,
+            pad_x: self.left_w + f32::from(dialog.origin_col) * cell_w,
+            pad_y: self.top_h + self.grid_pad_top + f32::from(dialog.origin_row) * cell_h,
             cell_w,
             cell_h,
             surf_w,
@@ -558,20 +587,11 @@ impl Renderer {
     }
 
     /// Rewrites the uniforms from the last uploaded grid. The parser is not involved.
-    pub fn refresh_cached(&mut self, composer: Option<[u16; 4]>, accent: Rgb, scrollbar: Range<u32>) -> bool {
+    pub fn refresh_cached(&mut self, show_composer: bool, accent: Rgb, scrollbar: Range<u32>) -> bool {
         let Some(frame) = self.presented else {
             return false;
         };
-        self.write_uniforms(
-            frame.cols,
-            frame.rows,
-            frame.cursor,
-            frame.scroll_top,
-            frame.scroll_h,
-            composer,
-            accent,
-            scrollbar,
-        );
+        self.write_uniforms(frame, show_composer, accent, scrollbar);
         true
     }
 
@@ -580,7 +600,7 @@ impl Renderer {
         atlas: &mut Atlas,
         face: &Face,
         snap: &Snapshot,
-        composer: Option<[u16; 4]>,
+        show_composer: bool,
         accent: Rgb,
         scrollbar: Range<u32>,
     ) {
@@ -628,16 +648,16 @@ impl Renderer {
             self.flush_atlas(atlas);
         }
         self.scrollbar_visible = snap.scroll_h > 0.0 && !scrollbar.is_empty();
-        let grid = self.write_uniforms(
-            snap.cols,
-            snap.rows,
-            snap.cursor,
-            snap.scroll_top,
-            snap.scroll_h,
-            composer,
-            accent,
-            scrollbar,
-        );
+        let frame = Presented {
+            cols: snap.cols,
+            rows: snap.rows,
+            cursor: snap.cursor,
+            composer: snap.composer,
+            scroll_top: snap.scroll_top,
+            scroll_h: snap.scroll_h,
+        };
+        self.presented = Some(frame);
+        let grid = self.write_uniforms(frame, show_composer, accent, scrollbar);
         if !snap.images.is_empty() {
             self.images.get_or_insert_with(|| Images::new(&self.device, self.config.format));
         }
@@ -663,6 +683,9 @@ impl Renderer {
             }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(corners) = &mut self.frame {
+            corners.prepare(&self.queue, self.config.width, self.config.height);
+        }
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rustty"),
         });
@@ -715,6 +738,9 @@ impl Renderer {
                 pass.set_bind_group(0, &dialog.bind, &[]);
                 pass.draw(0..6, 0..dialog.count);
             }
+            if let Some(frame) = &self.frame {
+                frame.draw(&mut pass);
+            }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
@@ -742,18 +768,13 @@ impl Renderer {
     }
 
     fn write_uniforms(
-        &mut self,
-        cols: u16,
-        rows: u16,
-        cursor: Option<(u16, u16)>,
-        scroll_top: f32,
-        scroll_h: f32,
-        composer: Option<[u16; 4]>,
+        &self,
+        frame: Presented,
+        show_composer: bool,
         accent: Rgb,
         scrollbar: Range<u32>,
     ) -> Uniforms {
-        self.presented = Some(Presented { cols, rows, cursor, scroll_top, scroll_h });
-        let (cursor_col, cursor_row, cursor_on) = match cursor {
+        let (cursor_col, cursor_row, cursor_on) = match frame.cursor {
             Some((col, row)) => (u32::from(col), u32::from(row), 1),
             None => (0, 0, 0),
         };
@@ -762,31 +783,33 @@ impl Renderer {
         let surf_w = self.config.width as f32;
         let surf_h = self.config.height as f32;
         let uniforms = Uniforms {
-            cols: u32::from(cols),
-            rows: u32::from(rows),
+            cols: u32::from(frame.cols),
+            rows: u32::from(frame.rows),
             cursor_col,
             cursor_row,
             cursor_on,
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
             _reserved: 0,
-            pad_x: 0.0,
-            pad_y: self.top_h,
+            pad_x: self.left_w,
+            pad_y: self.top_h + self.grid_pad_top,
             cell_w,
             cell_h,
             surf_w,
             surf_h,
-            scroll_top,
-            scroll_h,
-            composer: composer.map_or([0; 4], |bounds| bounds.map(u32::from)),
+            scroll_top: frame.scroll_top,
+            scroll_h: frame.scroll_h,
+            composer: frame.composer
+                .filter(|_| show_composer)
+                .map_or([0; 4], |bounds| bounds.map(u32::from)),
             composer_accent: accent.pack(),
             fill_bg: self.clear.pack(),
             scroll_left: scrollbar.start as f32,
             scroll_right: scrollbar.end as f32,
             sel_lo: self.selection.0,
             sel_hi: self.selection.1,
-            _sel_pad0: 0,
-            _sel_pad1: 0,
+            scroll_y0: self.top_h,
+            scroll_y1: (surf_h - self.chrome_h).max(self.top_h),
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         uniforms
@@ -820,8 +843,8 @@ impl Renderer {
             scroll_right: 0.0,
             sel_lo: 0,
             sel_hi: 0,
-            _sel_pad0: 0,
-            _sel_pad1: 0,
+            scroll_y0: 0.0,
+            scroll_y1: 0.0,
         };
         self.queue.write_buffer(buf, 0, bytemuck::bytes_of(&uniforms));
     }

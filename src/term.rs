@@ -58,6 +58,7 @@ pub struct Snapshot {
     pub rows_dirty: Vec<(u16, Vec<Cell>)>,
     pub(crate) images: Vec<Placement>,
     pub cursor: Option<(u16, u16)>,
+    pub(crate) composer: Option<[u16; 4]>,
     pub title: String,
     pub title_changed: bool,
     pub suspended: bool,
@@ -66,6 +67,8 @@ pub struct Snapshot {
     pub content_changed: bool,
     pub scroll_top: f32,
     pub scroll_h: f32,
+    /// Absolute line shown in the first visible row. See [`Term::view_top`].
+    pub view_top: u64,
 }
 
 pub struct Term {
@@ -84,6 +87,9 @@ pub struct Term {
     /// line leaves the top, so the reader never clones the row.
     pending: Vec<[u8; 64]>,
     view_offset: usize,
+    /// Lines that left the front of the scrollback. Absolute line numbers stay
+    /// valid while history is trimmed.
+    dropped: u64,
     title: String,
     title_dirty: bool,
     dirty: Vec<bool>,
@@ -92,6 +98,7 @@ pub struct Term {
     suspend: bool,
     autowrap: bool,
     cursor_visible: bool,
+    last_snapshot_cursor: Option<(u16, u16)>,
     app_cursor: bool,
     origin_mode: bool,
     pending_wrap: bool,
@@ -130,6 +137,7 @@ impl Term {
             line_pool: Vec::new(),
             pending: Vec::new(),
             view_offset: 0,
+            dropped: 0,
             title: "Rustty".to_string(),
             title_dirty: true,
             dirty: vec![true; usize::from(rows)],
@@ -138,6 +146,7 @@ impl Term {
             suspend: false,
             autowrap: true,
             cursor_visible: true,
+            last_snapshot_cursor: None,
             app_cursor: false,
             origin_mode: false,
             pending_wrap: false,
@@ -220,8 +229,15 @@ impl Term {
         self.view_offset
     }
 
+    /// Absolute number of the line in the first visible row. Line numbers count
+    /// from the first line this tab ever kept, so they survive scrolling and trimming.
+    pub fn view_top(&self) -> u64 {
+        let history = self.scrollback.len();
+        self.dropped + (history - self.view_offset.min(history)) as u64
+    }
+
     /// Colored rectangle of the active Codex composer, in cells.
-    pub(crate) fn codex_composer(&self) -> Option<[u16; 4]> {
+    fn codex_composer(&self) -> Option<[u16; 4]> {
         if !self.cursor_visible || self.suspend || self.view_offset != 0 {
             return None;
         }
@@ -364,6 +380,20 @@ impl Term {
         self.dirty.fill(true);
     }
 
+    /// Keeps the rows from a complete frame the renderer has yet to consume.
+    pub(crate) fn keep_pending_damage(&mut self, pending: &Snapshot) {
+        if self.suspend {
+            return;
+        }
+        if pending.full {
+            self.damage_all();
+        } else {
+            for (row, _) in &pending.rows_dirty {
+                self.mark(*row);
+            }
+        }
+    }
+
     pub fn alt_screen(&self) -> bool {
         self.alt_on
     }
@@ -449,8 +479,11 @@ impl Term {
     /// fills the track, so the bar stays on screen.
     pub fn scroll_metrics(&self) -> (f32, f32) {
         let history = self.scrollback.len();
-        if history == 0 {
-            return (0.0, 1.0);
+        // With nothing to scroll, or while the program takes the wheel for its own
+        // view, this history says nothing about what is left to read. No thumb is drawn.
+        let app_scrolls = self.mouse_enabled() || (self.alt_on && self.alt_scroll);
+        if history == 0 || (app_scrolls && self.view_offset == 0) {
+            return (0.0, 0.0);
         }
         let rows = usize::from(self.rows).max(1);
         let total = history + rows;
@@ -504,6 +537,7 @@ impl Term {
                 rows_dirty: Vec::new(),
                 images: Vec::new(),
                 cursor: None,
+                composer: None,
                 title: if title_changed { self.title.clone() } else { String::new() },
                 title_changed,
                 suspended: true,
@@ -511,11 +545,12 @@ impl Term {
                 content_changed: false,
                 scroll_top: 0.0,
                 scroll_h: 0.0,
+                view_top: self.view_top(),
             };
         }
 
-        let cursor = self.cursor_visible.then_some((self.cursor.col, self.cursor.row));
         let show_history = self.view_offset > 0;
+        let cursor = (self.cursor_visible && !show_history).then_some((self.cursor.col, self.cursor.row));
         let mut full = self.damage_all || show_history;
         if !full && self.view_offset == 0 {
             let dirty_count = self.dirty.iter().filter(|flag| **flag).count();
@@ -549,9 +584,14 @@ impl Term {
         } else {
             self.screen().graphics.placements.iter().cloned().collect()
         };
-        let changed = full || !rows_dirty.is_empty() || title_changed || self.graphics_dirty;
+        let changed = full
+            || !rows_dirty.is_empty()
+            || title_changed
+            || self.graphics_dirty
+            || cursor != self.last_snapshot_cursor;
         let content_changed = self.damage_all || self.dirty.iter().any(|flag| *flag);
         let (scroll_top, scroll_h) = self.scroll_metrics();
+        self.last_snapshot_cursor = cursor;
         self.damage_all = false;
         self.graphics_dirty = false;
         self.dirty.fill(false);
@@ -562,7 +602,8 @@ impl Term {
             cells,
             rows_dirty,
             images,
-            cursor: if show_history { None } else { cursor },
+            cursor,
+            composer: self.codex_composer(),
             title: if title_changed { self.title.clone() } else { String::new() },
             title_changed,
             suspended: false,
@@ -570,6 +611,7 @@ impl Term {
             content_changed,
             scroll_top,
             scroll_h,
+            view_top: self.view_top(),
         }
     }
 
@@ -584,38 +626,29 @@ impl Term {
         url_covering(&cells, usize::from(col))
     }
 
-    /// Text covered by the two cells, in reading order. Trailing spaces on each line are dropped.
-    pub fn selected_text(&self, anchor: (u16, u16), focus: (u16, u16)) -> String {
-        let cols = self.cols.max(1);
-        let linear = |cell: (u16, u16)| {
-            let col = cell.0.min(cols - 1);
-            let row = cell.1.min(self.rows.saturating_sub(1));
-            u32::from(row) * u32::from(cols) + u32::from(col)
-        };
-        let (lo, hi) = {
-            let a = linear(anchor);
-            let b = linear(focus);
-            if a <= b { (a, b) } else { (b, a) }
-        };
-        let row0 = (lo / u32::from(cols)) as u16;
-        let row1 = (hi / u32::from(cols)) as u16;
-        let col0 = (lo % u32::from(cols)) as u16;
-        let col1 = (hi % u32::from(cols)) as u16;
+    /// Text between two absolute positions `(col, line)`, in reading order.
+    /// Lines come from the history or the screen, wherever they are now. Trailing spaces are dropped.
+    pub fn selected_text(&self, anchor: (u16, u64), focus: (u16, u64)) -> String {
+        let last_col = self.cols.max(1) - 1;
+        let (lo, hi) = if (anchor.1, anchor.0) <= (focus.1, focus.0) { (anchor, focus) } else { (focus, anchor) };
         let mut lines = Vec::new();
-        for row in row0..=row1 {
-            let from = if row == row0 { col0 } else { 0 };
-            let to = if row == row1 { col1 } else { cols - 1 };
-            let mut line = String::new();
-            for glyph in self.glyphs(row) {
+        let mut cells = Vec::with_capacity(usize::from(self.cols));
+        for line in lo.1..=hi.1 {
+            let from = if line == lo.1 { lo.0.min(last_col) } else { 0 };
+            let to = if line == hi.1 { hi.0.min(last_col) } else { last_col };
+            cells.clear();
+            self.append_line(line, &mut cells);
+            let mut text = String::new();
+            for glyph in glyphs(&cells) {
                 if glyph.end < from || glyph.start > to {
                     continue;
                 }
-                line.push(glyph.ch);
+                text.push(glyph.ch);
             }
-            while line.ends_with(' ') {
-                line.pop();
+            while text.ends_with(' ') {
+                text.pop();
             }
-            lines.push(line);
+            lines.push(text);
         }
         lines.join("\n")
     }
@@ -644,21 +677,27 @@ impl Term {
     fn glyphs(&self, row: u16) -> Vec<Glyph> {
         let mut cells = Vec::new();
         self.append_visible(row, &mut cells);
-        let mut glyphs = Vec::new();
-        let mut col = 0u16;
-        for cell in cells {
-            if cell.flags & SPACER != 0 {
-                continue;
+        glyphs(&cells)
+    }
+
+    /// Cells of an absolute line. A line that was trimmed or lies past the screen reads blank.
+    fn append_line(&self, line: u64, dst: &mut Vec<Cell>) {
+        let cols = usize::from(self.cols);
+        let blank = Cell::blank(self.default_fg.pack(), self.default_bg.pack());
+        let history = self.scrollback.len();
+        let index = line.checked_sub(self.dropped).and_then(|index| usize::try_from(index).ok());
+        match index {
+            Some(index) if index < history => {
+                let src = &self.scrollback[index];
+                let n = src.len().min(cols);
+                dst.extend_from_slice(&src[..n]);
+                dst.resize(dst.len() + (cols - n), blank);
             }
-            let width: u16 = if cell.flags & WIDE != 0 { 2 } else { 1 };
-            let ch = char::from_u32(cell.cp)
-                .filter(|ch| cell.cp != 0 && !ch.is_control())
-                .unwrap_or(' ');
-            let end = col.saturating_add(width.saturating_sub(1));
-            glyphs.push(Glyph { start: col, end, ch });
-            col = col.saturating_add(width);
+            Some(index) if index - history < usize::from(self.rows) => {
+                dst.extend_from_slice(&self.screen().lines[index - history]);
+            }
+            _ => dst.resize(dst.len() + cols, blank),
         }
-        glyphs
     }
 
     fn append_visible(&self, row: u16, dst: &mut Vec<Cell>) {
@@ -715,18 +754,14 @@ impl Term {
     }
 
     fn move_to(&mut self, row: u16, col: u16) {
-        let old = self.cursor.row;
         self.cursor.row = row.min(self.rows.saturating_sub(1));
         self.cursor.col = col.min(self.cols.saturating_sub(1));
         self.pending_wrap = false;
-        self.mark(old);
-        self.mark(self.cursor.row);
     }
 
     fn carriage_return(&mut self) {
         self.cursor.col = 0;
         self.pending_wrap = false;
-        self.mark(self.cursor.row);
     }
 
     fn linefeed(&mut self) {
@@ -734,10 +769,7 @@ impl Term {
         if self.cursor.row == self.scroll_bot {
             self.scroll_region(self.scroll_top, self.scroll_bot, 1);
         } else if self.cursor.row + 1 < self.rows {
-            let old = self.cursor.row;
             self.cursor.row += 1;
-            self.mark(old);
-            self.mark(self.cursor.row);
         }
     }
 
@@ -817,6 +849,7 @@ impl Term {
         self.scrollback.push_back(line);
         while self.scrollback.len() > MAX_SCROLLBACK {
             if let Some(old) = self.scrollback.pop_front() {
+                self.dropped += 1;
                 self.recycle(old);
             }
         }
@@ -829,6 +862,7 @@ impl Term {
 
     fn forget_history(&mut self) {
         while let Some(line) = self.scrollback.pop_front() {
+            self.dropped += 1;
             self.recycle(line);
         }
         self.pending.clear();
@@ -1046,10 +1080,7 @@ impl Term {
                 1 => self.app_cursor = enable,
                 6 => self.origin_mode = enable,
                 7 => self.autowrap = enable,
-                25 => {
-                    self.cursor_visible = enable;
-                    self.mark(self.cursor.row);
-                }
+                25 => self.cursor_visible = enable,
                 47 | 1047 | 1049 => self.set_alt(enable),
                 1000 => self.mouse_normal = enable,
                 1002 => self.mouse_button = enable,
@@ -1058,12 +1089,7 @@ impl Term {
                 1007 => self.alt_scroll = enable,
                 1016 => self.mouse_pixels = enable,
                 2004 => self.bracketed_paste = enable,
-                2026 => {
-                    self.suspend = enable;
-                    if !enable {
-                        self.damage_all = true;
-                    }
-                }
+                2026 => self.suspend = enable,
                 _ => {}
             }
         }
@@ -1087,7 +1113,6 @@ impl Perform for Term {
                     self.pending_wrap = false;
                 } else if self.cursor.col > 0 {
                     self.cursor.col -= 1;
-                    self.mark(self.cursor.row);
                 }
             }
             b'\t' => {
@@ -1097,7 +1122,6 @@ impl Perform for Term {
                     self.pending_wrap = self.autowrap;
                     self.cursor.col = self.cols.saturating_sub(1);
                 }
-                self.mark(self.cursor.row);
             }
             _ => {}
         }
@@ -1390,6 +1414,24 @@ struct Glyph {
     ch: char,
 }
 
+fn glyphs(cells: &[Cell]) -> Vec<Glyph> {
+    let mut glyphs = Vec::new();
+    let mut col = 0u16;
+    for cell in cells {
+        if cell.flags & SPACER != 0 {
+            continue;
+        }
+        let width: u16 = if cell.flags & WIDE != 0 { 2 } else { 1 };
+        let ch = char::from_u32(cell.cp)
+            .filter(|ch| cell.cp != 0 && !ch.is_control())
+            .unwrap_or(' ');
+        let end = col.saturating_add(width.saturating_sub(1));
+        glyphs.push(Glyph { start: col, end, ch });
+        col = col.saturating_add(width);
+    }
+    glyphs
+}
+
 fn is_word(ch: char) -> bool {
     ch.is_alphanumeric()
         || matches!(ch, '_' | '-' | '.' | '/' | ':' | '@' | '+' | '%' | '~' | '?' | '=' | '&' | '#')
@@ -1637,11 +1679,18 @@ mod tests {
             "\x1b[4;2H         ",
             "\x1b[2;4H\x1b[48;2;70;72;76m#\x1b[0m\x1b[4;7H",
         ).as_bytes());
-        assert_eq!(term.codex_composer(), Some([1, 1, 10, 4]));
+        let visible = term.snapshot();
+        assert_eq!(visible.composer, Some([1, 1, 10, 4]));
         term.advance(b"\x1b[?25l");
-        assert_eq!(term.codex_composer(), None);
+        let hidden = term.snapshot();
+        assert_eq!(hidden.composer, None);
+        assert_eq!(hidden.cursor, None);
+        assert!(hidden.changed && !hidden.content_changed);
         term.advance(b"\x1b[?25h\x1b[5;1H");
-        assert_eq!(term.codex_composer(), None);
+        let moved = term.snapshot();
+        assert_eq!(moved.composer, None);
+        assert_eq!(moved.cursor, Some((0, 4)));
+        assert!(moved.changed && !moved.content_changed);
     }
 
     fn record_first(entry: &[u8; 64]) -> u32 {
@@ -1743,12 +1792,49 @@ mod tests {
     }
 
     #[test]
-    fn fresh_screen_still_reports_a_scrollbar() {
+    fn thumb_appears_with_history_and_shrinks_as_it_grows() {
         let mut term = Term::new(10, 4);
-        assert_eq!(term.scroll_metrics(), (0.0, 1.0));
-        let snap = term.snapshot();
-        assert_eq!(snap.scroll_top, 0.0);
-        assert_eq!(snap.scroll_h, 1.0);
+        assert_eq!(term.scroll_metrics(), (0.0, 0.0));
+        assert_eq!(term.snapshot().scroll_h, 0.0);
+
+        term.advance(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+        let (top, short) = term.scroll_metrics();
+        assert!((short - 0.5).abs() < 1e-6, "{short}");
+        assert!((top - 0.5).abs() < 1e-6, "{top}");
+        for _ in 0..40 {
+            term.advance(b"\r\nline");
+        }
+        let (top, long) = term.scroll_metrics();
+        assert!(long < short / 4.0, "{long}");
+        assert!((top + long - 1.0).abs() < 1e-6, "{top} {long}");
+    }
+
+    #[test]
+    fn no_thumb_while_the_program_scrolls_its_own_view() {
+        let mut term = Term::new(4, 2);
+        term.advance(b"aaaa\r\nbbbb\r\ncccc");
+        assert!(term.scroll_metrics().1 > 0.0);
+        term.advance(b"\x1b[?1049h\x1b[?1007h");
+        assert_eq!(term.scroll_metrics(), (0.0, 0.0));
+        term.scroll_view(1);
+        assert!(term.scroll_metrics().1 > 0.0);
+        term.scroll_view(-1);
+        term.advance(b"\x1b[?1007l\x1b[?1049l\x1b[?1000h");
+        assert_eq!(term.scroll_metrics(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn selection_keeps_its_lines_while_the_view_scrolls_and_history_is_trimmed() {
+        let mut term = Term::new(4, 2);
+        term.advance(b"aaaa\r\nbbbb\r\ncccc");
+        assert_eq!(term.view_top(), 1);
+        term.scroll_view(1);
+        assert_eq!(term.view_top(), 0);
+        assert_eq!(term.selected_text((2, 0), (1, 2)), "aa\nbbbb\ncc");
+        term.scroll_view(-1);
+        term.advance(b"\x1b[3J\x1b[Hdddd");
+        assert_eq!(term.view_top(), 1);
+        assert_eq!(term.selected_text((0, 0), (3, 1)), "\ndddd");
     }
 
     #[test]

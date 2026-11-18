@@ -22,8 +22,8 @@ struct Uniforms {
     scroll_right: f32,
     sel_lo: u32,
     sel_hi: u32,
-    _sel_pad0: u32,
-    _sel_pad1: u32,
+    scroll_y0: f32,
+    scroll_y1: f32,
 }
 
 struct Cell {
@@ -81,8 +81,9 @@ fn fill_quad(corner: vec2<f32>) -> VsOut {
     let strip = u._reserved != 0u;
     let left = select(u.scroll_left, f32(u.cols) * u.cell_w, strip);
     let right = select(u.scroll_right, u.surf_w, strip);
-    let bottom = select(u.surf_h - u.pad_y, u.pad_y + u.cell_h, strip);
-    let start = vec2<f32>(left, u.pad_y);
+    let top = select(u.scroll_y0, u.pad_y, strip);
+    let bottom = select(u.scroll_y1, u.pad_y + u.cell_h, strip);
+    let start = vec2<f32>(left, top);
     let end = max(start, vec2<f32>(right, bottom));
     return VsOut(clip_position(mix(start, end, corner)), vec2<f32>(0.0), vec4<f32>(0.0),
         unpack_color(u.fill_bg), corner, EXTRA_QUAD, 0u);

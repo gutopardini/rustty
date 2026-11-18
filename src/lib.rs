@@ -15,6 +15,7 @@ pub mod cell;
 mod clipboard;
 pub mod color;
 pub mod confirm;
+pub mod desktop;
 pub mod font;
 mod ft;
 pub mod gpu;

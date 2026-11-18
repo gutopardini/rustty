@@ -5,6 +5,7 @@ use std::ops::Range;
 use crate::agent::Agent;
 use crate::cell::{Cell, BOLD};
 use crate::color::Theme;
+use crate::desktop::{Button, ButtonLayout};
 use crate::tabs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,39 +24,58 @@ pub enum TitleHit {
     Close,
 }
 
-pub fn render(title: &str, agent: Option<Agent>, cols: u16, theme: Theme, maximized: bool) -> TitleBar {
+pub fn render(
+    title: &str,
+    agent: Option<Agent>,
+    cols: u16,
+    theme: Theme,
+    maximized: bool,
+    layout: &ButtonLayout,
+) -> TitleBar {
     let cols = usize::from(cols);
     let bg = theme.bar.pack();
     let fg = theme.fg.pack();
     let mut cells = vec![Cell::blank(fg, bg); cols];
     let button = if cols >= 16 { 3 } else { 2 };
-    let buttons = if cols >= button * 3 { 3 } else { 0 };
-    let used = button * buttons;
-    let origin = cols.saturating_sub(used);
-    let minimize = origin..origin + button;
-    let maximize = minimize.end..minimize.end + button;
-    let close = maximize.end..maximize.end + button;
-    if buttons == 3 {
-        paint_button(&mut cells, minimize.clone(), '\u{2212}', fg, bg);
-        let mark = if maximized { '\u{29C9}' } else { '\u{25A1}' };
-        paint_button(&mut cells, maximize.clone(), mark, fg, bg);
-        paint_button(&mut cells, close.clone(), '\u{00D7}', fg, bg);
+    let count = layout.left.len() + layout.right.len();
+    // The buttons go only when the title keeps at least the icon and a few letters.
+    let show = count > 0 && cols >= button * count + 6.min(cols);
+    let mut ranges = [0..0, 0..0, 0..0];
+    let mut left_end = 0;
+    let mut right_start = cols;
+    if show {
+        for &kind in &layout.left {
+            ranges[kind as usize] = left_end..left_end + button;
+            left_end += button;
+        }
+        right_start = cols - button * layout.right.len();
+        let mut at = right_start;
+        for &kind in &layout.right {
+            ranges[kind as usize] = at..at + button;
+            at += button;
+        }
+        for (kind, range) in [Button::Minimize, Button::Maximize, Button::Close].into_iter().zip(&ranges) {
+            let mark = match kind {
+                Button::Minimize => '\u{2212}',
+                Button::Maximize if maximized => '\u{29C9}',
+                Button::Maximize => '\u{25A1}',
+                Button::Close => '\u{00D7}',
+            };
+            paint_button(&mut cells, range.clone(), mark, fg, bg);
+        }
     }
-    // Leave room for the subject before adding the two-cell icon and a gap.
-    let prefix = if origin >= 6 { 3 } else { 0 };
-    let (label, label_width) = tabs::fit_title(title, origin - prefix);
+    // The subject is centered on the window and moves aside only when a button is in the way.
+    let room = right_start - left_end;
+    let prefix = if room >= 6 { 3 } else { 0 };
+    let (label, label_width) = tabs::fit_title(title, room - prefix);
     let width = prefix + label_width;
-    let start = ((cols - width) / 2).min(origin - width);
+    let start = ((cols - width) / 2).clamp(left_end, right_start - width);
     if prefix > 0 {
-        tabs::paint_icon(&mut cells[start..origin], agent, fg, bg);
+        tabs::paint_icon(&mut cells[start..right_start], agent, fg, bg);
     }
-    tabs::paint(&mut cells[start + prefix..origin], &label, fg, bg, BOLD);
-    TitleBar {
-        cells,
-        minimize: shrink(minimize, buttons == 3),
-        maximize: shrink(maximize, buttons == 3),
-        close: shrink(close, buttons == 3),
-    }
+    tabs::paint(&mut cells[start + prefix..right_start], &label, fg, bg, BOLD);
+    let [minimize, maximize, close] = ranges.map(|range| range.start as u16..range.end as u16);
+    TitleBar { cells, minimize, maximize, close }
 }
 
 pub fn hit(bar: &TitleBar, col: u16) -> TitleHit {
@@ -67,14 +87,6 @@ pub fn hit(bar: &TitleBar, col: u16) -> TitleHit {
         TitleHit::Minimize
     } else {
         TitleHit::Drag
-    }
-}
-
-fn shrink(range: Range<usize>, keep: bool) -> Range<u16> {
-    if keep {
-        range.start as u16..range.end as u16
-    } else {
-        0..0
     }
 }
 
@@ -99,7 +111,7 @@ mod tests {
     fn title_bar_uses_the_theme_and_keeps_the_buttons_on_the_right() {
         let noite = crate::color::theme(crate::color::theme_index("noite"));
         let papel = crate::color::theme(crate::color::theme_index("papel"));
-        let bar = render("Codex subject", Some(Agent::Codex), 80, noite, false);
+        let bar = render("Codex subject", Some(Agent::Codex), 80, noite, false, &ButtonLayout::default());
         assert_eq!(bar.cells[0].bg, noite.bar.pack());
         assert_ne!(bar.cells[0].bg, papel.bar.pack());
         assert_eq!(bar.cells[bar.close.start as usize + 1].cp, u32::from('\u{00D7}'));
@@ -110,25 +122,47 @@ mod tests {
         assert_eq!(bar.cells[start + 3].cp, u32::from('C'));
         assert_eq!(hit(&bar, bar.close.start), TitleHit::Close);
         assert_eq!(hit(&bar, 4), TitleHit::Drag);
-        let restored = render("shell", None, 80, noite, true);
+        let restored = render("shell", None, 80, noite, true, &ButtonLayout::default());
         assert_eq!(restored.cells[restored.maximize.start as usize + 1].cp, u32::from('\u{29C9}'));
     }
 
     #[test]
     fn narrow_title_bar_drops_the_buttons_instead_of_overlapping_the_title() {
         let theme = crate::color::theme(0);
-        let bar = render("Rustty", None, 4, theme, false);
+        let bar = render("Rustty", None, 4, theme, false, &ButtonLayout::default());
         assert!(bar.close.is_empty());
         assert!(bar.cells.iter().any(|cell| cell.cp == u32::from('R')));
     }
 
     #[test]
     fn title_and_icon_fit_before_the_window_controls() {
-        let bar = render("東京の長い話題", None, 16, crate::color::theme(0), false);
+        let bar = render("東京の長い話題", None, 16, crate::color::theme(0), false, &ButtonLayout::default());
         assert_eq!(bar.cells[1].cp, crate::agent::RUSTTY_ICON);
         assert_eq!(bar.cells[4].cp, u32::from('東'));
         assert_eq!(bar.cells[5].flags, crate::cell::SPACER);
         assert_eq!(bar.cells[6].cp, u32::from('…'));
         assert_eq!(bar.minimize.start, 7);
+    }
+
+    #[test]
+    fn buttons_follow_the_desktop_layout() {
+        let theme = crate::color::theme(0);
+        let gnome = render("shell", None, 80, theme, false, &ButtonLayout::parse("appmenu:close"));
+        assert_eq!(gnome.close, 77..80);
+        assert!(gnome.minimize.is_empty() && gnome.maximize.is_empty());
+        assert_eq!(gnome.cells[78].cp, u32::from('\u{00D7}'));
+        assert!(!gnome.cells.iter().any(|cell| cell.cp == u32::from('\u{2212}')));
+        assert_eq!(hit(&gnome, 70), TitleHit::Drag);
+
+        let left = render("shell", None, 80, theme, false, &ButtonLayout::parse("close,minimize:"));
+        assert_eq!(left.close, 0..3);
+        assert_eq!(left.minimize, 3..6);
+        assert_eq!(left.cells[1].cp, u32::from('\u{00D7}'));
+        assert_eq!(hit(&left, 4), TitleHit::Minimize);
+        let start = (80 - "shell".len() - 3) / 2;
+        assert_eq!(left.cells[start].cp, crate::agent::RUSTTY_ICON);
+
+        let none = render("shell", None, 80, theme, false, &ButtonLayout::parse(""));
+        assert!(none.close.is_empty());
     }
 }

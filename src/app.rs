@@ -10,7 +10,7 @@ use anyhow::Context;
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState};
@@ -19,6 +19,7 @@ use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
 use crate::agent::{self, Agent};
+use crate::desktop::{TitleAction, TitlebarPrefs};
 use crate::clipboard::{self, Clipboard};
 use crate::color::{self, Theme};
 use crate::confirm::{self, Choice, Dialog};
@@ -114,8 +115,8 @@ impl Session {
 /// Moves a finished grid into the slot the window thread draws. The lock covers the swap only.
 fn publish_frame(term: &mut Term, frames: &Mutex<Option<Snapshot>>) -> bool {
     let mut slot = frames.lock().unwrap_or_else(|err| err.into_inner());
-    if slot.is_some() {
-        term.damage_all();
+    if let Some(pending) = slot.as_ref() {
+        term.keep_pending_damage(pending);
     }
     let mut snap = term.snapshot();
     if snap.suspended && let Some(ready) = slot.as_mut() {
@@ -267,6 +268,12 @@ struct Tab {
     session: Session,
 }
 
+/// A cell as `(col, absolute line)`. The line survives scrolling, so a selection stays on its text.
+type Point = (u16, u64);
+
+/// Pause between steps of the scroll that follows a selection dragged past the grid.
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+
 struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -282,6 +289,9 @@ struct App {
     mods: ModifiersState,
     font_size: f32,
     vsync: bool,
+    grid_left: u32,
+    /// Space between the title bar and the first row.
+    grid_pad_top: u32,
     grid_cols: u16,
     grid_rows: u16,
     bar_dirty: bool,
@@ -291,11 +301,16 @@ struct App {
     settings_hot: bool,
     link_cell: Option<(u16, u16)>,
     hover_icon: CursorIcon,
-    selection: Option<((u16, u16), (u16, u16))>,
+    /// Ends of the selection as `(col, absolute line)`. See `Term::view_top`.
+    selection: Option<(Point, Point)>,
     selecting: bool,
     press_moved: bool,
-    press_cell: (u16, u16),
-    anchor_cell: (u16, u16),
+    press_cell: Point,
+    anchor_cell: Point,
+    /// Absolute line in the first row of the frame on screen.
+    view_top: u64,
+    /// Next step of the scroll that follows a selection dragged past the grid.
+    autoscroll_at: Option<Instant>,
     last_click: Option<(Instant, (u16, u16), u8)>,
     pending_link: Option<(Instant, String)>,
     selection_dirty: bool,
@@ -303,7 +318,6 @@ struct App {
     key_app_cursor: bool,
     key_alt: bool,
     key_bracketed: bool,
-    key_composer: Option<[u16; 4]>,
     panel_dirty: bool,
     panel: Option<Panel>,
     confirm_close: bool,
@@ -312,6 +326,7 @@ struct App {
     exit_confirmed: bool,
     next_agent_scan: Instant,
     ui: Ui,
+    desktop: TitlebarPrefs,
     cursor: Option<(f64, f64)>,
     wheel_frac: f32,
     scroll_drag: bool,
@@ -333,6 +348,8 @@ impl App {
                         .with_name("rustty", "rustty")
                         .with_window_icon(Some(icon))
                         .with_decorations(false)
+                        // The corners are cut round, as on the desktop's own windows.
+                        .with_transparent(true)
                         .with_inner_size(LogicalSize::new(1100.0, 700.0)),
                 )
                 .context("creating the window")?,
@@ -388,8 +405,13 @@ impl App {
         }
         let cell_w = self.face.cell_w().max(1);
         let cell_h = self.face.cell_h().max(1);
-        let cols = (scrollbar.gutter_left() / cell_w).max(2) as u16;
-        let rows = (scrollbar.height / cell_h).max(1) as u16;
+        let width = scrollbar.gutter_left();
+        let padding = (12.0 * window.scale_factor()).round() as u32;
+        self.grid_left = padding.min(width.saturating_sub(2 * cell_w) / 2);
+        // The first row keeps the same distance from the title bar as the text from the left edge.
+        self.grid_pad_top = padding.min(scrollbar.height.saturating_sub(cell_h) / 2);
+        let cols = ((width - 2 * self.grid_left) / cell_w).max(2) as u16;
+        let rows = ((scrollbar.height - self.grid_pad_top) / cell_h).max(1) as u16;
         self.grid_cols = cols;
         self.grid_rows = rows;
         self.bar_dirty = true;
@@ -502,13 +524,16 @@ impl App {
         let active = self.active.min(self.tabs.len() - 1);
         self.active = active;
         let show_terminal = !self.ui.open && !self.confirm_close;
+        let show_composer = show_terminal && self.tabs[active].agent == Some(Agent::Codex);
         let snap = self.tabs[active].session.take_frame();
-        let composer = self.composer_for(active, show_terminal);
         let cleared = snap.as_ref().is_some_and(|snap| snap.content_changed)
             && !self.selecting
             && self.selection.take().is_some();
         let paint_selection = self.selection_dirty || cleared;
         self.selection_dirty = false;
+        if let Some(snap) = snap.as_ref().filter(|snap| !snap.suspended) {
+            self.view_top = snap.view_top;
+        }
         if let Some(snap) = &snap {
             if snap.title_changed && snap.title != self.tabs[active].title && !snap.title.is_empty() {
                 self.tabs[active].title = snap.title.clone();
@@ -536,14 +561,20 @@ impl App {
         let Some(gpu) = &mut self.gpu else {
             return;
         };
-        gpu.set_insets(chrome_h, chrome_h);
+        gpu.set_insets(self.grid_left as f32, chrome_h, self.grid_pad_top as f32, chrome_h);
+        gpu.set_corner_radius(corner_radius(window));
         gpu.set_clear(theme.bg);
         gpu.set_selection(selection);
+        let tab_id = self.tabs[active].id;
         if let Some(snap) = snap.as_ref().filter(|snap| !snap.suspended) {
-            gpu.upload(&mut self.atlas, &self.face, snap, composer, theme.accent, scrollbar.track());
-            self.presented_tab = Some(self.tabs[active].id);
+            gpu.upload(
+                &mut self.atlas, &self.face, snap, show_composer, theme.accent, scrollbar.track(),
+            );
+            self.presented_tab = Some(tab_id);
         } else {
-            gpu.refresh_cached(composer, theme.accent, scrollbar.track());
+            gpu.refresh_cached(
+                show_composer && self.presented_tab == Some(tab_id), theme.accent, scrollbar.track(),
+            );
         }
         if self.bar_dirty {
             let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
@@ -554,7 +585,7 @@ impl App {
             let edge = if settings_lit && self.bar.settings.is_some() { theme.tab } else { theme.bar };
             gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, edge);
             let tab = &self.tabs[active];
-            self.title_bar = titlebar::render(&tab.title, tab.agent, cols, theme, window.is_maximized());
+            self.title_bar = titlebar::render(&tab.title, tab.agent, cols, theme, window.is_maximized(), &self.desktop.buttons);
             gpu.upload_title(&mut self.atlas, &self.face, &self.title_bar.cells, theme.bar);
             self.bar_dirty = false;
         }
@@ -590,7 +621,7 @@ impl App {
             gpu.upload_dialog(&mut self.atlas, &self.face, self.close_dialog.as_ref());
             self.confirm_dirty = false;
         }
-        if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(self.tabs[active].id)) {
+        if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(tab_id)) {
             tracing::warn!(%err, "frame");
         }
     }
@@ -806,8 +837,9 @@ impl App {
             .cursor
             .and_then(|(x, y)| {
                 let (col, row) = self.cell_at(x, y)?;
-                let top = self.chrome_height() as f64;
-                Some((col.saturating_add(1), row.saturating_add(1), (x.max(0.0) as u32 + 1, (y - top).max(0.0) as u32 + 1)))
+                let grid_x = x - f64::from(self.grid_left);
+                let grid_y = y - f64::from(self.grid_top());
+                Some((col + 1, row + 1, (grid_x as u32 + 1, grid_y as u32 + 1)))
             })
             .unwrap_or((1, 1, (1, 1)));
         // Shift keeps the wheel on this tab's history even when the program grabbed the mouse.
@@ -881,34 +913,16 @@ impl App {
                 term.alt_screen(),
                 term.rows(),
                 term.bracketed_paste(),
-                term.codex_composer(),
             )
         });
-        if let Some((app_cursor, alt, rows, bracketed, composer)) = fresh {
+        if let Some((app_cursor, alt, rows, bracketed)) = fresh {
             self.key_app_cursor = app_cursor;
             self.key_alt = alt;
             self.key_bracketed = bracketed;
-            self.key_composer = composer;
             (app_cursor, alt, rows)
         } else {
             (self.key_app_cursor, self.key_alt, self.grid_rows)
         }
-    }
-
-    fn composer_for(&mut self, active: usize, show_terminal: bool) -> Option<[u16; 4]> {
-        if !show_terminal || self.tabs[active].agent != Some(Agent::Codex) {
-            return None;
-        }
-        let fresh = self.tabs[active]
-            .session
-            .term
-            .try_lock()
-            .ok()
-            .map(|term| term.codex_composer());
-        if let Some(composer) = fresh {
-            self.key_composer = composer;
-        }
-        self.key_composer
     }
 
     fn link_at(&self, x: f64, y: f64) -> Option<String> {
@@ -938,8 +952,8 @@ impl App {
     fn cell_at(&self, x: f64, y: f64) -> Option<(u16, u16)> {
         let cell_w = self.face.cell_w().max(1) as f64;
         let cell_h = self.face.cell_h().max(1) as f64;
-        let col = (x / cell_w).floor();
-        let row = ((y - self.chrome_height() as f64) / cell_h).floor();
+        let col = ((x - f64::from(self.grid_left)) / cell_w).floor();
+        let row = ((y - f64::from(self.grid_top())) / cell_h).floor();
         if col < 0.0 || row < 0.0 {
             return None;
         }
@@ -951,20 +965,84 @@ impl App {
         Some((col, row))
     }
 
+    /// The selection in the frame's cells, as a half-open range of row-major indices.
     fn selection_span(&self) -> (u32, u32) {
         let Some((anchor, focus)) = self.selection else {
             return (0, 0);
         };
-        let cols = u32::from(self.grid_cols.max(1));
-        let linear = |cell: (u16, u16)| {
-            u32::from(cell.1) * cols + u32::from(cell.0.min(self.grid_cols.saturating_sub(1)))
+        let (lo, hi) = ordered(anchor, focus);
+        let cols = u64::from(self.grid_cols.max(1));
+        let rows = u64::from(self.grid_rows.max(1));
+        let top = self.view_top;
+        if hi.1 < top || lo.1 >= top + rows {
+            return (0, 0);
+        }
+        let last_col = u64::from(self.grid_cols.saturating_sub(1));
+        let start = if lo.1 < top { 0 } else { (lo.1 - top) * cols + u64::from(lo.0).min(last_col) };
+        let end = if hi.1 >= top + rows {
+            rows * cols
+        } else {
+            (hi.1 - top) * cols + u64::from(hi.0).min(last_col) + 1
         };
-        let (lo, hi) = {
-            let a = linear(anchor);
-            let b = linear(focus);
-            if a <= b { (a, b) } else { (b, a) }
+        (start as u32, end as u32)
+    }
+
+    /// The cell under the pointer, held to the grid's edge when the pointer is past it.
+    fn clamped_cell(&self, x: f64, y: f64) -> (u16, u16) {
+        let cell_w = self.face.cell_w().max(1) as f64;
+        let cell_h = self.face.cell_h().max(1) as f64;
+        let col = ((x - f64::from(self.grid_left)) / cell_w).floor();
+        let row = ((y - f64::from(self.grid_top())) / cell_h).floor();
+        let col = col.clamp(0.0, f64::from(self.grid_cols.saturating_sub(1))) as u16;
+        let row = row.clamp(0.0, f64::from(self.grid_rows.saturating_sub(1))) as u16;
+        (col, row)
+    }
+
+    fn point(&self, cell: (u16, u16)) -> Point {
+        (cell.0, self.view_top + u64::from(cell.1))
+    }
+
+    /// Lines to scroll while a selection is dragged above or below the grid. Positive reveals
+    /// older lines. The farther the pointer is from the edge, the faster the view moves.
+    fn autoscroll_lines(&self) -> isize {
+        let Some((_, y)) = self.cursor.filter(|_| self.selecting) else {
+            return 0;
         };
-        (lo, hi.saturating_add(1))
+        let cell_h = f64::from(self.face.cell_h().max(1));
+        let top = f64::from(self.grid_top());
+        let bottom = top + f64::from(self.grid_rows) * cell_h;
+        let lines = |distance: f64| (1.0 + distance / cell_h).min(8.0) as isize;
+        if y < top {
+            lines(top - y)
+        } else if y >= bottom {
+            -lines(y - bottom)
+        } else {
+            0
+        }
+    }
+
+    /// One step of the scroll that follows the selection. Returns false when the view
+    /// is already at the end it moves toward.
+    fn autoscroll_step(&mut self) -> bool {
+        let lines = self.autoscroll_lines();
+        if lines == 0 || self.tabs.is_empty() {
+            return false;
+        }
+        let active = self.active.min(self.tabs.len() - 1);
+        let top = self.tabs[active].session.update(|term| {
+            let before = term.view_top();
+            term.scroll_view(lines);
+            (term.view_top() != before).then(|| term.view_top())
+        });
+        let Some(top) = top else {
+            return false;
+        };
+        self.view_top = top;
+        if let Some((x, y)) = self.cursor {
+            self.extend_selection(x, y);
+        }
+        self.redraw();
+        true
     }
 
     fn note_click(&mut self, cell: (u16, u16)) -> u8 {
@@ -1000,6 +1078,7 @@ impl App {
 
     fn end_pointer(&mut self) {
         self.scroll_drag = false;
+        self.autoscroll_at = None;
         if !self.selecting {
             return;
         }
@@ -1030,15 +1109,17 @@ impl App {
             return false;
         };
         self.selecting = true;
-        self.press_cell = cell;
-        self.anchor_cell = cell;
+        self.autoscroll_at = None;
+        let point = self.point(cell);
+        self.press_cell = point;
+        self.anchor_cell = point;
         self.press_moved = false;
         let count = self.note_click(cell);
         if self.mods.shift_key() {
-            let anchor = self.selection.map(|(anchor, _)| anchor).unwrap_or(cell);
+            let anchor = self.selection.map(|(anchor, _)| anchor).unwrap_or(point);
             self.anchor_cell = anchor;
-            self.selection = Some((anchor, cell));
-            self.press_moved = cell != anchor;
+            self.selection = Some((anchor, point));
+            self.press_moved = point != anchor;
             self.selection_dirty = true;
             self.redraw();
             return true;
@@ -1050,6 +1131,7 @@ impl App {
                 Ok(term) => term.word_span(cell.0, cell.1),
                 Err(_) => (cell, cell),
             };
+            let span = (self.point(span.0), self.point(span.1));
             self.anchor_cell = span.0;
             self.selection = Some(span);
             self.press_moved = true;
@@ -1060,9 +1142,7 @@ impl App {
     }
 
     fn extend_selection(&mut self, x: f64, y: f64) {
-        let Some(cell) = self.cell_at(x, y) else {
-            return;
-        };
+        let cell = self.point(self.clamped_cell(x, y));
         if cell == self.press_cell {
             return;
         }
@@ -1078,6 +1158,7 @@ impl App {
 
     fn clear_selection(&mut self) {
         self.selecting = false;
+        self.autoscroll_at = None;
         self.press_moved = false;
         if self.selection.take().is_some() {
             self.selection_dirty = true;
@@ -1205,20 +1286,58 @@ impl App {
             }
             TitleHit::Drag => {
                 let now = Instant::now();
+                let limit = self.desktop.double_click_time;
                 let double = self
                     .last_title_click
-                    .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(350));
+                    .is_some_and(|at| now.saturating_duration_since(at) < limit);
                 if double {
                     self.last_title_click = None;
-                    window.set_maximized(!window.is_maximized());
-                    self.bar_dirty = true;
-                    self.redraw();
+                    self.title_action(self.desktop.double_click);
                 } else {
                     self.last_title_click = Some(now);
                     let _ = window.drag_window();
                 }
             }
         }
+    }
+
+    /// What the desktop asks a click on the title bar to do.
+    fn title_action(&mut self, action: TitleAction) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        match action {
+            TitleAction::ToggleMaximize => {
+                window.set_maximized(!window.is_maximized());
+                self.bar_dirty = true;
+                self.redraw();
+            }
+            TitleAction::Minimize => window.set_minimized(true),
+            TitleAction::Menu => {
+                let (x, y) = self.cursor.unwrap_or((0.0, 0.0));
+                window.show_window_menu(PhysicalPosition::new(x, y));
+            }
+            TitleAction::None => {}
+        }
+    }
+
+    /// A middle or right click on the title bar. Returns false when the click is elsewhere.
+    fn title_click(&mut self, button: MouseButton) -> bool {
+        let on_title = self.cursor.is_some_and(|(x, y)| {
+            self.is_title_y(y)
+                && titlebar::hit(&self.title_bar, strip_col(x, self.face.cell_w(), self.title_bar.cells.len()))
+                    == TitleHit::Drag
+        });
+        if !on_title || self.ui.open || self.confirm_close {
+            return false;
+        }
+        let action = match button {
+            MouseButton::Middle => self.desktop.middle_click,
+            MouseButton::Right => self.desktop.right_click,
+            _ => return false,
+        };
+        self.title_action(action);
+        true
     }
 
     fn begin_resize(&self, x: f64, y: f64) -> bool {
@@ -1243,10 +1362,19 @@ impl App {
         bar_contains_y(window.inner_size().height, self.chrome_height(), y)
     }
 
+    /// Top of the first row: the title bar and the space below it.
+    fn grid_top(&self) -> u32 {
+        self.chrome_height() + self.grid_pad_top
+    }
+
     fn chrome_height(&self) -> u32 {
         let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0);
         bar_height(scale, self.face.cell_h())
     }
+}
+
+fn ordered(a: Point, b: Point) -> (Point, Point) {
+    if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
 }
 
 /// A web address opens in the browser. A file path opens in the default application for its type.
@@ -1353,6 +1481,16 @@ impl Scrollbar {
     }
 }
 
+/// Corner radius of an Adwaita window, 15 logical pixels in libadwaita 1.10. Square when maximized
+/// or fullscreen, as GNOME draws its own windows.
+fn corner_radius(window: &Window) -> f32 {
+    if window.is_maximized() || window.fullscreen().is_some() {
+        0.0
+    } else {
+        (15.0 * window.scale_factor()) as f32
+    }
+}
+
 fn resize_margin(scale: f64) -> f64 {
     (5.0 * scale).clamp(4.0, 12.0)
 }
@@ -1447,6 +1585,13 @@ impl ApplicationHandler<Wake> for App {
                 };
                 if self.selecting {
                     self.extend_selection(position.x, position.y);
+                    // Past the top or bottom of the grid the view follows the selection.
+                    // The first step waits for the tick so a quick pass over the edge does not jump.
+                    if self.autoscroll_lines() == 0 {
+                        self.autoscroll_at = None;
+                    } else if self.autoscroll_at.is_none() {
+                        self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_TICK);
+                    }
                 }
                 if cell != self.link_cell {
                     self.link_cell = cell;
@@ -1469,6 +1614,8 @@ impl ApplicationHandler<Wake> for App {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Released) => self.end_pointer(),
                     (MouseButton::Left, ElementState::Pressed) => self.begin_pointer(),
+                    (MouseButton::Middle | MouseButton::Right, ElementState::Pressed)
+                        if self.title_click(button) => {}
                     (MouseButton::Middle, ElementState::Pressed) => self.paste(true),
                     _ => {}
                 }
@@ -1509,6 +1656,18 @@ impl ApplicationHandler<Wake> for App {
             self.next_agent_scan = now + Duration::from_secs(1);
         }
         let mut until = self.next_agent_scan;
+        if let Some(at) = self.autoscroll_at {
+            let at = if now >= at {
+                if self.autoscroll_step() { Some(now + AUTOSCROLL_TICK) } else { None }
+            } else {
+                Some(at)
+            };
+            // At the end of the history the step waits for the pointer to move again.
+            self.autoscroll_at = at;
+            if let Some(at) = at {
+                until = until.min(at);
+            }
+        }
         if let Some((at, url)) = self.pending_link.clone() {
             if now >= at {
                 self.pending_link = None;
@@ -1556,6 +1715,8 @@ pub fn run() -> anyhow::Result<()> {
         mods: ModifiersState::empty(),
         font_size,
         vsync,
+        grid_left: 0,
+        grid_pad_top: 0,
         grid_cols: 80,
         grid_rows: 24,
         bar_dirty: true,
@@ -1572,6 +1733,8 @@ pub fn run() -> anyhow::Result<()> {
         hover_icon: CursorIcon::Default,
         selection: None,
         selecting: false,
+        view_top: 0,
+        autoscroll_at: None,
         press_moved: false,
         press_cell: (0, 0),
         anchor_cell: (0, 0),
@@ -1582,7 +1745,6 @@ pub fn run() -> anyhow::Result<()> {
         key_app_cursor: false,
         key_alt: false,
         key_bracketed: false,
-        key_composer: None,
         panel_dirty: false,
         panel: None,
         confirm_close: false,
@@ -1591,6 +1753,7 @@ pub fn run() -> anyhow::Result<()> {
         exit_confirmed: false,
         next_agent_scan: Instant::now(),
         ui,
+        desktop: TitlebarPrefs::load(),
         cursor: None,
         wheel_frac: 0.0,
         scroll_drag: false,
@@ -1612,23 +1775,52 @@ mod tests {
     fn synchronized_pet_replacement_keeps_the_complete_frame_visible() {
         let frames = Mutex::new(None);
         let mut term = Term::new(20, 8);
+        term.advance(
+            "\x1b[4;1H\x1b[48;2;45;47;51m\x1b[1m›\x1b[22m           \x1b[0m\x1b[4;3H".as_bytes(),
+        );
         term.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=49374,c=4,r=5,q=2,C=1;/wAA/w==\x1b\\");
         assert!(publish_frame(&mut term, &frames));
 
-        term.advance(b"\x1b[?2026h\x1b]2;New subject\x07\x1b_Ga=d,d=I,i=49374,q=2;\x1b\\");
+        term.advance(
+            b"\x1b[?2026h\x1b7\x1b[2;9H\x1b]2;New subject\x07\x1b_Ga=d,d=I,i=49374,q=2;\x1b\\",
+        );
         assert!(publish_frame(&mut term, &frames));
         let previous = frames.lock().unwrap().take().unwrap();
         assert!(!previous.suspended);
         assert_eq!(previous.title, "New subject");
+        assert_eq!(previous.cursor, Some((2, 3)));
+        assert_eq!(previous.composer, Some([0, 3, 12, 4]));
         assert_eq!(previous.images[0].image.rgba, [255, 0, 0, 255]);
 
         term.advance(b"\x1b_Ga=T,f=32,s=1,v=1,i=49374,c=4,r=5,q=2,C=1;AAD//w==\x1b\\");
         assert!(!publish_frame(&mut term, &frames));
-        term.advance(b"\x1b[?2026l");
+        term.advance(b"\x1b8\x1b[?2026l");
         assert!(publish_frame(&mut term, &frames));
         let current = frames.lock().unwrap().take().unwrap();
+        assert_eq!(current.cursor, previous.cursor);
+        assert_eq!(current.composer, previous.composer);
+        assert!(!current.full && !current.content_changed && current.rows_dirty.is_empty());
         assert_eq!(current.images.len(), 1);
         assert_eq!(current.images[0].image.rgba, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn coalesced_updates_keep_pending_rows_and_the_latest_cursor() {
+        let frames = Mutex::new(None);
+        let mut term = Term::new(20, 8);
+        term.snapshot();
+
+        term.advance(b"\x1b[2;1HA\x1b]2;First update\x07");
+        assert!(publish_frame(&mut term, &frames));
+        term.advance(b"\x1b[4;1HB\x1b[?25l");
+        assert!(publish_frame(&mut term, &frames));
+
+        let frame = frames.lock().unwrap().take().unwrap();
+        assert_eq!(frame.title, "First update");
+        assert_eq!(frame.cursor, None);
+        assert!(!frame.full);
+        let rows: Vec<_> = frame.rows_dirty.iter().map(|(row, cells)| (*row, cells[0].cp)).collect();
+        assert_eq!(rows, [(1, u32::from('A')), (3, u32::from('B'))]);
     }
 
     #[test]

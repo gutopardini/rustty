@@ -74,9 +74,10 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
             };
         }
         let span = end - start;
-        // Wide tabs get more air at the edges and between the icon and the title.
-        // Narrow tabs drop back to the minimum so the title and the close mark fit.
-        let (lead, icon_gap, tail) = if span >= 20 { (4, 2, 4) } else { (1, 1, 1) };
+        // Wide tabs get more air at the edges. The icon keeps one cell to each side,
+        // the same as the number before it.
+        let (lead, tail) = if span >= 20 { (4, 4) } else { (1, 1) };
+        let icon_gap = 1;
         let close = if span >= lead + icon_gap + tail + 6 {
             Some((end - tail - 1) as u16)
         } else {
@@ -169,6 +170,7 @@ pub(crate) fn fit_title(title: &str, width: usize) -> (Cow<'_, str>, usize) {
     if width == 0 {
         return (Cow::Borrowed(""), 0);
     }
+    let title = without_status(title);
     let title = if title.is_empty() { "shell" } else { title };
     // Count the same cells as paint, including when the title has emoji or wide characters.
     let title_width = title.chars().filter_map(UnicodeWidthChar::width).sum();
@@ -190,6 +192,23 @@ pub(crate) fn fit_title(title: &str, width: usize) -> (Cow<'_, str>, usize) {
     }
     out.push('…');
     (Cow::Owned(out), used + 1)
+}
+
+/// Drops the activity mark an agent puts before its title, such as Claude's `✳` or a
+/// Braille spinner. The tab already shows the agent's icon, and the mark only pushed the text away from it.
+fn without_status(title: &str) -> &str {
+    let title = title.trim_start();
+    let mut chars = title.chars();
+    let Some(first) = chars.next() else {
+        return title;
+    };
+    let status = matches!(u32::from(first), 0x25A0..=0x27BF | 0x2800..=0x28FF) || matches!(first, '·' | '•' | '∙' | '*');
+    let rest = chars.as_str();
+    if status && rest.starts_with(char::is_whitespace) && !rest.trim_start().is_empty() {
+        rest.trim_start()
+    } else {
+        title
+    }
 }
 
 fn mark_tab(cells: &mut [Cell], active: bool) {
@@ -359,6 +378,23 @@ mod tests {
         }
         let settings = bar.settings.as_ref().expect("settings button");
         assert_eq!(bar.cells[usize::from(settings.start)].flags & TAB, 0);
+    }
+
+    #[test]
+    fn agent_status_mark_does_not_widen_the_gap_after_the_icon() {
+        let theme = crate::color::theme(0);
+        let titles = vec!["✳ Problema".to_string(), "⠐ Problema".to_string(), "Problema".to_string()];
+        let agents = [Some(Agent::Claude), Some(Agent::Claude), Some(Agent::Codex)];
+        let bar = render_bar(&titles, &agents, 0, 120, theme, false);
+        for span in &bar.spans {
+            let start = usize::from(span.start);
+            assert_eq!(bar.cells[start + 7].flags, SPACER);
+            assert_eq!(bar.cells[start + 8].cp, 0);
+            assert_eq!(bar.cells[start + 9].cp, u32::from('P'));
+        }
+        assert_eq!(without_status("~/Git ✳ x"), "~/Git ✳ x");
+        assert_eq!(without_status("* "), "* ");
+        assert_eq!(without_status("*.rs files"), "*.rs files");
     }
 
     #[test]

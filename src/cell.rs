@@ -94,8 +94,9 @@ pub struct Uniforms {
     pub sel_lo: u32,
     /// One past the last selected cell.
     pub sel_hi: u32,
-    pub _sel_pad0: u32,
-    pub _sel_pad1: u32,
+    /// Vertical span of the scrollbar track, in pixels. The grid can start lower.
+    pub scroll_y0: f32,
+    pub scroll_y1: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<Uniforms>() % 16 == 0);

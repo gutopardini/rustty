@@ -20,10 +20,13 @@ pub struct Frame {
     bind: wgpu::BindGroup,
     written: Option<FrameUniforms>,
     radius: f32,
+    edge_alpha: f32,
 }
 
-/// Opacity of the white 1px outline inside an Adwaita window.
-const EDGE_ALPHA: f32 = 0.07;
+/// Opacity of the 1px outline inside the window. Zero: the window has no border, only
+/// its rounded corners.
+const EDGE_ALPHA: f32 = 0.0;
+const GLASS_EDGE_ALPHA: f32 = 0.0;
 
 impl Frame {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -83,17 +86,11 @@ impl Frame {
             operation: wgpu::BlendOperation::Add,
         };
         let mask = pipeline("fs_mask", wgpu::BlendState { color: scale, alpha: scale });
-        // The outline lightens the color and leaves the window opaque.
+        // The outline lightens the color. An opaque window stays opaque, and a glass
+        // window gains the outline's own alpha, so the color stays premultiplied.
         let edge = pipeline(
             "fs_edge",
-            wgpu::BlendState {
-                color: wgpu::BlendComponent::OVER,
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::Zero,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            },
+            wgpu::BlendState { color: wgpu::BlendComponent::OVER, alpha: wgpu::BlendComponent::OVER },
         );
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("window frame"),
@@ -106,7 +103,7 @@ impl Frame {
             layout: &layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
         });
-        Self { mask, edge, uniforms, bind, written: None, radius: 0.0 }
+        Self { mask, edge, uniforms, bind, written: None, radius: 0.0, edge_alpha: EDGE_ALPHA }
     }
 
     /// Corner radius in pixels. Zero draws square corners and no outline, as for a maximized window.
@@ -114,10 +111,14 @@ impl Frame {
         self.radius = radius.max(0.0);
     }
 
+    pub fn set_glass(&mut self, glass: bool) {
+        self.edge_alpha = if glass { GLASS_EDGE_ALPHA } else { EDGE_ALPHA };
+    }
+
     pub fn prepare(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
         let size = [width as f32, height as f32];
         let radius = self.radius.min(size[0] * 0.5).min(size[1] * 0.5).floor();
-        let uniforms = FrameUniforms { size, radius, edge: EDGE_ALPHA };
+        let uniforms = FrameUniforms { size, radius, edge: self.edge_alpha };
         if self.written != Some(uniforms) {
             queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
             self.written = Some(uniforms);
@@ -129,8 +130,10 @@ impl Frame {
             return;
         }
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.set_pipeline(&self.edge);
-        pass.draw(0..6, 0..8);
+        if self.edge_alpha > 0.0 {
+            pass.set_pipeline(&self.edge);
+            pass.draw(0..6, 0..8);
+        }
         pass.set_pipeline(&self.mask);
         pass.draw(0..6, 0..4);
     }

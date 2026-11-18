@@ -11,6 +11,7 @@ compile_error!("Rustty builds on Linux only");
 
 pub mod agent;
 pub mod app;
+mod blur;
 pub mod cell;
 mod clipboard;
 pub mod color;

@@ -4,7 +4,7 @@
 
 A performance-focused CLI for LLMs. Written in Rust, drawn on the GPU, with the NPU on the roadmap.
 
-<img src="docs/rustty-appearance.png" alt="Rustty with the appearance panel open" width="820">
+<img src="docs/rustty-glass.png" alt="Rustty in Glass mode" width="820">
 
 </div>
 
@@ -20,6 +20,14 @@ rustty
 
 The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. The choice is stored in the same file.
 
+<div align="center">
+
+<img src="docs/rustty-appearance.png" alt="Appearance panel with Glass mode on and the Ink style" width="820">
+
+</div>
+
+The same panel turns on **Glass mode**. The window becomes translucent and the desktop behind it is blurred by the compositor through `ext-background-effect-v1`, which GNOME 51 and Plasma 6.7 offer. The tabs sit in a glass capsule, the active one in a pill, and the gear and window buttons become round glass. The shapes are drawn in a shader. Text and explicit colors stay opaque. `glass_opacity=0.78` in `ui.conf` sets the tint. With Glass mode off, the window is opaque.
+
 `TERM` is `xterm-256color`. `TERM_PROGRAM` is `rustty-kitty`, so Codex can see that Kitty graphics are available and draw `/pets` in the session.
 
 ## The screen
@@ -28,7 +36,7 @@ The window is a grid of cells, not a texture of the whole frame. A dirty row is 
 
 <div align="center">
 
-<img src="docs/rustty-agents.png" alt="Tabs showing the CLI in the foreground" width="820">
+<img src="docs/rustty-agents.png" alt="Tabs for a shell, Claude, and Cursor Agent" width="820">
 
 </div>
 
@@ -56,6 +64,14 @@ While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab 
 | `Ctrl+Shift+V` | paste |
 | middle-click | paste the primary selection |
 | `Ctrl+,` | appearance |
+
+The close button on the title bar asks before it closes the window when more than one tab is open. One tab closes immediately.
+
+<div align="center">
+
+<img src="docs/rustty-close.png" alt="Confirmation before closing three open tabs" width="820">
+
+</div>
 
 Anything else goes to the shell.
 

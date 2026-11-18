@@ -1,7 +1,6 @@
 //! Tab strip drawn as one row of cells at the bottom of the window.
 
 use std::borrow::Cow;
-use std::ops::Range;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -22,47 +21,60 @@ pub struct TabSpan {
 pub enum BarHit {
     Select(usize),
     Close(usize),
-    Settings,
 }
 
 pub struct Bar {
     pub cells: Vec<Cell>,
     pub spans: Vec<TabSpan>,
-    pub settings: Option<Range<u16>>,
+    /// Index of the active tab in `spans`.
+    pub selected: usize,
 }
 
-pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, cols: u16, theme: Theme, settings_lit: bool) -> Bar {
+/// In glass mode every cell keeps the bar color, which the shader makes see-through, and the
+/// tabs carry no shape of their own: the glass capsule and pill are drawn under them.
+/// One cell on each side of the tabs leaves room for the capsule's round ends.
+pub fn render_bar(
+    titles: &[String],
+    agents: &[Option<Agent>],
+    active: usize,
+    cols: u16,
+    theme: Theme,
+    glass: bool,
+) -> Bar {
     let cols = usize::from(cols);
     if titles.is_empty() || cols == 0 {
-        return Bar { cells: Vec::new(), spans: Vec::new(), settings: None };
+        return Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 };
     }
-    let settings_width = if cols >= 10 {
-        6
-    } else if cols >= 7 {
-        4
-    } else {
-        0
-    };
-    let usable = cols - settings_width;
+    // The settings gear lives in the title bar, next to the window buttons.
+    let usable = cols;
+    let margin = if glass && usable >= 12 { 1 } else { 0 };
+    let tabs_end = usable - margin;
     let mut cells = vec![Cell::blank(theme.muted.pack(), theme.bar.pack()); cols];
-    // The usable strip is split across the tabs. The remainder goes to the first
-    // tabs, so the last one always meets the settings button.
+    // The strip is split across the tabs. The remainder goes to the first tabs, so the
+    // last one always reaches the end of the row.
     let count = titles.len();
-    let base = usable / count;
-    let extra = usable % count;
+    let room = tabs_end - margin;
+    let base = room / count;
+    let extra = room % count;
     let mut spans = Vec::with_capacity(count);
-    let mut start = 0usize;
+    let mut start = margin;
     for (index, title) in titles.iter().enumerate() {
         let width = base + usize::from(index < extra);
-        if width == 0 || start >= usable {
+        if width == 0 || start >= tabs_end {
             break;
         }
-        let end = (start + width).min(usable);
+        let end = (start + width).min(tabs_end);
         if end <= start {
             break;
         }
         let active_tab = index == active;
-        let bg = if active_tab { theme.bg.pack() } else { theme.tab.pack() };
+        let bg = if glass {
+            theme.bar.pack()
+        } else if active_tab {
+            theme.bg.pack()
+        } else {
+            theme.tab.pack()
+        };
         let fg = if active_tab { theme.fg.pack() } else { theme.tab_fg.pack() };
         let flags = if active_tab { BOLD } else { 0 };
         for cell in &mut cells[start..end] {
@@ -86,6 +98,18 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
         // One breathing cell separates the title from the close button.
         let reserve = if close.is_some() { tail + 2 } else { 0 };
         let label_end = end.saturating_sub(reserve);
+        // On glass the number, icon and title sit in the middle of the segment, as the
+        // labels of a segmented control. They move left only when the close mark needs room.
+        let lead = if glass {
+            let number = (index + 1).to_string().len();
+            let fixed = number + 1 + 2 + icon_gap;
+            let (_, title_width) = fit_title(title, label_end.saturating_sub(start + lead + fixed));
+            let content = fixed + title_width;
+            let centered = span.saturating_sub(content) / 2;
+            centered.min(label_end.saturating_sub(start + content)).max(lead)
+        } else {
+            lead
+        };
         let prefix = format!("{:lead$}{} ", "", index + 1, lead = lead);
         let can_fit_prefix_and_icon = start + prefix.width() + 2 <= label_end;
         let mut text_start = start;
@@ -119,7 +143,9 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
             };
         }
         // The shader rounds the ends. The gap between them separates tabs of the same color.
-        mark_tab(&mut cells[start..end], active_tab);
+        if !glass {
+            mark_tab(&mut cells[start..end], active_tab);
+        }
         spans.push(TabSpan {
             start: start as u16,
             end: end as u16,
@@ -127,28 +153,10 @@ pub fn render_bar(titles: &[String], agents: &[Option<Agent>], active: usize, co
         });
         start = end;
     }
-    let settings = if settings_width > 0 {
-        let bg = if settings_lit { theme.tab.pack() } else { theme.bar.pack() };
-        let fg = theme.fg.pack();
-        for cell in &mut cells[usable..] {
-            *cell = Cell::blank(fg, bg);
-        }
-        let icon_col = usable + (settings_width - 4) / 2;
-        cells[icon_col] = Cell { cp: crate::agent::SETTINGS_ICON, fg, bg, flags: AGENT_ICON | QUAD };
-        for cell in &mut cells[icon_col + 1..icon_col + 4] {
-            *cell = Cell { cp: 0, fg, bg, flags: SPACER };
-        }
-        Some(usable as u16..cols as u16)
-    } else {
-        None
-    };
-    Bar { cells, spans, settings }
+    Bar { cells, spans, selected: active }
 }
 
 pub fn hit(bar: &Bar, col: u16) -> Option<BarHit> {
-    if bar.settings.as_ref().is_some_and(|range| range.contains(&col)) {
-        return Some(BarHit::Settings);
-    }
     for (index, span) in bar.spans.iter().enumerate() {
         if (span.start..span.end).contains(&col) {
             if span.close == Some(col) {
@@ -272,25 +280,14 @@ mod tests {
         assert_eq!(bar.spans.len(), 2);
         assert_eq!(bar.spans[0].start, 0);
         assert_eq!(bar.spans[0].end, bar.spans[1].start);
-        let settings = bar.settings.as_ref().expect("settings button");
-        assert!(bar.spans[1].end <= settings.start);
-        assert_eq!(settings.end, 40);
+        assert_eq!(bar.spans[1].end, 40);
         let close = bar.spans[0].close.expect("close column");
         assert_eq!(bar.cells[close as usize].cp, u32::from('×'));
         assert_ne!(bar.cells[bar.spans[0].start as usize].bg, bar.cells[bar.spans[1].start as usize].bg);
         assert_eq!(hit(&bar, bar.spans[0].start), Some(BarHit::Select(0)));
         assert_eq!(hit(&bar, close), Some(BarHit::Close(0)));
         assert_eq!(hit(&bar, bar.spans[1].start), Some(BarHit::Select(1)));
-        for col in settings.clone() {
-            assert_eq!(hit(&bar, col), Some(BarHit::Settings));
-        }
-        assert_eq!(settings.end - settings.start, 6);
-        let icon = &bar.cells[usize::from(settings.start) + 1];
-        assert_eq!(icon.cp, crate::agent::SETTINGS_ICON);
-        assert_eq!(icon.flags, AGENT_ICON | QUAD);
-        assert_eq!(bar.cells[usize::from(settings.start) + 2].flags, SPACER);
-        assert_eq!(bar.cells[usize::from(settings.start) + 3].flags, SPACER);
-        assert_eq!(bar.cells[usize::from(settings.start) + 4].flags, SPACER);
+        assert!(!bar.cells.iter().any(|cell| cell.cp == crate::agent::SETTINGS_ICON));
     }
 
     #[test]
@@ -309,17 +306,16 @@ mod tests {
     }
 
     #[test]
-    fn single_tab_fills_up_to_settings_and_its_number_is_accented() {
+    fn single_tab_fills_the_row_and_its_number_is_accented() {
         let theme = crate::color::theme(0);
         let bar = render_bar(&["shell".into()], &[], 0, 100, theme, false);
-        let settings = bar.settings.as_ref().expect("settings button");
         assert_eq!(bar.spans[0].start, 0);
-        assert_eq!(bar.spans[0].end, settings.start);
+        assert_eq!(bar.spans[0].end, 100);
         assert_eq!(bar.cells[4].cp, u32::from('1'));
         assert_eq!(bar.cells[4].fg, theme.accent.pack());
         assert_eq!(bar.cells[50].bg, theme.bg.pack());
         assert_eq!(hit(&bar, 50), Some(BarHit::Select(0)));
-        assert_eq!(hit(&bar, 99), Some(BarHit::Settings));
+        assert_eq!(hit(&bar, 99), Some(BarHit::Select(0)));
     }
 
     #[test]
@@ -328,9 +324,8 @@ mod tests {
         let one = render_bar(&["shell".into()], &[], 0, 40, theme, false);
         let titles: Vec<String> = (0..6).map(|index| format!("tab {index}")).collect();
         let many = render_bar(&titles, &[], 0, 40, theme, false);
-        let settings = many.settings.as_ref().expect("settings button");
-        assert_eq!(one.spans[0].end, settings.start);
-        assert_eq!(many.spans.last().expect("tabs").end, settings.start);
+        assert_eq!(one.spans[0].end, 40);
+        assert_eq!(many.spans.last().expect("tabs").end, 40);
         assert!(many.spans[0].end < one.spans[0].end);
         for pair in many.spans.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
@@ -376,8 +371,6 @@ mod tests {
                 assert_eq!((bar.cells[start + 1].flags >> TAB_FROM_LEFT_SHIFT) & 15, 1);
             }
         }
-        let settings = bar.settings.as_ref().expect("settings button");
-        assert_eq!(bar.cells[usize::from(settings.start)].flags & TAB, 0);
     }
 
     #[test]
@@ -407,5 +400,37 @@ mod tests {
             AGENT_ICON | WIDE | TAB | TAB_ACTIVE
         );
         assert_eq!(bar.cells[7].flags, SPACER);
+    }
+
+    #[test]
+    fn glass_bar_leaves_the_cells_see_through_and_room_for_the_capsule() {
+        let theme = crate::color::theme(0);
+        let titles = vec!["alpha".to_string(), "beta".to_string()];
+        let bar = render_bar(&titles, &[], 1, 80, theme, true);
+        assert!(bar.cells.iter().all(|cell| cell.bg == theme.bar.pack()));
+        assert!(bar.cells.iter().all(|cell| cell.flags & (TAB | TAB_ACTIVE) == 0));
+        assert_eq!(bar.spans[0].start, 1);
+        assert_eq!(bar.spans.last().expect("tabs").end, 79);
+        assert_eq!(hit(&bar, bar.spans[1].start), Some(BarHit::Select(1)));
+        let active_text = bar.cells[usize::from(bar.spans[1].start)..usize::from(bar.spans[1].end)]
+            .iter()
+            .find(|cell| cell.cp == u32::from('b'))
+            .expect("title");
+        assert_eq!(active_text.fg, theme.fg.pack());
+    }
+
+    #[test]
+    fn glass_labels_sit_in_the_middle_of_their_segment() {
+        let theme = crate::color::theme(0);
+        let bar = render_bar(&["alpha".into(), "beta".into()], &[None, None], 0, 100, theme, true);
+        for span in &bar.spans {
+            let (start, end) = (usize::from(span.start), usize::from(span.end));
+            let painted: Vec<usize> = (start..end)
+                .filter(|&col| ![0, u32::from(' '), u32::from('×')].contains(&bar.cells[col].cp))
+                .collect();
+            let left = painted[0] - start;
+            let right = end - 1 - painted[painted.len() - 1];
+            assert!(left.abs_diff(right) <= 2, "{left} {right}");
+        }
     }
 }

@@ -97,6 +97,11 @@ pub struct Uniforms {
     /// Vertical span of the scrollbar track, in pixels. The grid can start lower.
     pub scroll_y0: f32,
     pub scroll_y1: f32,
+    /// Nonzero in glass mode: a cell whose background is `glass_key` lets the window show through.
+    pub glass: u32,
+    /// The background that turns transparent in glass mode, packed as `0x00BBGGRR`.
+    pub glass_key: u32,
+    pub _glass_pad: [u32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<Uniforms>() % 16 == 0);

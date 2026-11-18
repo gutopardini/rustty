@@ -24,6 +24,9 @@ struct Uniforms {
     sel_hi: u32,
     scroll_y0: f32,
     scroll_y1: f32,
+    glass: u32,
+    glass_key: u32,
+    _glass_pad: vec2<u32>,
 }
 
 struct Cell {
@@ -85,8 +88,12 @@ fn fill_quad(corner: vec2<f32>) -> VsOut {
     let bottom = select(u.scroll_y1, u.pad_y + u.cell_h, strip);
     let start = vec2<f32>(left, top);
     let end = max(start, vec2<f32>(right, bottom));
+    var fill = unpack_color(u.fill_bg);
+    if (strip && u.glass != 0u && u.fill_bg == u.glass_key) {
+        fill = vec4<f32>(0.0);
+    }
     return VsOut(clip_position(mix(start, end, corner)), vec2<f32>(0.0), vec4<f32>(0.0),
-        unpack_color(u.fill_bg), corner, EXTRA_QUAD, 0u);
+        fill, corner, EXTRA_QUAD, 0u);
 }
 
 @vertex
@@ -150,7 +157,8 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
         fg = vec4<f32>(fg.rgb * 0.72, 1.0);
     }
     let on_cursor = u.cursor_on != 0u && col == u.cursor_col && row == u.cursor_row;
-    if (on_cursor || (cell.flags & 1u) != 0u) {
+    let swapped_colors = on_cursor || (cell.flags & 1u) != 0u;
+    if (swapped_colors) {
         let swapped = fg;
         fg = bg;
         bg = swapped;
@@ -159,6 +167,11 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
     if (selected) {
         fg = vec4<f32>(1.0, 1.0, 1.0, 1.0);
         bg = vec4<f32>(0.23, 0.45, 0.85, 1.0);
+    }
+    // Glass mode: the default background is see-through, premultiplied to zero.
+    // Explicit colors, the cursor block and the selection stay opaque.
+    if (u.glass != 0u && cell.bg == u.glass_key && !swapped_colors && !selected) {
+        bg = vec4<f32>(0.0);
     }
 
     out.clip = clip_position(vec2<f32>(px, py));
@@ -171,14 +184,19 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsO
     return out;
 }
 
+// Colors are premultiplied. An opaque cell returns alpha 1, as before glass mode.
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (in.flags == EXTRA_QUAD) {
         if (u._reserved != 0u) {
             return in.bg;
         }
-        let track = mix(in.bg, vec4<f32>(0.42, 0.44, 0.50, 1.0), 0.45);
-        let thumb = vec4<f32>(0.86, 0.88, 0.93, 1.0);
+        var track = mix(in.bg, vec4<f32>(0.42, 0.44, 0.50, 1.0), 0.45);
+        var thumb = vec4<f32>(0.86, 0.88, 0.93, 1.0);
+        if (u.glass != 0u) {
+            track = vec4<f32>(0.42, 0.44, 0.50, 1.0) * 0.28;
+            thumb = vec4<f32>(0.86, 0.88, 0.93, 1.0) * 0.62;
+        }
         let on_thumb = in.local.y >= u.scroll_top && in.local.y <= u.scroll_top + u.scroll_h;
         return select(track, thumb, on_thumb);
     }
@@ -192,7 +210,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
         let uv = vec2<f32>((f32(in.slot) + clamp(icon_pos.x, 0.001, 0.999)) / 7.0, clamp(icon_pos.y, 0.001, 0.999));
         let icon = textureSampleLevel(agent_icons, atlas_samp, uv, 0.0);
-        let painted = vec4<f32>(mix(in.bg.rgb, icon.rgb, icon.a), 1.0);
+        let painted = mix(in.bg, vec4<f32>(icon.rgb, 1.0), icon.a);
         return mix(unpack_color(u.composer_accent), painted, tab_cover(in.local, in.flags));
     }
     let coverage = textureSampleLevel(atlas, atlas_samp, in.uv, 0.0).r;

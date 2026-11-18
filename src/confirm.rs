@@ -42,6 +42,19 @@ impl Dialog {
             .map(|zone| zone.choice)
     }
 
+    /// Columns, rows and choice of each button, relative to the dialog's origin.
+    pub fn buttons(&self) -> impl Iterator<Item = (Range<u16>, Range<u16>, Choice)> + '_ {
+        self.zones.iter().map(|zone| (zone.cols.clone(), zone.rows.clone(), zone.choice))
+    }
+
+    /// Paints every cell, buttons included, with this background. On glass that is the
+    /// window color, which the shader leaves see-through so the glass under it shows.
+    pub fn set_background(&mut self, bg: u32) {
+        for cell in &mut self.cells {
+            cell.bg = bg;
+        }
+    }
+
     fn row(&mut self, row: u16) -> &mut [Cell] {
         let width = usize::from(self.cols);
         let start = usize::from(row) * width;

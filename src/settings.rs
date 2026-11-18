@@ -15,7 +15,14 @@ pub struct Ui {
     pub font: usize,
     /// Directory where each new tab starts its shell.
     pub cwd: Option<PathBuf>,
+    /// Translucent window with the desktop blurred behind it, and glass controls in the bars.
+    pub glass: bool,
+    /// Opacity of the window tint in glass mode, `glass_opacity` in the file.
+    pub glass_opacity: f32,
 }
+
+/// Enough tint for text to stay legible over a busy desktop.
+pub const DEFAULT_GLASS_OPACITY: f32 = 0.78;
 
 impl Ui {
     pub fn load() -> Self {
@@ -30,6 +37,8 @@ impl Ui {
             fonts: font::font_choices(),
             font: 0,
             cwd: None,
+            glass: false,
+            glass_opacity: DEFAULT_GLASS_OPACITY,
         };
         let Some(text) = std::fs::read_to_string(config_path()).ok() else {
             return ui;
@@ -44,6 +53,12 @@ impl Ui {
                 }
                 "style" => ui.style = color::theme_index(value.trim()),
                 "font" => ui.select_path(PathBuf::from(value.trim())),
+                "glass" => ui.glass = matches!(value.trim(), "on" | "true" | "1" | "yes"),
+                "glass_opacity" => {
+                    if let Ok(opacity) = value.trim().parse::<f32>() {
+                        ui.glass_opacity = opacity.clamp(0.2, 1.0);
+                    }
+                }
                 "cwd" => {
                     let path = PathBuf::from(value.trim());
                     if path.is_dir() {
@@ -67,8 +82,14 @@ impl Ui {
             .as_ref()
             .map(|path| format!("cwd={}\n", path.display()))
             .unwrap_or_default();
+        let glass = if self.glass { "on" } else { "off" };
+        let opacity = if (self.glass_opacity - DEFAULT_GLASS_OPACITY).abs() > f32::EPSILON {
+            format!("glass_opacity={}\n", self.glass_opacity)
+        } else {
+            String::new()
+        };
         let text = format!(
-            "size={}\nstyle={}\nfont={}\n{cwd}",
+            "size={}\nstyle={}\nfont={}\nglass={glass}\n{opacity}{cwd}",
             self.size,
             color::theme(self.style).id,
             font
@@ -122,6 +143,7 @@ pub enum PanelHit {
     Larger,
     PrevFont,
     NextFont,
+    Glass,
     Style(usize),
 }
 
@@ -163,10 +185,22 @@ impl Panel {
     }
 }
 
-pub fn render_panel(grid_cols: u16, grid_rows: u16, theme: Theme, font_name: &str, size: f32, style: usize) -> Option<Panel> {
+/// Row of the glass switch, and the first row of the style list below it.
+const GLASS_ROW: u16 = 6;
+const STYLE_LIST: u16 = 9;
+
+pub fn render_panel(
+    grid_cols: u16,
+    grid_rows: u16,
+    theme: Theme,
+    font_name: &str,
+    size: f32,
+    style: usize,
+    glass: bool,
+) -> Option<Panel> {
     let cols = 34u16.min(grid_cols.saturating_sub(1)).max(0);
-    let rows = (7 + THEMES.len() as u16).min(grid_rows.saturating_sub(1));
-    if cols < 20 || rows < 8 || grid_cols < 21 || grid_rows < 9 {
+    let rows = (STYLE_LIST + THEMES.len() as u16).min(grid_rows.saturating_sub(1));
+    if cols < 20 || rows < STYLE_LIST + 1 || grid_cols < 21 || grid_rows < STYLE_LIST + 2 {
         return None;
     }
     let origin_col = grid_cols.saturating_sub(cols);
@@ -196,9 +230,15 @@ pub fn render_panel(grid_cols: u16, grid_rows: u16, theme: Theme, font_name: &st
     zones.push(Zone { col: 0, end: 5, row: 4, action: PanelHit::Smaller });
     zones.push(Zone { col: cols - 5, end: cols, row: 4, action: PanelHit::Larger });
 
-    paint(&mut cells, width, 6, 1, "Style", theme.muted.pack(), theme.panel.pack(), 0);
+    paint(&mut cells, width, GLASS_ROW, 1, "Glass mode", theme.fg.pack(), theme.panel.pack(), 0);
+    let switch = if glass { "[ on]" } else { "[off]" };
+    let switch_fg = if glass { theme.accent.pack() } else { theme.muted.pack() };
+    paint(&mut cells, width, GLASS_ROW, cols - 6, switch, switch_fg, theme.panel.pack(), 0);
+    zones.push(Zone { col: 0, end: cols, row: GLASS_ROW, action: PanelHit::Glass });
+
+    paint(&mut cells, width, STYLE_LIST - 1, 1, "Style", theme.muted.pack(), theme.panel.pack(), 0);
     for (index, item) in THEMES.iter().enumerate() {
-        let row = 7 + index as u16;
+        let row = STYLE_LIST + index as u16;
         if row >= rows {
             break;
         }
@@ -269,7 +309,7 @@ mod tests {
     #[test]
     fn style_row_and_size_buttons_are_hits() {
         let theme = color::theme(0);
-        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0).expect("panel");
+        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false).expect("panel");
         assert_eq!(panel.hit(panel.origin_col + 1, panel.origin_row + 4), Some(PanelHit::Smaller));
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 2, panel.origin_row + 4), Some(PanelHit::Larger));
         assert_eq!(panel.hit(panel.origin_col + 4, panel.origin_row + 4), Some(PanelHit::Smaller));
@@ -277,7 +317,11 @@ mod tests {
         let size_row = &panel.cells[usize::from(panel.cols) * 4..usize::from(panel.cols) * 5];
         let size_text: String = size_row.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
         assert!(size_text.contains("Size: 15 px"), "{size_text}");
-        assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + 7), Some(PanelHit::Style(0)));
+        assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + STYLE_LIST), Some(PanelHit::Style(0)));
+        assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + GLASS_ROW), Some(PanelHit::Glass));
+        let glass_row = &panel.cells[usize::from(panel.cols) * 6..usize::from(panel.cols) * 7];
+        let glass_text: String = glass_row.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
+        assert!(glass_text.contains("Glass mode") && glass_text.contains("[off]"), "{glass_text}");
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 1, panel.origin_row), Some(PanelHit::Close));
         assert!(panel.contains(panel.origin_col, panel.origin_row));
         assert!(!panel.contains(0, panel.origin_row) || panel.origin_col == 0);

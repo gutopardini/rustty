@@ -19,12 +19,16 @@ use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
 use crate::agent::{self, Agent};
+use crate::blur::Blur;
 use crate::desktop::{TitleAction, TitlebarPrefs};
 use crate::clipboard::{self, Clipboard};
 use crate::color::{self, Theme};
 use crate::confirm::{self, Choice, Dialog};
 use crate::font::{Atlas, Face};
-use crate::gpu::Renderer;
+use crate::gpu::{
+    GlassShape, Renderer, GLASS_BUTTON, GLASS_CONTAINER, GLASS_PILL, GLASS_SHEET, ICON_CLOSE, ICON_MAXIMIZE,
+    ICON_MINIMIZE, ICON_RESTORE,
+};
 use crate::input::{self, Input};
 use crate::npu::{Indexer, Scheduler};
 use crate::pty::Pty;
@@ -282,6 +286,9 @@ struct App {
     proxy: EventLoopProxy<Wake>,
     window: Option<Arc<Window>>,
     gpu: Option<Renderer>,
+    /// Compositor blur behind the window. Asked for the first time glass mode is on.
+    blur: Option<Blur>,
+    blur_tried: bool,
     /// The tab whose complete frame is currently on the GPU.
     presented_tab: Option<u64>,
     face: Face,
@@ -311,6 +318,10 @@ struct App {
     view_top: u64,
     /// Next step of the scroll that follows a selection dragged past the grid.
     autoscroll_at: Option<Instant>,
+    /// Text under the finished selection. The selection stays while that text stays.
+    selection_text: Option<String>,
+    /// Output arrived since the selection text was last compared.
+    selection_stale: bool,
     last_click: Option<(Instant, (u16, u16), u8)>,
     pending_link: Option<(Instant, String)>,
     selection_dirty: bool,
@@ -357,8 +368,10 @@ impl App {
         self.rescale(window.scale_factor());
         let mut gpu = Renderer::new(Arc::clone(&window), self.vsync)?;
         gpu.set_clear(color::theme(self.ui.style).bg);
+        gpu.set_glass(self.ui.glass.then_some(self.ui.glass_opacity));
         self.window = Some(window);
         self.gpu = Some(gpu);
+        self.ensure_blur();
         self.fit();
         self.redraw();
         Ok(())
@@ -446,6 +459,10 @@ impl App {
             agent: None,
             session,
         });
+        if self.tabs.len() == 2 {
+            // The tab bar appears and takes its rows from the grid.
+            self.fit();
+        }
         self.focus_tab(self.tabs.len() - 1);
         Ok(())
     }
@@ -488,6 +505,10 @@ impl App {
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        if self.tabs.len() == 1 {
+            // The tab bar goes away and gives its rows back to the grid.
+            self.fit();
+        }
         let active = self.active;
         self.focus_tab(active);
     }
@@ -526,9 +547,10 @@ impl App {
         let show_terminal = !self.ui.open && !self.confirm_close;
         let show_composer = show_terminal && self.tabs[active].agent == Some(Agent::Codex);
         let snap = self.tabs[active].session.take_frame();
-        let cleared = snap.as_ref().is_some_and(|snap| snap.content_changed)
-            && !self.selecting
-            && self.selection.take().is_some();
+        // Output elsewhere, such as an agent's spinner, keeps the selection. It goes only when
+        // the selected text itself changes.
+        self.selection_stale |= snap.as_ref().is_some_and(|snap| snap.content_changed);
+        let cleared = self.selection_stale && !self.selecting && self.selection_changed(active);
         let paint_selection = self.selection_dirty || cleared;
         self.selection_dirty = false;
         if let Some(snap) = snap.as_ref().filter(|snap| !snap.suspended) {
@@ -558,10 +580,11 @@ impl App {
         let chrome_h = scrollbar.top as f32;
         let theme = color::theme(self.ui.style);
         let selection = self.selection_span();
+        let tab_bar_h = self.tab_bar_height() as f32;
         let Some(gpu) = &mut self.gpu else {
             return;
         };
-        gpu.set_insets(self.grid_left as f32, chrome_h, self.grid_pad_top as f32, chrome_h);
+        gpu.set_insets(self.grid_left as f32, chrome_h, self.grid_pad_top as f32, tab_bar_h);
         gpu.set_corner_radius(corner_radius(window));
         gpu.set_clear(theme.bg);
         gpu.set_selection(selection);
@@ -580,14 +603,30 @@ impl App {
             let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
             let agents: Vec<Option<Agent>> = self.tabs.iter().map(|tab| tab.agent).collect();
             let cols = (size.width / self.face.cell_w().max(1)).clamp(1, 1024) as u16;
-            let settings_lit = self.settings_hot || self.ui.open;
-            self.bar = tabs::render_bar(&titles, &agents, active, cols, theme, settings_lit);
-            let edge = if settings_lit && self.bar.settings.is_some() { theme.tab } else { theme.bar };
-            gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, edge);
+            let one_tab = self.tabs.len() <= 1;
+            self.bar = if one_tab {
+                Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 }
+            } else {
+                tabs::render_bar(&titles, &agents, active, cols, theme, self.ui.glass)
+            };
+            gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar);
             let tab = &self.tabs[active];
-            self.title_bar = titlebar::render(&tab.title, tab.agent, cols, theme, window.is_maximized(), &self.desktop.buttons);
+            self.title_bar = titlebar::render(
+                &tab.title,
+                tab.agent,
+                cols,
+                theme,
+                window.is_maximized(),
+                &self.desktop.buttons,
+                true,
+                self.ui.glass,
+            );
             gpu.upload_title(&mut self.atlas, &self.face, &self.title_bar.cells, theme.bar);
             self.bar_dirty = false;
+        }
+        if let Some(blur) = &mut self.blur {
+            // Sent before the present, whose commit applies the region.
+            blur.sync(self.ui.glass, size.width, size.height, corner_radius(window), window.scale_factor());
         }
         if self.ui.open {
             self.panel = settings::render_panel(
@@ -597,7 +636,13 @@ impl App {
                 self.ui.font_name(),
                 self.ui.size,
                 self.ui.style,
+                self.ui.glass,
             );
+            if let Some(panel) = self.panel.as_mut().filter(|_| self.ui.glass) {
+                for cell in &mut panel.cells {
+                    cell.bg = theme.bg.pack();
+                }
+            }
             if let Some(panel) = &self.panel {
                 gpu.stamp(
                     &mut self.atlas,
@@ -618,8 +663,49 @@ impl App {
             } else {
                 None
             };
+            if let Some(dialog) = self.close_dialog.as_mut().filter(|_| self.ui.glass) {
+                dialog.set_background(theme.bg.pack());
+            }
             gpu.upload_dialog(&mut self.atlas, &self.face, self.close_dialog.as_ref());
             self.confirm_dirty = false;
+        }
+        if self.ui.glass {
+            let scale = window.scale_factor();
+            let mut shapes = glass_shapes(
+                &self.bar,
+                &self.title_bar,
+                size,
+                scrollbar.top,
+                self.face.cell_w().max(1),
+                scale,
+                self.settings_hot || self.ui.open,
+                window.is_maximized(),
+            );
+            let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
+            let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
+            if let Some(panel) = &self.panel {
+                // The panel replaces the grid cells it covers, so its sheet goes under the grid.
+                let rect = (panel.origin_col, panel.origin_row, panel.cols, panel.rows);
+                shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, 0.86));
+            }
+            let overlay = shapes.len();
+            if let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close) {
+                let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
+                shapes.push(sheet(rect, origin, cell, (8.0 * scale) as f32, scale, theme, 0.94));
+                let inset = (2.0 * scale).round() as f32;
+                for (cols, rows, choice) in dialog.buttons() {
+                    let x = origin.0 + f32::from(dialog.origin_col + cols.start) * cell.0 + inset;
+                    let y = origin.1 + f32::from(dialog.origin_row + rows.start) * cell.1 + inset;
+                    let w = f32::from(cols.end - cols.start) * cell.0 - 2.0 * inset;
+                    let h = f32::from(rows.end - rows.start) * cell.1 - 2.0 * inset;
+                    let button = GlassShape::new(x, y, w, h, GLASS_BUTTON);
+                    shapes.push(match choice {
+                        confirm::Choice::Close => button.with_tint(theme.danger, 0.9),
+                        confirm::Choice::Cancel => button,
+                    });
+                }
+            }
+            gpu.set_glass_shapes(&shapes, overlay, scale as f32, is_light(theme));
         }
         if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(tab_id)) {
             tracing::warn!(%err, "frame");
@@ -688,6 +774,42 @@ impl App {
         self.redraw();
     }
 
+    /// Glass mode on or off. Off draws exactly the opaque window of before.
+    fn toggle_glass(&mut self) {
+        self.ui.glass = !self.ui.glass;
+        let opacity = self.ui.glass.then_some(self.ui.glass_opacity);
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_glass(opacity);
+            if self.ui.glass && !gpu.supports_glass() {
+                tracing::warn!("the surface is not premultiplied, glass mode has no effect");
+            }
+        }
+        self.ensure_blur();
+        // The bars grow in glass mode to hold the capsules, so the grid is measured again.
+        self.fit();
+        for tab in &self.tabs {
+            tab.session.update(|term| term.damage_all());
+        }
+        self.bar_dirty = true;
+        self.panel_dirty = true;
+        self.ui.save();
+        self.redraw();
+    }
+
+    fn ensure_blur(&mut self) {
+        if !self.ui.glass || self.blur_tried {
+            return;
+        }
+        let Some(window) = &self.window else {
+            return;
+        };
+        self.blur_tried = true;
+        self.blur = Blur::new(window);
+        if self.blur.as_ref().is_some_and(|blur| !blur.supported()) {
+            tracing::info!("the compositor offers background effects but not blur");
+        }
+    }
+
     fn apply_size(&mut self, delta: f32) {
         let previous = self.ui.size;
         self.ui.nudge_size(delta);
@@ -743,6 +865,7 @@ impl App {
             PanelHit::Larger => self.apply_size(1.0),
             PanelHit::PrevFont => self.apply_font(-1),
             PanelHit::NextFont => self.apply_font(1),
+            PanelHit::Glass => self.toggle_glass(),
             PanelHit::Style(index) => self.apply_style(index),
         }
     }
@@ -859,7 +982,7 @@ impl App {
     }
 
     fn scrollbar(&self, window: &Window, size: PhysicalSize<u32>) -> Scrollbar {
-        Scrollbar::new(size, self.chrome_height(), window.scale_factor(), window.is_maximized())
+        Scrollbar::new(size, self.chrome_height(), self.tab_bar_height(), window.scale_factor(), window.is_maximized())
     }
 
     fn try_scroll_drag(&mut self) -> bool {
@@ -1119,6 +1242,7 @@ impl App {
             let anchor = self.selection.map(|(anchor, _)| anchor).unwrap_or(point);
             self.anchor_cell = anchor;
             self.selection = Some((anchor, point));
+            self.selection_text = None;
             self.press_moved = point != anchor;
             self.selection_dirty = true;
             self.redraw();
@@ -1134,6 +1258,7 @@ impl App {
             let span = (self.point(span.0), self.point(span.1));
             self.anchor_cell = span.0;
             self.selection = Some(span);
+            self.selection_text = None;
             self.press_moved = true;
             self.selection_dirty = true;
             self.redraw();
@@ -1151,12 +1276,41 @@ impl App {
             return;
         }
         self.selection = Some((anchor, cell));
+        self.selection_text = None;
         self.press_moved = true;
         self.selection_dirty = true;
         self.redraw();
     }
 
+    /// Compares the text under the selection with the text it had. Drops the selection when
+    /// it differs. A parser holding the grid only postpones the check to the next frame.
+    fn selection_changed(&mut self, active: usize) -> bool {
+        let Some((anchor, focus)) = self.selection else {
+            self.selection_stale = false;
+            return false;
+        };
+        let Ok(term) = self.tabs[active].session.term.try_lock() else {
+            return false;
+        };
+        let text = term.selected_text(anchor, focus);
+        drop(term);
+        self.selection_stale = false;
+        match &self.selection_text {
+            Some(kept) if *kept != text => {
+                self.selection = None;
+                self.selection_text = None;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.selection_text = Some(text);
+                false
+            }
+        }
+    }
+
     fn clear_selection(&mut self) {
+        self.selection_text = None;
         self.selecting = false;
         self.autoscroll_at = None;
         self.press_moved = false;
@@ -1174,12 +1328,12 @@ impl App {
             return;
         }
         let active = self.active.min(self.tabs.len() - 1);
+        // A busy parser holds the grid only for one chunk. Waiting for it beats losing the copy.
         let text = {
-            let Ok(term) = self.tabs[active].session.term.try_lock() else {
-                return;
-            };
+            let term = self.tabs[active].session.term.lock().unwrap_or_else(|err| err.into_inner());
             term.selected_text(anchor, focus)
         };
+        self.selection_text = Some(text.clone());
         if text.is_empty() {
             return;
         }
@@ -1238,7 +1392,6 @@ impl App {
             match tabs::hit(&self.bar, col) {
                 Some(BarHit::Select(index)) => self.focus_tab(index),
                 Some(BarHit::Close(index)) => self.close_tab(index),
-                Some(BarHit::Settings) => self.toggle_settings(),
                 None => {}
             }
             return;
@@ -1278,6 +1431,7 @@ impl App {
                     self.exit_confirmed = true;
                 }
             }
+            TitleHit::Settings => self.toggle_settings(),
             TitleHit::Minimize => window.set_minimized(true),
             TitleHit::Maximize => {
                 window.set_maximized(!window.is_maximized());
@@ -1359,7 +1513,13 @@ impl App {
 
     fn is_bar_y(&self, y: f64) -> bool {
         let Some(window) = &self.window else { return false };
-        bar_contains_y(window.inner_size().height, self.chrome_height(), y)
+        let bar_h = self.tab_bar_height();
+        bar_h > 0 && bar_contains_y(window.inner_size().height, bar_h, y)
+    }
+
+    /// The tab bar shows from the second tab on. With one tab its subject is in the title bar.
+    fn tab_bar_height(&self) -> u32 {
+        if self.tabs.len() > 1 { self.chrome_height() } else { 0 }
     }
 
     /// Top of the first row: the title bar and the space below it.
@@ -1369,7 +1529,11 @@ impl App {
 
     fn chrome_height(&self) -> u32 {
         let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0);
-        bar_height(scale, self.face.cell_h())
+        if self.ui.glass {
+            glass_bar_height(scale, self.face.cell_h())
+        } else {
+            bar_height(scale, self.face.cell_h())
+        }
     }
 }
 
@@ -1434,6 +1598,95 @@ fn bar_height(scale: f64, cell_h: u32) -> u32 {
     ((32.0 * scale).ceil() as u32).max(cell_h.max(1))
 }
 
+/// Glass bars leave room around the text for the capsule and the pill inside it.
+fn glass_bar_height(scale: f64, cell_h: u32) -> u32 {
+    ((44.0 * scale).ceil() as u32).max(cell_h.max(1) + (20.0 * scale).round() as u32)
+}
+
+fn is_light(theme: Theme) -> bool {
+    let luma = 0.2126 * f32::from(theme.bg.r) + 0.7152 * f32::from(theme.bg.g) + 0.0722 * f32::from(theme.bg.b);
+    luma > 128.0
+}
+
+/// The glass under the bars: a capsule around the tabs with a pill on the selected one,
+/// a round button behind the settings gear, and one behind each window control.
+fn glass_shapes(
+    bar: &Bar,
+    title: &TitleBar,
+    size: PhysicalSize<u32>,
+    chrome_h: u32,
+    cell_w: u32,
+    scale: f64,
+    settings_lit: bool,
+    maximized: bool,
+) -> Vec<GlassShape> {
+    let cw = cell_w as f32;
+    let scale = scale as f32;
+    let chrome = chrome_h as f32;
+    let inset = (4.0 * scale).round();
+    let cap_h = (chrome - 2.0 * inset).max(1.0);
+    let bar_y = size.height as f32 - chrome + inset;
+    // Clear of the window's round corner, which is 15 logical pixels.
+    let side_margin = (10.0 * scale).round();
+    let mut shapes = Vec::with_capacity(8);
+    if let (Some(first), Some(last)) = (bar.spans.first(), bar.spans.last()) {
+        let x0 = (f32::from(first.start) * cw - 0.6 * cw).max(side_margin);
+        // The same margin on the right as on the left, whatever the cells leave over.
+        let x1 = (size.width as f32 - x0).max(f32::from(last.end) * cw);
+        shapes.push(GlassShape::new(x0, bar_y, x1 - x0, cap_h, GLASS_CONTAINER));
+        // The pill sits inside the capsule with the same gap on every side, like a
+        // segment pressed into the glass.
+        if let Some(active) = bar.spans.get(bar.selected) {
+            let gap = (4.0 * scale).round();
+            let left = (f32::from(active.start) * cw + gap).max(x0 + gap);
+            let right = (f32::from(active.end) * cw - gap).min(x1 - gap);
+            shapes.push(GlassShape::new(left, bar_y + gap, right - left, cap_h - 2.0 * gap, GLASS_PILL));
+        }
+    }
+    // The gear and the window buttons share one size and one rule for their center.
+    let maximize = if maximized { ICON_RESTORE } else { ICON_MAXIMIZE };
+    let buttons = [
+        (&title.settings, None),
+        (&title.minimize, Some(ICON_MINIMIZE)),
+        (&title.maximize, Some(maximize)),
+        (&title.close, Some(ICON_CLOSE)),
+    ];
+    for (range, icon) in buttons {
+        if range.is_empty() {
+            continue;
+        }
+        // The mark sits in the middle cell, as titlebar::paint_button places it.
+        let mark = f32::from(range.start + (range.end - range.start) / 2);
+        let center = (mark + 0.5) * cw;
+        let side = (cap_h - 2.0 * scale).min(f32::from(range.end - range.start) * cw).max(1.0);
+        let button = GlassShape::new(center - side * 0.5, (chrome - side) * 0.5, side, side, GLASS_BUTTON);
+        shapes.push(match icon {
+            Some(icon) => button.with_icon(icon),
+            None => button.lit(settings_lit).with_gear(),
+        });
+    }
+    shapes
+}
+
+/// A glass sheet behind a block of grid cells `(col, row, cols, rows)`, grown by `pad` pixels.
+fn sheet(
+    rect: (u16, u16, u16, u16),
+    origin: (f32, f32),
+    cell: (f32, f32),
+    pad: f32,
+    scale: f64,
+    theme: Theme,
+    alpha: f32,
+) -> GlassShape {
+    let x = origin.0 + f32::from(rect.0) * cell.0 - pad;
+    let y = origin.1 + f32::from(rect.1) * cell.1 - pad;
+    let w = f32::from(rect.2) * cell.0 + 2.0 * pad;
+    let h = f32::from(rect.3) * cell.1 + 2.0 * pad;
+    GlassShape::new(x, y, w, h, GLASS_SHEET)
+        .with_radius((14.0 * scale) as f32)
+        .with_tint(theme.panel, alpha)
+}
+
 fn bar_contains_y(height: u32, bar_h: u32, y: f64) -> bool {
     y >= f64::from(height.saturating_sub(bar_h)) && y < f64::from(height)
 }
@@ -1451,13 +1704,14 @@ struct Scrollbar {
 }
 
 impl Scrollbar {
-    fn new(size: PhysicalSize<u32>, chrome: u32, scale: f64, maximized: bool) -> Self {
+    /// `top` is the title bar, `bottom` the tab bar, zero while it is hidden.
+    fn new(size: PhysicalSize<u32>, top: u32, bottom: u32, scale: f64, maximized: bool) -> Self {
         let border = if maximized { 0 } else { resize_margin(scale).ceil() as u32 };
         Self {
             right: size.width.saturating_sub(border),
             width: (4.0 * scale).round().max(1.0) as u32,
-            top: chrome,
-            height: size.height.saturating_sub(chrome.saturating_mul(2)),
+            top,
+            height: size.height.saturating_sub(top.saturating_add(bottom)),
         }
     }
 
@@ -1562,13 +1816,8 @@ impl ApplicationHandler<Wake> for App {
                 if self.scroll_drag {
                     self.drag_scroll(position.y);
                 }
-                let col = strip_col(position.x, self.face.cell_w(), self.bar.cells.len());
-                let hot = self.is_bar_y(position.y)
-                    && self
-                        .bar
-                        .settings
-                        .as_ref()
-                        .is_some_and(|settings| settings.contains(&col));
+                let title_col = strip_col(position.x, self.face.cell_w(), self.title_bar.cells.len());
+                let hot = self.is_title_y(position.y) && self.title_bar.settings.contains(&title_col);
                 if hot != self.settings_hot {
                     self.settings_hot = hot;
                     self.bar_dirty = true;
@@ -1625,6 +1874,11 @@ impl ApplicationHandler<Wake> for App {
             }
             _ => {}
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The blur objects ride on winit's wl_display, which closes when the loop ends.
+        self.blur = None;
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
@@ -1709,6 +1963,8 @@ pub fn run() -> anyhow::Result<()> {
         proxy,
         window: None,
         gpu: None,
+        blur: None,
+        blur_tried: false,
         presented_tab: None,
         face,
         atlas,
@@ -1720,12 +1976,13 @@ pub fn run() -> anyhow::Result<()> {
         grid_cols: 80,
         grid_rows: 24,
         bar_dirty: true,
-        bar: Bar { cells: Vec::new(), spans: Vec::new(), settings: None },
+        bar: Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 },
         title_bar: TitleBar {
             cells: Vec::new(),
             minimize: 0..0,
             maximize: 0..0,
             close: 0..0,
+            settings: 0..0,
         },
         last_title_click: None,
         settings_hot: false,
@@ -1735,6 +1992,8 @@ pub fn run() -> anyhow::Result<()> {
         selecting: false,
         view_top: 0,
         autoscroll_at: None,
+        selection_text: None,
+        selection_stale: false,
         press_moved: false,
         press_cell: (0, 0),
         anchor_cell: (0, 0),
@@ -1768,8 +2027,67 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         Mutex, PhysicalSize, ResizeDirection, Scrollbar, Term, bar_contains_y, bar_height,
-        existing_file, publish_frame, resize_edge, strip_col,
+        existing_file, glass_bar_height, glass_shapes, publish_frame, resize_edge, strip_col,
     };
+    use crate::desktop::ButtonLayout;
+    use crate::gpu::{GLASS_BUTTON, GLASS_CONTAINER, GLASS_PILL, GLASS_SHEET};
+
+    #[test]
+    fn glass_bars_are_taller_than_the_text() {
+        assert_eq!(glass_bar_height(1.0, 19), 44);
+        assert_eq!(glass_bar_height(1.0, 30), 50);
+        assert!(glass_bar_height(2.0, 38) >= bar_height(2.0, 38) + 16);
+    }
+
+    #[test]
+    fn glass_capsule_holds_the_tabs_and_the_pill_marks_the_active_one() {
+        let theme = crate::color::theme(0);
+        let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let bar = crate::tabs::render_bar(&titles, &[], 1, 100, theme, true);
+        let title = crate::titlebar::render("shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, true);
+        let size = PhysicalSize::new(1000, 600);
+        let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, true, false);
+        let kinds: Vec<u32> = shapes.iter().map(|shape| shape.kind).collect();
+        assert_eq!(kinds, vec![GLASS_CONTAINER, GLASS_PILL, GLASS_BUTTON, GLASS_BUTTON]);
+        let [container, pill, settings, close] = [shapes[0], shapes[1], shapes[2], shapes[3]];
+        // The capsule sits inside the bottom bar with the same margin on both sides.
+        assert_eq!(container.rect[1], 600.0 - 40.0 + 4.0);
+        assert_eq!(container.rect[3], 32.0);
+        assert_eq!(container.rect[0], 1000.0 - container.rect[0] - container.rect[2]);
+        // The pill covers the second tab and stays inside the capsule.
+        let active = bar.spans[1];
+        assert_eq!(pill.rect[0], f32::from(active.start) * 10.0 + 4.0);
+        assert!(pill.rect[1] > container.rect[1] && pill.rect[1] + pill.rect[3] < container.rect[1] + container.rect[3]);
+        // The gear is a button like close: same circle, same height, one button apart.
+        assert!(settings.lit > 0.0 && settings.icon == crate::gpu::ICON_GEAR && container.icon == 0.0);
+        assert_eq!(close.icon, crate::gpu::ICON_CLOSE);
+        assert!(title.cells.iter().all(|cell| cell.cp != u32::from('\u{00D7}')));
+        assert_eq!(settings.rect[1..], close.rect[1..]);
+        let step = f32::from(title.close.end - title.close.start) * 10.0;
+        assert!((close.rect[0] - settings.rect[0] - step).abs() < 0.01);
+        // The close button is a circle around the × in the title bar.
+        assert!(close.rect[1] < 40.0 && close.rect[2] == close.rect[3]);
+        let mark = f32::from(title.close.start + 1) * 10.0 + 5.0;
+        assert!((close.rect[0] + close.rect[2] * 0.5 - mark).abs() < 0.01);
+    }
+
+    #[test]
+    fn glass_dialog_cells_turn_see_through_over_a_sheet_with_a_red_close_button() {
+        let theme = crate::color::theme(0);
+        let mut dialog = crate::confirm::render(80, 24, theme, 3).expect("dialog");
+        dialog.set_background(theme.bg.pack());
+        assert!(dialog.cells.iter().all(|cell| cell.bg == theme.bg.pack()));
+        let buttons: Vec<_> = dialog.buttons().collect();
+        assert_eq!(buttons.len(), 2);
+        assert!(buttons.iter().any(|(_, _, choice)| *choice == crate::confirm::Choice::Close));
+        let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
+        let shape = super::sheet(rect, (12.0, 50.0), (10.0, 20.0), 8.0, 1.0, theme, 0.94);
+        assert_eq!(shape.kind, GLASS_SHEET);
+        assert_eq!(shape.rect[0], 12.0 + f32::from(dialog.origin_col) * 10.0 - 8.0);
+        assert_eq!(shape.rect[2], f32::from(dialog.cols) * 10.0 + 16.0);
+        assert_eq!(shape.radius, 14.0);
+        assert!((shape.tint[3] - 0.94).abs() < 1e-6);
+    }
 
     #[test]
     fn synchronized_pet_replacement_keeps_the_complete_frame_visible() {
@@ -1836,7 +2154,7 @@ mod tests {
 
     #[test]
     fn scrollbar_reaches_the_window_edge_and_stops_at_the_chrome() {
-        let scroll = Scrollbar::new(PhysicalSize::new(2560, 1408), 32, 1.0, true);
+        let scroll = Scrollbar::new(PhysicalSize::new(2560, 1408), 32, 32, 1.0, true);
         assert_eq!(scroll.track(), 2556..2560);
         assert_eq!(scroll.hit(2559.0, 32.0), Some(0.0));
         assert_eq!(scroll.hit(2559.0, 704.0), Some(0.5));
@@ -1849,7 +2167,7 @@ mod tests {
     #[test]
     fn floating_scrollbar_leaves_room_to_resize() {
         let size = PhysicalSize::new(2200, 1400);
-        let scroll = Scrollbar::new(size, 64, 2.0, false);
+        let scroll = Scrollbar::new(size, 64, 64, 2.0, false);
         assert_eq!(scroll.track(), 2182..2190);
         assert_eq!(scroll.hit(2189.0, 700.0), Some(0.5));
         assert_eq!(resize_edge(2189.0, 700.0, size, 2.0), None);

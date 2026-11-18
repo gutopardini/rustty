@@ -1824,6 +1824,21 @@ mod tests {
     }
 
     #[test]
+    fn spinner_and_streamed_output_leave_the_selected_text_alone() {
+        let mut term = Term::new(12, 3);
+        term.advance("answer one\r\nanswer two\r\n⠋ Thinking".as_bytes());
+        let selection = ((0, 0), (9, 1));
+        assert_eq!(term.selected_text(selection.0, selection.1), "answer one\nanswer two");
+        for frame in ["⠙", "⠹", "⠸"] {
+            term.advance(format!("\r{frame} Thinking").as_bytes());
+            assert_eq!(term.selected_text(selection.0, selection.1), "answer one\nanswer two");
+        }
+        term.advance(b"\r\x1b[Kmore\r\nlines\r\nhere");
+        assert_eq!(term.view_top(), 2);
+        assert_eq!(term.selected_text(selection.0, selection.1), "answer one\nanswer two");
+    }
+
+    #[test]
     fn selection_keeps_its_lines_while_the_view_scrolls_and_history_is_trimmed() {
         let mut term = Term::new(4, 2);
         term.advance(b"aaaa\r\nbbbb\r\ncccc");

@@ -13,9 +13,15 @@ use crate::font::{Atlas, Face};
 use crate::term::Snapshot;
 
 mod frame;
+mod glass;
 mod images;
 
 use frame::Frame;
+pub use glass::{
+    GlassShape, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER, ICON_CLOSE, ICON_GEAR, ICON_MAXIMIZE,
+    ICON_MINIMIZE, ICON_RESTORE, PILL as GLASS_PILL, SHEET as GLASS_SHEET,
+};
+use glass::Glass;
 use images::Images;
 
 const MAX_GLYPHS: usize = 8192;
@@ -74,6 +80,9 @@ pub struct Renderer {
     /// Rounded corners. Absent when the surface cannot be transparent.
     frame: Option<Frame>,
     clear: Rgb,
+    /// Opacity of the window tint in glass mode. `None` keeps the window opaque.
+    glass: Option<f32>,
+    glass_layer: Option<Glass>,
     selection: (u32, u32),
     presented: Option<Presented>,
 }
@@ -220,7 +229,9 @@ impl Renderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // An opaque cell replaces what is under it, as before. A see-through
+                    // cell in glass mode leaves the glass and the window tint visible.
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -402,6 +413,8 @@ impl Renderer {
             chrome_h: 0.0,
             frame,
             clear: DEFAULT_BG,
+            glass: None,
+            glass_layer: None,
             selection: (0, 0),
             presented: None,
         };
@@ -426,6 +439,34 @@ impl Renderer {
 
     pub fn set_clear(&mut self, color: Rgb) {
         self.clear = color;
+    }
+
+    /// Glass needs a premultiplied surface, the same one that cuts the corners round.
+    pub fn supports_glass(&self) -> bool {
+        self.frame.is_some()
+    }
+
+    /// `Some(opacity)` turns the default background into a tint of that opacity.
+    /// `None` restores the opaque window.
+    pub fn set_glass(&mut self, opacity: Option<f32>) {
+        let opacity = opacity.filter(|_| self.supports_glass()).map(|value| value.clamp(0.2, 1.0));
+        self.glass = opacity;
+        if let Some(frame) = &mut self.frame {
+            frame.set_glass(opacity.is_some());
+        }
+        if opacity.is_none() {
+            self.glass_layer = None;
+        }
+    }
+
+    /// Glass capsules, buttons and sheets, in physical pixels. Shapes before `overlay` are
+    /// drawn under the bars and the grid. The rest go over the grid, under the dialog text.
+    pub fn set_glass_shapes(&mut self, shapes: &[GlassShape], overlay: usize, scale: f32, light: bool) {
+        if self.glass.is_none() {
+            return;
+        }
+        let layer = self.glass_layer.get_or_insert_with(|| Glass::new(&self.device, self.config.format));
+        layer.set(&self.queue, self.config.width, self.config.height, scale, light, shapes, overlay);
     }
 
     pub(crate) fn upload_dialog(
@@ -490,6 +531,9 @@ impl Renderer {
             cell_h,
             surf_w,
             surf_h: self.config.height as f32,
+            // On glass the dialog's cells in the window color let its sheet show.
+            glass: u32::from(self.glass.is_some()),
+            glass_key: self.clear.pack(),
             ..bytemuck::Zeroable::zeroed()
         };
         self.queue.write_buffer(&layer.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -697,12 +741,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.clear.r) / 255.0,
-                            g: f64::from(self.clear.g) / 255.0,
-                            b: f64::from(self.clear.b) / 255.0,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color(self.clear, self.glass)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -711,6 +750,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some(glass) = self.glass_layer.as_ref().filter(|_| self.glass.is_some()) {
+                glass.draw(&mut pass);
+            }
             pass.set_pipeline(&self.pipeline);
             if self.title_count > 0 {
                 pass.set_bind_group(0, &self.title_bind, &[]);
@@ -733,6 +775,10 @@ impl Renderer {
                     pass.set_bind_group(0, &self.bind, &[]);
                     pass.draw(0..6, count..count + 1);
                 }
+            }
+            if let Some(glass) = self.glass_layer.as_ref().filter(|_| self.glass.is_some()) {
+                glass.draw_overlay(&mut pass);
+                pass.set_pipeline(&self.pipeline);
             }
             if let Some(dialog) = &self.dialog {
                 pass.set_bind_group(0, &dialog.bind, &[]);
@@ -810,6 +856,9 @@ impl Renderer {
             sel_hi: self.selection.1,
             scroll_y0: self.top_h,
             scroll_y1: (surf_h - self.chrome_h).max(self.top_h),
+            glass: u32::from(self.glass.is_some()),
+            glass_key: self.clear.pack(),
+            _glass_pad: [0; 2],
         };
         self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         uniforms
@@ -845,6 +894,9 @@ impl Renderer {
             sel_hi: 0,
             scroll_y0: 0.0,
             scroll_y1: 0.0,
+            glass: u32::from(self.glass.is_some()),
+            glass_key: strip.pack(),
+            _glass_pad: [0; 2],
         };
         self.queue.write_buffer(buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -1009,6 +1061,17 @@ fn make_bind(
     })
 }
 
+/// The window tint. Premultiplied, so a glass window stores the color scaled by its opacity.
+fn clear_color(color: Rgb, glass: Option<f32>) -> wgpu::Color {
+    let alpha = f64::from(glass.unwrap_or(1.0));
+    wgpu::Color {
+        r: f64::from(color.r) / 255.0 * alpha,
+        g: f64::from(color.g) / 255.0 * alpha,
+        b: f64::from(color.b) / 255.0 * alpha,
+        a: alpha,
+    }
+}
+
 fn present_mode(vsync: bool, modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     if !vsync {
         if modes.contains(&wgpu::PresentMode::AutoNoVsync) {
@@ -1028,7 +1091,19 @@ fn present_mode(vsync: bool, modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
 
 #[cfg(test)]
 mod tests {
-    use super::present_mode;
+    use super::{clear_color, present_mode};
+    use crate::color::Rgb;
+
+    #[test]
+    fn opaque_window_clears_as_before_and_glass_premultiplies() {
+        let color = Rgb::new(0x13, 0x16, 0x19);
+        let opaque = clear_color(color, None);
+        assert_eq!(opaque.a, 1.0);
+        assert!((opaque.r - 0x13 as f64 / 255.0).abs() < 1e-9);
+        let glass = clear_color(color, Some(0.5));
+        assert_eq!(glass.a, 0.5);
+        assert!((glass.g - 0x16 as f64 / 255.0 * 0.5).abs() < 1e-9);
+    }
 
     #[test]
     fn mailbox_keeps_vsync_without_queueing_frames() {

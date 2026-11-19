@@ -464,6 +464,21 @@ impl Term {
         None
     }
 
+    /// The live screen belongs to the program. A selection dragged past the grid has to
+    /// scroll that program: Claude keeps the rest of the transcript and only redraws the
+    /// viewport, so this tab's history does not contain the hidden lines.
+    /// `None` means `scroll_view` is the right move, including while the user is already
+    /// reading this tab's own history.
+    pub fn selection_scroll(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Option<Vec<u8>> {
+        if steps == 0 || self.view_offset != 0 {
+            return None;
+        }
+        if !(self.mouse_enabled() || (self.alt_on && self.alt_scroll)) {
+            return None;
+        }
+        self.wheel_write(steps, col, row, pixel)
+    }
+
     pub fn scroll_view(&mut self, delta: isize) {
         self.set_view((self.view_offset as isize + delta).clamp(0, self.scrollback.len() as isize) as usize);
     }
@@ -1776,6 +1791,28 @@ mod tests {
         let row0: String = snap.cells.iter().take(4).map(cell_char).collect();
         assert_eq!(row0, "aaaa");
         assert!(snap.scroll_h > 0.0);
+    }
+
+    #[test]
+    fn selection_drag_past_the_live_screen_scrolls_the_program() {
+        let mut term = Term::new(8, 4);
+        term.advance(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let up = term.selection_scroll(1, 2, 1, (4, 2)).expect("older lines");
+        assert_eq!(up, b"\x1b[<64;2;1M\x1b[<64;2;1m");
+        let down = term.selection_scroll(-2, 2, 4, (4, 40)).expect("newer lines");
+        assert_eq!(down, b"\x1b[<65;2;4M\x1b[<65;2;4m\x1b[<65;2;4M\x1b[<65;2;4m");
+        assert_eq!(term.view_offset(), 0);
+
+        let mut arrows = Term::new(8, 4);
+        arrows.advance(b"\x1b[?1049h\x1b[?1007h");
+        assert_eq!(arrows.selection_scroll(1, 1, 1, (1, 1)).as_deref(), Some(&b"\x1b[A"[..]));
+
+        let mut shell = Term::new(4, 2);
+        shell.advance(b"aaaa\r\nbbbb\r\ncccc");
+        assert!(shell.selection_scroll(1, 1, 1, (1, 1)).is_none());
+        shell.scroll_view(1);
+        shell.advance(b"\x1b[?1000h\x1b[?1006h");
+        assert!(shell.selection_scroll(1, 1, 1, (1, 1)).is_none());
     }
 
     #[test]

@@ -59,6 +59,7 @@ While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab 
 | `Ctrl+Shift+1` … `9` | jump to a tab |
 | `Shift+PageUp` / `PageDown` | scroll the scrollback |
 | drag | select text; the selection is copied when the button is released |
+| drag a tab | move that tab along the bar |
 | double-click / triple-click | select a word / the line |
 | `Ctrl+Shift+C` | copy the selection |
 | `Ctrl+Shift+V` | paste |

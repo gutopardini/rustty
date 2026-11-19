@@ -10,4 +10,4 @@ The files in `source/` exist only to identify the CLI running in a tab. The mark
 | Antigravity | [Google Antigravity site icon](https://antigravity.google/favicon.svg) |
 | Cursor | [Cursor site icon](https://cursor.com/marketing-static/favicon.svg) |
 
-The atlas order is Claude, Codex, Kiro, Antigravity, Cursor, the settings gear, and the Rustty icon. Each image sits in a transparent 64 × 64 box without distorting its original proportion. Rebuild it with `scripts/render-agent-icons.sh`. That needs Python 3, Pillow, and ImageMagick with SVG support. The application embeds the atlas and does not need those programs at runtime.
+The atlas order is Claude, Codex, Kiro, Antigravity, Cursor, the settings gear, and the Rustty icon. Each mark keeps its proportion and fills the 64 × 64 tile; the soft light rim on the source files is cropped off so the edge sits flush on a dark tab. Rebuild it with `scripts/render-agent-icons.sh`. That needs Python 3, Pillow, and ImageMagick with SVG support. The application embeds the atlas and does not need those programs at runtime.

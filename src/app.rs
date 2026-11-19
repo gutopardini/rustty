@@ -99,6 +99,22 @@ impl Session {
         result
     }
 
+    /// Scrolls the program that owns the live screen, or this tab's history.
+    fn follow_selection(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Follow {
+        let frames = Arc::clone(&self.frames);
+        let mut term = self.term.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(bytes) = term.selection_scroll(steps, col, row, pixel) {
+            return Follow::Program(bytes);
+        }
+        let before = term.view_top();
+        term.scroll_view(steps);
+        let top = (term.view_top() != before).then(|| term.view_top());
+        if top.is_some() {
+            publish_frame(&mut term, &frames);
+        }
+        Follow::History(top)
+    }
+
     /// Scrolls this tab, or returns bytes the program asked to receive instead.
     fn wheel(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Option<Vec<u8>> {
         let frames = Arc::clone(&self.frames);
@@ -114,6 +130,13 @@ impl Session {
     fn take_frame(&self) -> Option<Snapshot> {
         self.frames.lock().unwrap_or_else(|err| err.into_inner()).take()
     }
+}
+
+enum Follow {
+    /// Bytes for the program that owns the viewport.
+    Program(Vec<u8>),
+    /// `Some` is the new absolute line of the first row, after this tab's history moved.
+    History(Option<u64>),
 }
 
 /// Moves a finished grid into the slot the window thread draws. The lock covers the swap only.
@@ -272,6 +295,13 @@ struct Tab {
     session: Session,
 }
 
+#[derive(Clone, Copy)]
+struct TabDrag {
+    index: usize,
+    origin_x: f64,
+    armed: bool,
+}
+
 /// A cell as `(col, absolute line)`. The line survives scrolling, so a selection stays on its text.
 type Point = (u16, u64);
 
@@ -341,6 +371,8 @@ struct App {
     cursor: Option<(f64, f64)>,
     wheel_frac: f32,
     scroll_drag: bool,
+    /// Tab being reordered. `armed` is set once the pointer has moved enough to count as a drag.
+    tab_drag: Option<TabDrag>,
 }
 
 impl App {
@@ -1013,6 +1045,72 @@ impl App {
         true
     }
 
+    fn begin_tab_drag(&mut self) -> bool {
+        if self.ui.open || self.tabs.len() < 2 {
+            return false;
+        }
+        let Some((x, y)) = self.cursor else {
+            return false;
+        };
+        if !self.is_bar_y(y) {
+            return false;
+        }
+        let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
+        let Some(BarHit::Select(index)) = tabs::hit(&self.bar, col) else {
+            return false;
+        };
+        self.focus_tab(index);
+        self.tab_drag = Some(TabDrag { index, origin_x: x, armed: false });
+        true
+    }
+
+    fn drag_tab(&mut self, x: f64) {
+        let Some(mut drag) = self.tab_drag else {
+            return;
+        };
+        if !drag.armed {
+            let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0);
+            let slop = (8.0 * scale).clamp(6.0, 24.0);
+            if (x - drag.origin_x).abs() < slop {
+                return;
+            }
+            drag.armed = true;
+            self.tab_drag = Some(drag);
+            self.hover_icon = CursorIcon::Grabbing;
+            if let Some(window) = &self.window {
+                window.set_cursor(CursorIcon::Grabbing);
+            }
+        }
+        let Some(target) = self.tab_drop_index(x) else {
+            return;
+        };
+        if target != drag.index {
+            self.move_tab(drag.index, target);
+        }
+    }
+
+    fn tab_drop_index(&self, x: f64) -> Option<usize> {
+        let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
+        tabs::drop_index(&self.bar, col)
+    }
+
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = to;
+        if let Some(drag) = &mut self.tab_drag {
+            drag.index = to;
+        }
+        for (index, tab) in self.tabs.iter().enumerate() {
+            tab.session.visible.store(index == to, Ordering::Relaxed);
+        }
+        self.bar_dirty = true;
+        self.redraw();
+    }
+
     fn drag_scroll(&mut self, y: f64) {
         let Some(window) = &self.window else {
             return;
@@ -1144,28 +1242,46 @@ impl App {
         }
     }
 
-    /// One step of the scroll that follows the selection. Returns false when the view
-    /// is already at the end it moves toward.
+    /// One step of the scroll that follows the selection. Returns false when neither this
+    /// tab nor the program can move any further that way.
     fn autoscroll_step(&mut self) -> bool {
         let lines = self.autoscroll_lines();
         if lines == 0 || self.tabs.is_empty() {
             return false;
         }
         let active = self.active.min(self.tabs.len() - 1);
-        let top = self.tabs[active].session.update(|term| {
-            let before = term.view_top();
-            term.scroll_view(lines);
-            (term.view_top() != before).then(|| term.view_top())
-        });
-        let Some(top) = top else {
-            return false;
-        };
-        self.view_top = top;
-        if let Some((x, y)) = self.cursor {
-            self.extend_selection(x, y);
+        let (col, row, pixel) = self.autoscroll_pointer();
+        match self.tabs[active].session.follow_selection(lines, col, row, pixel) {
+            Follow::Program(bytes) => {
+                if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
+                    tracing::warn!(%err, "pty write");
+                    return false;
+                }
+                true
+            }
+            Follow::History(Some(top)) => {
+                self.view_top = top;
+                if let Some((x, y)) = self.cursor {
+                    self.extend_selection(x, y);
+                }
+                self.redraw();
+                true
+            }
+            Follow::History(None) => false,
         }
-        self.redraw();
-        true
+    }
+
+    /// Cell at the grid edge the pointer has crossed, in the same coordinates as a wheel event.
+    fn autoscroll_pointer(&self) -> (u16, u16, (u32, u32)) {
+        let (x, y) = self.cursor.unwrap_or((0.0, 0.0));
+        let (col, row) = self.clamped_cell(x, y);
+        let cell_w = self.face.cell_w().max(1) as f64;
+        let cell_h = self.face.cell_h().max(1) as f64;
+        let width = f64::from(self.grid_cols.max(1)) * cell_w;
+        let height = f64::from(self.grid_rows.max(1)) * cell_h;
+        let grid_x = (x - f64::from(self.grid_left)).clamp(0.0, width - 1.0);
+        let grid_y = (y - f64::from(self.grid_top())).clamp(0.0, height - 1.0);
+        (col.saturating_add(1), row.saturating_add(1), ((grid_x as u32) + 1, (grid_y as u32) + 1))
     }
 
     fn note_click(&mut self, cell: (u16, u16)) -> u8 {
@@ -1193,7 +1309,7 @@ impl App {
             self.on_click();
             return;
         }
-        if self.try_scroll_drag() || self.begin_selection() {
+        if self.try_scroll_drag() || self.begin_tab_drag() || self.begin_selection() {
             return;
         }
         self.on_click();
@@ -1201,6 +1317,12 @@ impl App {
 
     fn end_pointer(&mut self) {
         self.scroll_drag = false;
+        if self.tab_drag.take().is_some() {
+            self.hover_icon = CursorIcon::Default;
+            if let Some(window) = &self.window {
+                window.set_cursor(CursorIcon::Default);
+            }
+        }
         self.autoscroll_at = None;
         if !self.selecting {
             return;
@@ -1816,6 +1938,9 @@ impl ApplicationHandler<Wake> for App {
                 if self.scroll_drag {
                     self.drag_scroll(position.y);
                 }
+                if self.tab_drag.is_some() {
+                    self.drag_tab(position.x);
+                }
                 let title_col = strip_col(position.x, self.face.cell_w(), self.title_bar.cells.len());
                 let hot = self.is_title_y(position.y) && self.title_bar.settings.contains(&title_col);
                 if hot != self.settings_hot {
@@ -1842,7 +1967,7 @@ impl ApplicationHandler<Wake> for App {
                         self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_TICK);
                     }
                 }
-                if cell != self.link_cell {
+                if self.tab_drag.is_none() && cell != self.link_cell {
                     self.link_cell = cell;
                     let icon = if cell.is_some() && self.link_at(position.x, position.y).is_some() {
                         CursorIcon::Pointer
@@ -2016,6 +2141,7 @@ pub fn run() -> anyhow::Result<()> {
         cursor: None,
         wheel_frac: 0.0,
         scroll_drag: false,
+        tab_drag: None,
     };
     app.open_tab().context("opening the pty")?;
     event_loop.run_app(&mut app).context("window loop")?;

@@ -157,15 +157,30 @@ pub fn render_bar(
 }
 
 pub fn hit(bar: &Bar, col: u16) -> Option<BarHit> {
-    for (index, span) in bar.spans.iter().enumerate() {
-        if (span.start..span.end).contains(&col) {
-            if span.close == Some(col) {
-                return Some(BarHit::Close(index));
-            }
-            return Some(BarHit::Select(index));
-        }
+    let index = drop_index(bar, col)?;
+    let span = bar.spans.get(index)?;
+    if span.close == Some(col) {
+        Some(BarHit::Close(index))
+    } else if (span.start..span.end).contains(&col) {
+        Some(BarHit::Select(index))
+    } else {
+        None
     }
-    None
+}
+
+/// Tab under `col`, including the margin past the first and last tabs.
+/// A column in the margin has no hit, but a drag still lands on the end tab.
+pub fn drop_index(bar: &Bar, col: u16) -> Option<usize> {
+    let (Some(first), Some(last)) = (bar.spans.first(), bar.spans.last()) else {
+        return None;
+    };
+    if col < first.start {
+        return Some(0);
+    }
+    if col >= last.end {
+        return Some(bar.spans.len() - 1);
+    }
+    bar.spans.iter().position(|span| (span.start..span.end).contains(&col))
 }
 
 pub(crate) fn paint_icon(cells: &mut [Cell], agent: Option<Agent>, fg: u32, bg: u32) {
@@ -287,6 +302,8 @@ mod tests {
         assert_eq!(hit(&bar, bar.spans[0].start), Some(BarHit::Select(0)));
         assert_eq!(hit(&bar, close), Some(BarHit::Close(0)));
         assert_eq!(hit(&bar, bar.spans[1].start), Some(BarHit::Select(1)));
+        assert_eq!(drop_index(&bar, close), Some(0));
+        assert_eq!(drop_index(&bar, 40), Some(1));
         assert!(!bar.cells.iter().any(|cell| cell.cp == crate::agent::SETTINGS_ICON));
     }
 

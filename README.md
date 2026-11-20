@@ -26,7 +26,9 @@ The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. 
 
 </div>
 
-The same panel turns on **Glass mode**. The window becomes translucent and the desktop behind it is blurred by the compositor through `ext-background-effect-v1`, which GNOME 51 and Plasma 6.7 offer. The tabs sit in a glass capsule, the active one in a pill, and the gear and window buttons become round glass. The shapes are drawn in a shader. Text and explicit colors stay opaque. `glass_opacity=0.78` in `ui.conf` sets the tint. With Glass mode off, the window is opaque.
+The same panel turns on **Glass mode**. The window becomes translucent and the desktop behind it is blurred by the compositor through `ext-background-effect-v1`, which GNOME 51 and Plasma 6.7 offer. The tabs sit in a glass capsule, the active one in a pill, and the gear and window buttons become round glass. The shapes are drawn in a shader. Text and explicit colors stay opaque. With Glass mode off, the window is opaque.
+
+With Glass mode on, **Look** in that panel opens the glass controls. `[-]` and `[+]` change the value for the style on screen, and the window follows at once. **Restore default** puts every glass value back. The same values are stored in `ui.conf`. A pair there is the dark theme, then the light theme.
 
 `TERM` is `xterm-256color`. `TERM_PROGRAM` is `rustty-kitty`, so Codex can see that Kitty graphics are available and draw `/pets` in the session.
 

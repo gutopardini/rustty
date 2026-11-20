@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use nix::errno::Errno;
@@ -367,6 +367,14 @@ struct App {
     exit_confirmed: bool,
     next_agent_scan: Instant,
     ui: Ui,
+    /// `ui.conf` as last read, so a calibration shows up without a restart.
+    glass_stamp: Option<SystemTime>,
+    /// The glass controls inside the appearance panel, and how far that list is scrolled.
+    glass_page: bool,
+    glass_scroll: u16,
+    /// The shortcut map, and how far that list is scrolled.
+    keys_page: bool,
+    keys_scroll: u16,
     desktop: TitlebarPrefs,
     cursor: Option<(f64, f64)>,
     wheel_frac: f32,
@@ -400,7 +408,7 @@ impl App {
         self.rescale(window.scale_factor());
         let mut gpu = Renderer::new(Arc::clone(&window), self.vsync)?;
         gpu.set_clear(color::theme(self.ui.style).bg);
-        gpu.set_glass(self.ui.glass.then_some(self.ui.glass_opacity));
+        gpu.set_glass(self.ui.glass.then_some(self.ui.glass_tune.opacity));
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.ensure_blur();
@@ -570,6 +578,38 @@ impl App {
         }
     }
 
+    /// Picks up glass keys edited in `ui.conf` while the window is open.
+    fn refresh_glass_tune(&mut self) {
+        let stamp = settings::config_stamp();
+        if stamp == self.glass_stamp {
+            return;
+        }
+        self.glass_stamp = stamp;
+        let Some(tune) = settings::read_glass_tune() else { return };
+        if tune.text() == self.ui.glass_tune.text() {
+            return;
+        }
+        let relayout = tune.bar != self.ui.glass_tune.bar || tune.bar_pad != self.ui.glass_tune.bar_pad;
+        let opacity = tune.opacity;
+        self.ui.glass_tune = tune;
+        if !self.ui.glass {
+            return;
+        }
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_glass(Some(opacity));
+        }
+        if relayout {
+            self.fit();
+            for tab in &self.tabs {
+                tab.session.update(|term| term.damage_all());
+            }
+        }
+        self.bar_dirty = true;
+        self.panel_dirty = true;
+        self.confirm_dirty = true;
+        self.redraw();
+    }
+
     fn draw(&mut self) {
         if self.tabs.is_empty() || self.gpu.is_none() {
             return;
@@ -661,6 +701,12 @@ impl App {
             blur.sync(self.ui.glass, size.width, size.height, corner_radius(window), window.scale_factor());
         }
         if self.ui.open {
+            let page = self.glass_page.then_some(settings::GlassPage {
+                tune: self.ui.glass_tune,
+                light: is_light(theme),
+                scroll: self.glass_scroll,
+            });
+            let keys = self.keys_page.then_some(self.keys_scroll);
             self.panel = settings::render_panel(
                 self.grid_cols,
                 self.grid_rows,
@@ -669,6 +715,8 @@ impl App {
                 self.ui.size,
                 self.ui.style,
                 self.ui.glass,
+                page,
+                keys,
             );
             if let Some(panel) = self.panel.as_mut().filter(|_| self.ui.glass) {
                 for cell in &mut panel.cells {
@@ -703,6 +751,7 @@ impl App {
         }
         if self.ui.glass {
             let scale = window.scale_factor();
+            let tune = self.ui.glass_tune;
             let mut shapes = glass_shapes(
                 &self.bar,
                 &self.title_bar,
@@ -712,19 +761,21 @@ impl App {
                 scale,
                 self.settings_hot || self.ui.open,
                 window.is_maximized(),
+                &tune,
             );
             let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
             let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
             if let Some(panel) = &self.panel {
                 // The panel replaces the grid cells it covers, so its sheet goes under the grid.
                 let rect = (panel.origin_col, panel.origin_row, panel.cols, panel.rows);
-                shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, 0.86));
+                shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, tune.sheet, tune.radius));
             }
             let overlay = shapes.len();
             if let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close) {
                 let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
-                shapes.push(sheet(rect, origin, cell, (8.0 * scale) as f32, scale, theme, 0.94));
-                let inset = (2.0 * scale).round() as f32;
+                let pad = (f64::from(tune.dialog_pad) * scale) as f32;
+                shapes.push(sheet(rect, origin, cell, pad, scale, theme, tune.dialog, tune.radius));
+                let inset = (f64::from(tune.button_inset) * scale).round() as f32;
                 for (cols, rows, choice) in dialog.buttons() {
                     let x = origin.0 + f32::from(dialog.origin_col + cols.start) * cell.0 + inset;
                     let y = origin.1 + f32::from(dialog.origin_row + rows.start) * cell.1 + inset;
@@ -732,12 +783,12 @@ impl App {
                     let h = f32::from(rows.end - rows.start) * cell.1 - 2.0 * inset;
                     let button = GlassShape::new(x, y, w, h, GLASS_BUTTON);
                     shapes.push(match choice {
-                        confirm::Choice::Close => button.with_tint(theme.danger, 0.9),
+                        confirm::Choice::Close => button.with_tint(theme.danger, tune.danger),
                         confirm::Choice::Cancel => button,
                     });
                 }
             }
-            gpu.set_glass_shapes(&shapes, overlay, scale as f32, is_light(theme));
+            gpu.set_glass_shapes(&shapes, overlay, scale as f32, is_light(theme), &tune);
         }
         if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(tab_id)) {
             tracing::warn!(%err, "frame");
@@ -779,6 +830,8 @@ impl App {
             return;
         }
         self.ui.open = false;
+        self.glass_page = false;
+        self.keys_page = false;
         self.panel = None;
         self.panel_dirty = false;
         self.bar_dirty = true;
@@ -809,7 +862,7 @@ impl App {
     /// Glass mode on or off. Off draws exactly the opaque window of before.
     fn toggle_glass(&mut self) {
         self.ui.glass = !self.ui.glass;
-        let opacity = self.ui.glass.then_some(self.ui.glass_opacity);
+        let opacity = self.ui.glass.then_some(self.ui.glass_tune.opacity);
         if let Some(gpu) = &mut self.gpu {
             gpu.set_glass(opacity);
             if self.ui.glass && !gpu.supports_glass() {
@@ -899,7 +952,91 @@ impl App {
             PanelHit::NextFont => self.apply_font(1),
             PanelHit::Glass => self.toggle_glass(),
             PanelHit::Style(index) => self.apply_style(index),
+            PanelHit::GlassLook => {
+                self.glass_page = true;
+                self.glass_scroll = 0;
+                self.panel_dirty = true;
+                self.redraw();
+            }
+            PanelHit::GlassBack => {
+                self.glass_page = false;
+                self.panel_dirty = true;
+                self.redraw();
+            }
+            PanelHit::GlassNudge(control, dir) => self.nudge_glass(control, i32::from(dir)),
+            PanelHit::GlassScroll(delta) => self.scroll_glass(delta),
+            PanelHit::Keys => {
+                self.keys_page = true;
+                self.keys_scroll = 0;
+                self.panel_dirty = true;
+                self.redraw();
+            }
+            PanelHit::KeysBack => {
+                self.keys_page = false;
+                self.panel_dirty = true;
+                self.redraw();
+            }
+            PanelHit::KeysScroll(delta) => self.scroll_keys(delta),
+            PanelHit::GlassReset => {
+                let bars = (self.ui.glass_tune.bar, self.ui.glass_tune.bar_pad);
+                self.ui.glass_tune = settings::GlassTune::default();
+                self.apply_glass_tune((self.ui.glass_tune.bar, self.ui.glass_tune.bar_pad) != bars);
+            }
         }
+    }
+
+    fn nudge_glass(&mut self, control: settings::GlassControl, dir: i32) {
+        let light = is_light(self.theme());
+        let bars = (self.ui.glass_tune.bar, self.ui.glass_tune.bar_pad);
+        self.ui.glass_tune.nudge(control, dir, light);
+        self.apply_glass_tune((self.ui.glass_tune.bar, self.ui.glass_tune.bar_pad) != bars);
+    }
+
+    fn apply_glass_tune(&mut self, relayout: bool) {
+        if self.ui.glass {
+            if let Some(gpu) = &mut self.gpu {
+                gpu.set_glass(Some(self.ui.glass_tune.opacity));
+            }
+            if relayout {
+                self.fit();
+                for tab in &self.tabs {
+                    tab.session.update(|term| term.damage_all());
+                }
+            }
+            self.bar_dirty = true;
+        }
+        self.panel_dirty = true;
+        self.ui.save();
+        self.glass_stamp = settings::config_stamp();
+        self.redraw();
+    }
+
+    fn scroll_glass(&mut self, delta: i16) {
+        let max = settings::glass_scroll_max(self.grid_rows);
+        let next = (i32::from(self.glass_scroll) + i32::from(delta)).clamp(0, i32::from(max)) as u16;
+        if next == self.glass_scroll {
+            return;
+        }
+        self.glass_scroll = next;
+        self.panel_dirty = true;
+        self.redraw();
+    }
+
+    fn scroll_keys(&mut self, delta: i16) {
+        let max = settings::keys_scroll_max(self.grid_rows);
+        let next = (i32::from(self.keys_scroll) + i32::from(delta)).clamp(0, i32::from(max)) as u16;
+        if next == self.keys_scroll {
+            return;
+        }
+        self.keys_scroll = next;
+        self.panel_dirty = true;
+        self.redraw();
+    }
+
+    fn wheel_on_panel(&self) -> bool {
+        let Some((x, y)) = self.cursor else { return false };
+        let Some((col, row)) = self.cell_at(x, y) else { return false };
+        self.panel.as_ref().is_some_and(|panel| panel.contains(col, row))
     }
 
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
@@ -916,7 +1053,16 @@ impl App {
             return;
         }
         if self.ui.open && matches!(event.logical_key, Key::Named(winit::keyboard::NamedKey::Escape)) {
-            self.close_settings();
+            if self.keys_page {
+                self.keys_page = false;
+            } else if self.glass_page {
+                self.glass_page = false;
+            } else {
+                self.close_settings();
+                return;
+            }
+            self.panel_dirty = true;
+            self.redraw();
             return;
         }
         if self.selection.is_some() && matches!(event.logical_key, Key::Named(winit::keyboard::NamedKey::Escape)) {
@@ -988,6 +1134,17 @@ impl App {
             return;
         }
         self.wheel_frac -= steps as f32;
+        if self.ui.open && self.wheel_on_panel() {
+            let delta = -(steps.clamp(-32, 32) as i16);
+            if self.keys_page {
+                self.scroll_keys(delta);
+                return;
+            }
+            if self.glass_page {
+                self.scroll_glass(delta);
+                return;
+            }
+        }
         let (col, row, pixel) = self
             .cursor
             .and_then(|(x, y)| {
@@ -1652,7 +1809,7 @@ impl App {
     fn chrome_height(&self) -> u32 {
         let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0);
         if self.ui.glass {
-            glass_bar_height(scale, self.face.cell_h())
+            glass_bar_height(scale, self.face.cell_h(), &self.ui.glass_tune)
         } else {
             bar_height(scale, self.face.cell_h())
         }
@@ -1721,8 +1878,10 @@ fn bar_height(scale: f64, cell_h: u32) -> u32 {
 }
 
 /// Glass bars leave room around the text for the capsule and the pill inside it.
-fn glass_bar_height(scale: f64, cell_h: u32) -> u32 {
-    ((44.0 * scale).ceil() as u32).max(cell_h.max(1) + (20.0 * scale).round() as u32)
+fn glass_bar_height(scale: f64, cell_h: u32, tune: &crate::settings::GlassTune) -> u32 {
+    let bar = (f64::from(tune.bar) * scale).ceil() as u32;
+    let pad = (f64::from(tune.bar_pad) * scale).round() as u32;
+    bar.max(cell_h.max(1).saturating_add(pad))
 }
 
 fn is_light(theme: Theme) -> bool {
@@ -1741,15 +1900,16 @@ fn glass_shapes(
     scale: f64,
     settings_lit: bool,
     maximized: bool,
+    tune: &crate::settings::GlassTune,
 ) -> Vec<GlassShape> {
     let cw = cell_w as f32;
     let scale = scale as f32;
     let chrome = chrome_h as f32;
-    let inset = (4.0 * scale).round();
+    let inset = (tune.inset * scale).round();
     let cap_h = (chrome - 2.0 * inset).max(1.0);
     let bar_y = size.height as f32 - chrome + inset;
     // Clear of the window's round corner, which is 15 logical pixels.
-    let side_margin = (10.0 * scale).round();
+    let side_margin = (tune.margin * scale).round();
     let mut shapes = Vec::with_capacity(8);
     if let (Some(first), Some(last)) = (bar.spans.first(), bar.spans.last()) {
         let x0 = (f32::from(first.start) * cw - 0.6 * cw).max(side_margin);
@@ -1759,7 +1919,7 @@ fn glass_shapes(
         // The pill sits inside the capsule with the same gap on every side, like a
         // segment pressed into the glass.
         if let Some(active) = bar.spans.get(bar.selected) {
-            let gap = (4.0 * scale).round();
+            let gap = (tune.gap * scale).round();
             let left = (f32::from(active.start) * cw + gap).max(x0 + gap);
             let right = (f32::from(active.end) * cw - gap).min(x1 - gap);
             shapes.push(GlassShape::new(left, bar_y + gap, right - left, cap_h - 2.0 * gap, GLASS_PILL));
@@ -1780,7 +1940,7 @@ fn glass_shapes(
         // The mark sits in the middle cell, as titlebar::paint_button places it.
         let mark = f32::from(range.start + (range.end - range.start) / 2);
         let center = (mark + 0.5) * cw;
-        let side = (cap_h - 2.0 * scale).min(f32::from(range.end - range.start) * cw).max(1.0);
+        let side = (cap_h - tune.button_inset * scale).min(f32::from(range.end - range.start) * cw).max(1.0);
         let button = GlassShape::new(center - side * 0.5, (chrome - side) * 0.5, side, side, GLASS_BUTTON);
         shapes.push(match icon {
             Some(icon) => button.with_icon(icon),
@@ -1799,13 +1959,14 @@ fn sheet(
     scale: f64,
     theme: Theme,
     alpha: f32,
+    radius: f32,
 ) -> GlassShape {
     let x = origin.0 + f32::from(rect.0) * cell.0 - pad;
     let y = origin.1 + f32::from(rect.1) * cell.1 - pad;
     let w = f32::from(rect.2) * cell.0 + 2.0 * pad;
     let h = f32::from(rect.3) * cell.1 + 2.0 * pad;
     GlassShape::new(x, y, w, h, GLASS_SHEET)
-        .with_radius((14.0 * scale) as f32)
+        .with_radius((f64::from(radius) * scale) as f32)
         .with_tint(theme.panel, alpha)
 }
 
@@ -2032,6 +2193,7 @@ impl ApplicationHandler<Wake> for App {
         let now = Instant::now();
         if now >= self.next_agent_scan {
             self.refresh_agents();
+            self.refresh_glass_tune();
             self.next_agent_scan = now + Duration::from_secs(1);
         }
         let mut until = self.next_agent_scan;
@@ -2137,6 +2299,11 @@ pub fn run() -> anyhow::Result<()> {
         exit_confirmed: false,
         next_agent_scan: Instant::now(),
         ui,
+        glass_stamp: settings::config_stamp(),
+        glass_page: false,
+        glass_scroll: 0,
+        keys_page: false,
+        keys_scroll: 0,
         desktop: TitlebarPrefs::load(),
         cursor: None,
         wheel_frac: 0.0,
@@ -2160,9 +2327,10 @@ mod tests {
 
     #[test]
     fn glass_bars_are_taller_than_the_text() {
-        assert_eq!(glass_bar_height(1.0, 19), 44);
-        assert_eq!(glass_bar_height(1.0, 30), 50);
-        assert!(glass_bar_height(2.0, 38) >= bar_height(2.0, 38) + 16);
+        let tune = crate::settings::GlassTune::default();
+        assert_eq!(glass_bar_height(1.0, 19, &tune), 44);
+        assert_eq!(glass_bar_height(1.0, 30, &tune), 50);
+        assert!(glass_bar_height(2.0, 38, &tune) >= bar_height(2.0, 38) + 16);
     }
 
     #[test]
@@ -2172,7 +2340,7 @@ mod tests {
         let bar = crate::tabs::render_bar(&titles, &[], 1, 100, theme, true);
         let title = crate::titlebar::render("shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, true);
         let size = PhysicalSize::new(1000, 600);
-        let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, true, false);
+        let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, true, false, &crate::settings::GlassTune::default());
         let kinds: Vec<u32> = shapes.iter().map(|shape| shape.kind).collect();
         assert_eq!(kinds, vec![GLASS_CONTAINER, GLASS_PILL, GLASS_BUTTON, GLASS_BUTTON]);
         let [container, pill, settings, close] = [shapes[0], shapes[1], shapes[2], shapes[3]];
@@ -2207,7 +2375,7 @@ mod tests {
         assert_eq!(buttons.len(), 2);
         assert!(buttons.iter().any(|(_, _, choice)| *choice == crate::confirm::Choice::Close));
         let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
-        let shape = super::sheet(rect, (12.0, 50.0), (10.0, 20.0), 8.0, 1.0, theme, 0.94);
+        let shape = super::sheet(rect, (12.0, 50.0), (10.0, 20.0), 8.0, 1.0, theme, 0.94, 14.0);
         assert_eq!(shape.kind, GLASS_SHEET);
         assert_eq!(shape.rect[0], 12.0 + f32::from(dialog.origin_col) * 10.0 - 8.0);
         assert_eq!(shape.rect[2], f32::from(dialog.cols) * 10.0 + 16.0);

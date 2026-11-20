@@ -4,10 +4,36 @@
 // top, a brighter band along the inside of the edge, and a specular rim lit from below
 // and from the top left.
 
+// Amounts come from ui.conf. Distances are logical pixels. A tone is already chosen
+// for this theme: dark or light.
 struct Look {
     size: vec2<f32>,
     scale: f32,
     light: f32,
+    body_top: f32,
+    body_bottom: f32,
+    lit_boost: f32,
+    shadow: f32,
+    shadow_blur: f32,
+    shadow_y: f32,
+    pill_top: f32,
+    pill_bottom: f32,
+    pill_rim: f32,
+    pill_rim_size: f32,
+    pill_soft: f32,
+    groove: f32,
+    groove_strength: f32,
+    sheet_shadow: f32,
+    sheet_spread: f32,
+    sheet_y: f32,
+    frost_top: f32,
+    frost_bottom: f32,
+    ink: f32,
+    ink_alpha: f32,
+    ink_lit: f32,
+    margin: f32,
+    pad0: f32,
+    pad1: f32,
 }
 
 struct Shape {
@@ -36,7 +62,7 @@ struct VsOut {
 }
 
 fn margin() -> f32 {
-    return 10.0 * look.scale;
+    return look.margin * look.scale;
 }
 
 @vertex
@@ -158,39 +184,39 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         // The selected tab is sunk into the glass: darker than the capsule, shaded at the
         // top where the rim casts on it, and a faint light along its lower edge.
         var tint = select(vec3<f32>(0.0), vec3<f32>(1.0), light);
-        var body_a = select(mix(0.42, 0.26, t), mix(0.62, 0.78, t), light);
-        let soft = clamp(0.5 - d / (1.2 * s), 0.0, 1.0);
+        var body_a = mix(look.pill_top, look.pill_bottom, t);
+        let soft = clamp(0.5 - d / max(look.pill_soft * s, 0.001), 0.0, 1.0);
         var color = vec4<f32>(tint * body_a, body_a) * soft;
-        let inner_top = (1.0 - smoothstep(0.0, 6.0 * s, depth)) * max(-n.y, 0.0) * select(0.30, 0.10, light);
+        let inner_top = (1.0 - smoothstep(0.0, max(look.pill_rim_size * s, 0.001), depth)) * max(-n.y, 0.0) * look.pill_rim;
         color = over(vec4<f32>(0.0, 0.0, 0.0, inner_top * soft), color);
         return color;
     }
 
     if (shape.kind == SHEET) {
         // A dialog: a wide soft shadow and a tinted body, a little clearer toward the bottom.
-        let spread = 16.0 * s;
-        let d_drop = sd_round(p - vec2<f32>(0.0, 6.0 * s), center, half, r);
-        let drop = (1.0 - smoothstep(-0.3 * spread, spread, d_drop)) * select(0.40, 0.18, light);
+        let spread = max(look.sheet_spread * s, 0.001);
+        let d_drop = sd_round(p - vec2<f32>(0.0, look.sheet_y * s), center, half, r);
+        let drop = (1.0 - smoothstep(-0.3 * spread, spread, d_drop)) * look.sheet_shadow;
         var sheet = vec4<f32>(0.0, 0.0, 0.0, drop * (1.0 - cover));
         let body = vec4<f32>(shape.tint.rgb * shape.tint.a, shape.tint.a) * cover;
         sheet = over(body, sheet);
-        let frost = mix(select(0.06, 0.10, light), select(0.015, 0.03, light), t) * cover;
+        let frost = mix(look.frost_top, look.frost_bottom, t) * cover;
         return over(vec4<f32>(frost), sheet);
     }
 
     // Drop shadow under the capsule and the buttons.
-    let blur = 7.0 * s;
-    let d_shadow = sd_round(p - vec2<f32>(0.0, 3.0 * s), center, half, r);
-    let soft_shadow = (1.0 - smoothstep(-0.4 * blur, blur, d_shadow)) * select(0.28, 0.12, light);
+    let blur = max(look.shadow_blur * s, 0.001);
+    let d_shadow = sd_round(p - vec2<f32>(0.0, look.shadow_y * s), center, half, r);
+    let soft_shadow = (1.0 - smoothstep(-0.4 * blur, blur, d_shadow)) * look.shadow;
     var color = vec4<f32>(0.0, 0.0, 0.0, soft_shadow * (1.0 - cover));
 
     // Body: frosted, darker at the top and clearer toward the bottom, as glass lit from below.
-    var body = select(mix(0.035, 0.11, t), mix(0.22, 0.40, t), light);
-    body = body + shape.lit * select(0.06, 0.10, light);
+    var body = mix(look.body_top, look.body_bottom, t);
+    body = body + shape.lit * look.lit_boost;
     color = over(vec4<f32>(body * cover), color);
 
     // Inner shadow under the top rim, so the capsule reads as a groove.
-    let inner_top = (1.0 - smoothstep(0.0, 9.0 * s, depth)) * pow(max(-n.y, 0.0), 1.5) * select(0.26, 0.08, light);
+    let inner_top = (1.0 - smoothstep(0.0, max(look.groove * s, 0.001), depth)) * pow(max(-n.y, 0.0), 1.5) * look.groove_strength;
     color = over(vec4<f32>(0.0, 0.0, 0.0, inner_top * cover), color);
 
     // A tinted button, such as the one that closes the tabs, takes its color under the frost.
@@ -206,8 +232,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
             let side = 2.0 * min(half.x, half.y);
             mark = clamp(0.5 - control_distance(icon, p, center, side), 0.0, 1.0);
         }
-        let ink = select(0.86, 0.22, light) + shape.lit * 0.14;
-        let a = mark * select(0.9, 0.85, light);
+        let ink = look.ink + shape.lit * look.ink_lit;
+        let a = mark * look.ink_alpha;
         color = over(vec4<f32>(vec3<f32>(ink) * a, a), color);
     }
     return color;

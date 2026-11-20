@@ -449,7 +449,7 @@ impl Renderer {
     /// `Some(opacity)` turns the default background into a tint of that opacity.
     /// `None` restores the opaque window.
     pub fn set_glass(&mut self, opacity: Option<f32>) {
-        let opacity = opacity.filter(|_| self.supports_glass()).map(|value| value.clamp(0.2, 1.0));
+        let opacity = opacity.filter(|_| self.supports_glass()).map(|value| value.clamp(0.0, 1.0));
         self.glass = opacity;
         if let Some(frame) = &mut self.frame {
             frame.set_glass(opacity.is_some());
@@ -461,12 +461,19 @@ impl Renderer {
 
     /// Glass capsules, buttons and sheets, in physical pixels. Shapes before `overlay` are
     /// drawn under the bars and the grid. The rest go over the grid, under the dialog text.
-    pub fn set_glass_shapes(&mut self, shapes: &[GlassShape], overlay: usize, scale: f32, light: bool) {
+    pub fn set_glass_shapes(
+        &mut self,
+        shapes: &[GlassShape],
+        overlay: usize,
+        scale: f32,
+        light: bool,
+        tune: &crate::settings::GlassTune,
+    ) {
         if self.glass.is_none() {
             return;
         }
         let layer = self.glass_layer.get_or_insert_with(|| Glass::new(&self.device, self.config.format));
-        layer.set(&self.queue, self.config.width, self.config.height, scale, light, shapes, overlay);
+        layer.set(&self.queue, self.config.width, self.config.height, scale, light, tune, shapes, overlay);
     }
 
     pub(crate) fn upload_dialog(

@@ -2,6 +2,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::settings::GlassTune;
+
 /// The capsule that holds the tabs.
 pub const CONTAINER: u32 = 0;
 /// The selected tab, inside the capsule.
@@ -67,12 +69,69 @@ impl GlassShape {
     }
 }
 
+/// Matches `Look` in `glass.wgsl`. Distances stay in logical pixels; the shader scales them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct Look {
     size: [f32; 2],
     scale: f32,
     light: f32,
+    body_top: f32,
+    body_bottom: f32,
+    lit_boost: f32,
+    shadow: f32,
+    shadow_blur: f32,
+    shadow_y: f32,
+    pill_top: f32,
+    pill_bottom: f32,
+    pill_rim: f32,
+    pill_rim_size: f32,
+    pill_soft: f32,
+    groove: f32,
+    groove_strength: f32,
+    sheet_shadow: f32,
+    sheet_spread: f32,
+    sheet_y: f32,
+    frost_top: f32,
+    frost_bottom: f32,
+    ink: f32,
+    ink_alpha: f32,
+    ink_lit: f32,
+    margin: f32,
+    pad0: f32,
+    pad1: f32,
+}
+
+fn look(width: u32, height: u32, scale: f32, light: bool, tune: &GlassTune) -> Look {
+    Look {
+        size: [width as f32, height as f32],
+        scale: scale.max(0.5),
+        light: if light { 1.0 } else { 0.0 },
+        body_top: tune.body_top.pick(light),
+        body_bottom: tune.body_bottom.pick(light),
+        lit_boost: tune.lit.pick(light),
+        shadow: tune.shadow.pick(light),
+        shadow_blur: tune.shadow_blur,
+        shadow_y: tune.shadow_y,
+        pill_top: tune.pill_top.pick(light),
+        pill_bottom: tune.pill_bottom.pick(light),
+        pill_rim: tune.pill_rim.pick(light),
+        pill_rim_size: tune.pill_rim_size,
+        pill_soft: tune.pill_soft,
+        groove: tune.groove,
+        groove_strength: tune.groove_strength.pick(light),
+        sheet_shadow: tune.sheet_shadow.pick(light),
+        sheet_spread: tune.sheet_spread,
+        sheet_y: tune.sheet_y,
+        frost_top: tune.frost_top.pick(light),
+        frost_bottom: tune.frost_bottom.pick(light),
+        ink: tune.ink.pick(light),
+        ink_alpha: tune.ink_alpha.pick(light),
+        ink_lit: tune.ink_lit,
+        margin: tune.margin,
+        pad0: 0.0,
+        pad1: 0.0,
+    }
 }
 
 pub struct Glass {
@@ -167,12 +226,13 @@ impl Glass {
         height: u32,
         scale: f32,
         light: bool,
+        tune: &GlassTune,
         shapes: &[GlassShape],
         overlay: usize,
     ) {
         let shapes = &shapes[..shapes.len().min(MAX_SHAPES)];
         let overlay = overlay.min(shapes.len());
-        let look = Look { size: [width as f32, height as f32], scale: scale.max(0.5), light: if light { 1.0 } else { 0.0 } };
+        let look = look(width, height, scale, light, tune);
         if self
             .written
             .as_ref()
@@ -226,5 +286,23 @@ mod tests {
         let shape = super::GlassShape::new(0.0, 0.0, 120.0, 30.0, super::CONTAINER);
         assert_eq!(shape.radius, 15.0);
         assert_eq!(std::mem::size_of::<super::GlassShape>(), 48);
+    }
+
+    #[test]
+    fn default_tune_keeps_the_dark_glass_that_was_in_the_shader() {
+        let look = super::look(800, 600, 1.0, false, &crate::settings::GlassTune::default());
+        assert_eq!(std::mem::size_of::<super::Look>() % 16, 0);
+        assert!((look.body_top - 0.035).abs() < 1e-6);
+        assert!((look.body_bottom - 0.11).abs() < 1e-6);
+        assert!((look.shadow - 0.28).abs() < 1e-6);
+        assert!((look.shadow_blur - 7.0).abs() < 1e-6);
+        assert!((look.pill_top - 0.42).abs() < 1e-6);
+        assert!((look.pill_bottom - 0.26).abs() < 1e-6);
+        assert!((look.margin - 10.0).abs() < 1e-6);
+        assert_eq!(look.light, 0.0);
+        let day = super::look(800, 600, 2.0, true, &crate::settings::GlassTune::default());
+        assert!((day.body_top - 0.22).abs() < 1e-6);
+        assert!((day.ink - 0.22).abs() < 1e-6);
+        assert!((day.scale - 2.0).abs() < 1e-6);
     }
 }

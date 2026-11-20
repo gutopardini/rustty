@@ -39,4 +39,4 @@ The lockup uses Red Hat Display Bold as curves. In the grid and in the applicati
 
 The bar is compact and sits at the bottom, leaving room for commands. The active tab connects visually to the terminal background, and its number takes copper. The panel uses a slightly lighter surface. Agent icons share one square box and keep each mark’s proportion. Hierarchy also comes from position, text, and background, not from color alone. Space the native interface in multiples of a cell. Skip glows, textures, and motion that get in the way of reading or slow the terminal down.
 
-Theme choice stays in the appearance panel (`Ctrl+,`) and in `ui.conf`. Rustty is the default when there is no preference yet. An earlier choice such as `noite` or `papel` remains valid.
+Theme choice stays in the appearance panel (`Ctrl+,`) and in `ui.conf`. Rustty is the default when there is no preference yet. The style keys are `night`, `ink`, `paper`, `amber`, and `sea`. A file that still uses the older key for one of those styles opens the same theme.

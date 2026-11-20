@@ -138,11 +138,11 @@ mod tests {
 
     #[test]
     fn title_bar_uses_the_theme_and_keeps_the_buttons_on_the_right() {
-        let noite = crate::color::theme(crate::color::theme_index("noite"));
-        let papel = crate::color::theme(crate::color::theme_index("papel"));
-        let bar = render("Codex subject", Some(Agent::Codex), 80, noite, false, &ButtonLayout::default(), false, false);
-        assert_eq!(bar.cells[0].bg, noite.bar.pack());
-        assert_ne!(bar.cells[0].bg, papel.bar.pack());
+        let night = crate::color::theme(crate::color::theme_index("night"));
+        let paper = crate::color::theme(crate::color::theme_index("paper"));
+        let bar = render("Codex subject", Some(Agent::Codex), 80, night, false, &ButtonLayout::default(), false, false);
+        assert_eq!(bar.cells[0].bg, night.bar.pack());
+        assert_ne!(bar.cells[0].bg, paper.bar.pack());
         assert_eq!(bar.cells[bar.close.start as usize + 1].cp, u32::from('\u{00D7}'));
         assert_eq!(bar.cells[bar.maximize.start as usize + 1].cp, u32::from('\u{25A1}'));
         let start = (80 - "Codex subject".len() - 3) / 2;
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(bar.cells[start + 3].cp, u32::from('C'));
         assert_eq!(hit(&bar, bar.close.start), TitleHit::Close);
         assert_eq!(hit(&bar, 4), TitleHit::Drag);
-        let restored = render("shell", None, 80, noite, true, &ButtonLayout::default(), false, false);
+        let restored = render("shell", None, 80, night, true, &ButtonLayout::default(), false, false);
         assert_eq!(restored.cells[restored.maximize.start as usize + 1].cp, u32::from('\u{29C9}'));
     }
 

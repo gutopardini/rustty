@@ -54,8 +54,8 @@ unsigned char *ft_render(FtFace *face, unsigned long codepoint, unsigned px, int
     if (FT_Set_Pixel_Sizes(ft_face, 0, px)) {
         return NULL;
     }
-    /* Sem o overlap, contornos sobrepostos da Nerd Font (ícones e quadrados
-       pixelados) saem furados. O tamanho pedido preserva a grade de pixels. */
+    /* Without the overlap flag, stacked Nerd Font contours (icons and
+       pixel-grid squares) render with holes. The requested size keeps the pixel grid. */
     if (FT_Load_Char(ft_face, codepoint, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP)) {
         return NULL;
     }

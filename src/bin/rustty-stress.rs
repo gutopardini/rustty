@@ -273,7 +273,7 @@ fn ascii(n: usize) -> Vec<u8> {
 
 fn unicode(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
-    let line = "café — não é ASCII, linha de log\r\n".as_bytes();
+    let line = "café — not ASCII, a log line\r\n".as_bytes();
     while out.len() < n {
         out.extend_from_slice(line);
     }

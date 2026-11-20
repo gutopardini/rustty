@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title">
-  <title id="title">Rustty — prompt e cursor</title>
+  <title id="title">Rustty prompt and cursor</title>
   <defs>
     <linearGradient id="case" x1="72" y1="42" x2="430" y2="470" gradientUnits="userSpaceOnUse">
       <stop stop-color="#303439"/>

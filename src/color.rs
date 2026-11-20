@@ -51,7 +51,7 @@ pub const THEMES: &[Theme] = &[
         danger: DANGER_DARK,
     },
     Theme {
-        id: "noite",
+        id: "night",
         name: "Night",
         fg: DEFAULT_FG,
         bg: DEFAULT_BG,
@@ -64,7 +64,7 @@ pub const THEMES: &[Theme] = &[
         danger: DANGER_DARK,
     },
     Theme {
-        id: "tinta",
+        id: "ink",
         name: "Ink",
         fg: Rgb::new(0xf2, 0xf2, 0xf2),
         bg: Rgb::new(0x0c, 0x0c, 0x0c),
@@ -77,7 +77,7 @@ pub const THEMES: &[Theme] = &[
         danger: DANGER_DARK,
     },
     Theme {
-        id: "papel",
+        id: "paper",
         name: "Paper",
         fg: Rgb::new(0x1c, 0x1e, 0x24),
         bg: Rgb::new(0xf4, 0xf1, 0xea),
@@ -90,7 +90,7 @@ pub const THEMES: &[Theme] = &[
         danger: DANGER_LIGHT,
     },
     Theme {
-        id: "ambar",
+        id: "amber",
         name: "Amber",
         fg: Rgb::new(0xe6, 0xb1, 0x5a),
         bg: Rgb::new(0x14, 0x0e, 0x08),
@@ -103,7 +103,7 @@ pub const THEMES: &[Theme] = &[
         danger: DANGER_DARK,
     },
     Theme {
-        id: "mar",
+        id: "sea",
         name: "Sea",
         fg: Rgb::new(0xc6, 0xe4, 0xe0),
         bg: Rgb::new(0x0c, 0x16, 0x18),
@@ -122,6 +122,14 @@ pub fn theme(index: usize) -> Theme {
 }
 
 pub fn theme_index(id: &str) -> usize {
+    let id = match id {
+        "noite" => "night",
+        "tinta" => "ink",
+        "papel" => "paper",
+        "ambar" => "amber",
+        "mar" => "sea",
+        other => other,
+    };
     THEMES.iter().position(|theme| theme.id == id).unwrap_or(0)
 }
 
@@ -181,8 +189,9 @@ mod tests {
     #[test]
     fn branded_default_keeps_existing_theme_ids() {
         assert_eq!(theme(0).id, "rustty");
-        for id in ["noite", "tinta", "papel", "ambar", "mar"] {
+        for (id, legacy) in [("night", "noite"), ("ink", "tinta"), ("paper", "papel"), ("amber", "ambar"), ("sea", "mar")] {
             assert_eq!(theme(theme_index(id)).id, id);
+            assert_eq!(theme_index(legacy), theme_index(id));
         }
     }
 }

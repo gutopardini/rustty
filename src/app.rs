@@ -674,12 +674,17 @@ impl App {
         if self.bar_dirty {
             let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
             let agents: Vec<Option<Agent>> = self.tabs.iter().map(|tab| tab.agent).collect();
-            let cols = (size.width / self.face.cell_w().max(1)).clamp(1, 1024) as u16;
+            let cell_w = self.face.cell_w().max(1);
+            let cols = (size.width / cell_w).clamp(1, 1024) as u16;
             let one_tab = self.tabs.len() <= 1;
             self.bar = if one_tab {
                 Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 }
             } else {
-                tabs::render_bar(&titles, &agents, active, cols, theme, self.ui.glass)
+                let track = self.ui.glass.then(|| {
+                    let margin = (self.ui.glass_tune.margin * window.scale_factor() as f32).round();
+                    glass_track_cols(cols, size.width, cell_w, margin)
+                });
+                tabs::render_bar_in(&titles, &agents, active, cols, theme, self.ui.glass, track)
             };
             gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar);
             let tab = &self.tabs[active];
@@ -1889,6 +1894,15 @@ fn is_light(theme: Theme) -> bool {
     luma > 128.0
 }
 
+/// Columns under the glass capsule, so the labels split the same interval the pill does.
+fn glass_track_cols(cols: u16, width: u32, cell_w: u32, margin: f32) -> (u16, u16) {
+    let cols = cols.max(1);
+    let cw = cell_w.max(1) as f32;
+    let left = (margin / cw).round().clamp(0.0, f32::from(cols - 1));
+    let right = ((width as f32 - margin) / cw).round().clamp(left + 1.0, f32::from(cols));
+    (left as u16, right as u16)
+}
+
 /// The glass under the bars: a capsule around the tabs with a pill on the selected one,
 /// a round button behind the settings gear, and one behind each window control.
 fn glass_shapes(
@@ -1911,18 +1925,27 @@ fn glass_shapes(
     // Clear of the window's round corner, which is 15 logical pixels.
     let side_margin = (tune.margin * scale).round();
     let mut shapes = Vec::with_capacity(8);
-    if let (Some(first), Some(last)) = (bar.spans.first(), bar.spans.last()) {
-        let x0 = (f32::from(first.start) * cw - 0.6 * cw).max(side_margin);
-        // The same margin on the right as on the left, whatever the cells leave over.
-        let x1 = (size.width as f32 - x0).max(f32::from(last.end) * cw);
-        shapes.push(GlassShape::new(x0, bar_y, x1 - x0, cap_h, GLASS_CONTAINER));
-        // The pill sits inside the capsule with the same gap on every side, like a
-        // segment pressed into the glass.
-        if let Some(active) = bar.spans.get(bar.selected) {
+    if !bar.spans.is_empty() {
+        let x0 = side_margin.min(size.width as f32 * 0.5);
+        let x1 = (size.width as f32 - side_margin).max(x0 + 1.0);
+        let container = GlassShape::new(x0, bar_y, x1 - x0, cap_h, GLASS_CONTAINER);
+        let radius = container.radius;
+        shapes.push(container);
+        // Each tab is an equal slice of the capsule. The pill is that slice inset by
+        // the same gap on every side, so its curve shares a center with the capsule's.
+        let count = bar.spans.len();
+        if let Some(index) = (bar.selected < count).then_some(bar.selected) {
             let gap = (tune.gap * scale).round();
-            let left = (f32::from(active.start) * cw + gap).max(x0 + gap);
-            let right = (f32::from(active.end) * cw - gap).min(x1 - gap);
-            shapes.push(GlassShape::new(left, bar_y + gap, right - left, cap_h - 2.0 * gap, GLASS_PILL));
+            let seg = (x1 - x0) / count as f32;
+            let left = x0 + seg * index as f32 + gap;
+            let right = x0 + seg * (index as f32 + 1.0) - gap;
+            let pill_h = (cap_h - 2.0 * gap).max(1.0);
+            if right - left >= 1.0 {
+                shapes.push(
+                    GlassShape::new(left, bar_y + gap, right - left, pill_h, GLASS_PILL)
+                        .with_radius((radius - gap).max(0.0)),
+                );
+            }
         }
     }
     // The gear and the window buttons share one size and one rule for their center.
@@ -2348,10 +2371,14 @@ mod tests {
         assert_eq!(container.rect[1], 600.0 - 40.0 + 4.0);
         assert_eq!(container.rect[3], 32.0);
         assert_eq!(container.rect[0], 1000.0 - container.rect[0] - container.rect[2]);
-        // The pill covers the second tab and stays inside the capsule.
-        let active = bar.spans[1];
-        assert_eq!(pill.rect[0], f32::from(active.start) * 10.0 + 4.0);
-        assert!(pill.rect[1] > container.rect[1] && pill.rect[1] + pill.rect[3] < container.rect[1] + container.rect[3]);
+        // The pill is the middle third, inset by the same gap the capsule uses on its curve.
+        let gap = 4.0;
+        let seg = container.rect[2] / 3.0;
+        assert!((pill.rect[0] - (container.rect[0] + seg + gap)).abs() < 0.01);
+        assert!((pill.rect[2] - (seg - 2.0 * gap)).abs() < 0.01);
+        assert_eq!(pill.rect[1], container.rect[1] + gap);
+        assert_eq!(pill.rect[3], container.rect[3] - 2.0 * gap);
+        assert!((pill.radius - (container.radius - gap)).abs() < 0.01);
         // The gear is a button like close: same circle, same height, one button apart.
         assert!(settings.lit > 0.0 && settings.icon == crate::gpu::ICON_GEAR && container.icon == 0.0);
         assert_eq!(close.icon, crate::gpu::ICON_CLOSE);
@@ -2363,6 +2390,46 @@ mod tests {
         assert!(close.rect[1] < 40.0 && close.rect[2] == close.rect[3]);
         let mark = f32::from(title.close.start + 1) * 10.0 + 5.0;
         assert!((close.rect[0] + close.rect[2] * 0.5 - mark).abs() < 0.01);
+    }
+
+    #[test]
+    fn glass_end_pills_share_the_capsule_curve() {
+        let theme = crate::color::theme(0);
+        let tune = crate::settings::GlassTune::default();
+        let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let title = crate::titlebar::render(
+            "shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, true,
+        );
+        let size = PhysicalSize::new(1000, 600);
+        let track = super::glass_track_cols(100, size.width, 10, tune.margin);
+        assert_eq!(track, (1, 99));
+        for active in [0usize, 2] {
+            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track));
+            let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, false, false, &tune);
+            let container = shapes[0];
+            let pill = shapes[1];
+            let gap = tune.gap;
+            let edge = if active == 0 {
+                container.rect[0] + gap
+            } else {
+                container.rect[0] + container.rect[2] - gap
+            };
+            let pill_edge = if active == 0 { pill.rect[0] } else { pill.rect[0] + pill.rect[2] };
+            assert!((pill_edge - edge).abs() < 0.01, "{active}");
+            let cap = if active == 0 {
+                container.rect[0] + container.radius
+            } else {
+                container.rect[0] + container.rect[2] - container.radius
+            };
+            let pill_cap = if active == 0 {
+                pill.rect[0] + pill.radius
+            } else {
+                pill.rect[0] + pill.rect[2] - pill.radius
+            };
+            assert!((pill_cap - cap).abs() < 0.01, "{active} capsule {cap} pill {pill_cap}");
+            assert_eq!(bar.spans[active].start, if active == 0 { 1 } else { bar.spans[1].end });
+            assert_eq!(bar.spans.last().expect("tabs").end, 99);
+        }
     }
 
     #[test]

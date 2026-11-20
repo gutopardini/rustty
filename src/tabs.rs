@@ -32,7 +32,7 @@ pub struct Bar {
 
 /// In glass mode every cell keeps the bar color, which the shader makes see-through, and the
 /// tabs carry no shape of their own: the glass capsule and pill are drawn under them.
-/// One cell on each side of the tabs leaves room for the capsule's round ends.
+/// The labels occupy the columns under that capsule.
 pub fn render_bar(
     titles: &[String],
     agents: &[Option<Agent>],
@@ -41,23 +41,48 @@ pub fn render_bar(
     theme: Theme,
     glass: bool,
 ) -> Bar {
+    render_bar_in(titles, agents, active, cols, theme, glass, None)
+}
+
+/// `track` is the column range under the glass capsule. Labels sit in that range,
+/// split the same way the pill splits the capsule.
+pub(crate) fn render_bar_in(
+    titles: &[String],
+    agents: &[Option<Agent>],
+    active: usize,
+    cols: u16,
+    theme: Theme,
+    glass: bool,
+    track: Option<(u16, u16)>,
+) -> Bar {
     let cols = usize::from(cols);
     if titles.is_empty() || cols == 0 {
         return Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 };
     }
     // The settings gear lives in the title bar, next to the window buttons.
-    let usable = cols;
-    let margin = if glass && usable >= 12 { 1 } else { 0 };
-    let tabs_end = usable - margin;
+    let (origin, tabs_end) = if glass {
+        if let Some((start, end)) = track {
+            let start = usize::from(start).min(cols.saturating_sub(1));
+            let end = usize::from(end).clamp(start.saturating_add(1), cols);
+            (start, end)
+        } else if cols >= 12 {
+            // One column on each side when the caller has no pixel track yet.
+            (1, cols - 1)
+        } else {
+            (0, cols)
+        }
+    } else {
+        (0, cols)
+    };
     let mut cells = vec![Cell::blank(theme.muted.pack(), theme.bar.pack()); cols];
     // The strip is split across the tabs. The remainder goes to the first tabs, so the
     // last one always reaches the end of the row.
     let count = titles.len();
-    let room = tabs_end - margin;
+    let room = tabs_end - origin;
     let base = room / count;
     let extra = room % count;
     let mut spans = Vec::with_capacity(count);
-    let mut start = margin;
+    let mut start = origin;
     for (index, title) in titles.iter().enumerate() {
         let width = base + usize::from(index < extra);
         if width == 0 || start >= tabs_end {
@@ -449,5 +474,16 @@ mod tests {
             let right = end - 1 - painted[painted.len() - 1];
             assert!(left.abs_diff(right) <= 2, "{left} {right}");
         }
+    }
+
+    #[test]
+    fn glass_labels_follow_the_capsule_columns() {
+        let theme = crate::color::theme(0);
+        let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let bar = render_bar_in(&titles, &[], 0, 100, theme, true, Some((2, 90)));
+        assert_eq!(bar.spans[0].start, 2);
+        assert_eq!(bar.spans[2].end, 90);
+        assert_eq!(bar.spans[0].end, bar.spans[1].start);
+        assert_eq!(bar.spans[1].end, bar.spans[2].start);
     }
 }

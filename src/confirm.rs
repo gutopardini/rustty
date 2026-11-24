@@ -2,7 +2,8 @@
 
 use std::ops::Range;
 
-use crate::cell::{BOLD, Cell, SPACER, TALL};
+use crate::cell::{BOLD, Cell, REVERSE, SPACER, TALL};
+use crate::tabs;
 use crate::color::Theme;
 
 const MAX_COLS: u16 = 44;
@@ -29,6 +30,8 @@ pub struct Dialog {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Cell>,
+    /// Column, row and width of the title field, relative to the dialog origin.
+    pub field: Option<(u16, u16, u16)>,
     zones: Vec<Zone>,
 }
 
@@ -149,6 +152,7 @@ pub fn render(grid_cols: u16, grid_rows: u16, theme: Theme, tabs: usize) -> Opti
             Cell::blank(theme.fg.pack(), theme.panel.pack());
             usize::from(cols) * usize::from(rows)
         ],
+        field: None,
         zones: Vec::new(),
     };
 
@@ -230,6 +234,53 @@ pub fn render(grid_cols: u16, grid_rows: u16, theme: Theme, tabs: usize) -> Opti
     Some(dialog)
 }
 
+/// The prompt Kitty shows for `set_tab_title`: the current name and a block cursor.
+pub fn render_rename(
+    grid_cols: u16,
+    grid_rows: u16,
+    theme: Theme,
+    draft: &str,
+    cursor: usize,
+    cursor_on: bool,
+) -> Option<Dialog> {
+    let cols = grid_cols.min(MAX_COLS);
+    let rows = 1;
+    if cols < 8 || grid_rows == 0 {
+        return None;
+    }
+    let gutter = if cols >= 20 { 2 } else { 1 };
+    let content = cols - 2 * gutter;
+    let field_row = 0;
+    let mut dialog = Dialog {
+        origin_col: (grid_cols - cols) / 2,
+        origin_row: grid_rows.saturating_sub(rows),
+        cols,
+        rows,
+        cells: vec![
+            Cell::blank(theme.fg.pack(), theme.panel.pack());
+            usize::from(cols) * usize::from(rows)
+        ],
+        field: Some((gutter, field_row, content)),
+        zones: Vec::new(),
+    };
+    let left = usize::from(gutter);
+    let right = usize::from(cols - gutter);
+    let (field, cursor_col) = tabs::field_view(draft, usize::from(content), cursor);
+    paint(&mut dialog.row(field_row)[left..right], &field, theme.fg.pack(), 0);
+    if cursor_on {
+        let at = left + cursor_col;
+        if at < right {
+            let cell = &mut dialog.row(field_row)[at];
+            if cell.cp == 0 {
+                *cell = Cell::blank(theme.fg.pack(), theme.panel.pack());
+                cell.cp = u32::from(' ');
+            }
+            cell.flags |= REVERSE;
+        }
+    }
+    Some(dialog)
+}
+
 fn paint(cells: &mut [Cell], text: &str, fg: u32, flags: u32) {
     for (cell, ch) in cells.iter_mut().zip(text.chars()) {
         cell.cp = ch as u32;
@@ -308,5 +359,20 @@ mod tests {
         let compact = render(16, 2, crate::color::theme(0), 2).unwrap();
         assert_eq!(compact.hit(2, 1), Some(Choice::Cancel));
         assert_eq!(compact.hit(13, 1), Some(Choice::Close));
+    }
+
+    #[test]
+    fn rename_prompt_shows_the_draft_and_a_cursor_above_the_bottom() {
+        let theme = crate::color::theme(0);
+        let dialog = render_rename(80, 24, theme, "shell", 5, true).unwrap();
+        assert_eq!(dialog.rows, 1);
+        assert_eq!(dialog.origin_row, 23);
+        let (col, row, _) = dialog.field.expect("field");
+        let caret = &dialog.cells[usize::from(row) * usize::from(dialog.cols) + usize::from(col) + 5];
+        assert_eq!(caret.cp, u32::from(' '));
+        assert_ne!(caret.flags & REVERSE, 0);
+        let text: String = dialog.cells.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
+        assert!(text.contains("shell"), "{text}");
+        assert!(!text.contains("Tab title"), "{text}");
     }
 }

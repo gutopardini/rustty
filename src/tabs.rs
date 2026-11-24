@@ -6,7 +6,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::Agent;
 use crate::cell::{
-    AGENT_ICON, BOLD, Cell, QUAD, SPACER, TAB, TAB_ACTIVE, TAB_FROM_LEFT_SHIFT, TAB_FROM_RIGHT_SHIFT, WIDE,
+    AGENT_ICON, BOLD, Cell, QUAD, REVERSE, SPACER, TAB, TAB_ACTIVE, TAB_FROM_LEFT_SHIFT, TAB_FROM_RIGHT_SHIFT,
+    WIDE,
 };
 use crate::color::Theme;
 
@@ -15,6 +16,27 @@ pub struct TabSpan {
     pub start: u16,
     pub end: u16,
     pub close: Option<u16>,
+    /// First column of the title text, and how many columns that text may use.
+    pub label_at: u16,
+    pub label_cols: u16,
+}
+
+/// Draft shown in one tab while its label is being typed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LabelEdit<'a> {
+    pub index: usize,
+    pub text: &'a str,
+    pub cursor: usize,
+    pub cursor_on: bool,
+}
+
+const MAX_LABEL_CHARS: usize = 128;
+
+/// The text being typed into a tab label. `cursor` counts characters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LabelDraft {
+    pub text: String,
+    pub cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +63,7 @@ pub fn render_bar(
     theme: Theme,
     glass: bool,
 ) -> Bar {
-    render_bar_in(titles, agents, active, cols, theme, glass, None)
+    render_bar_in(titles, agents, active, cols, theme, glass, None, None, &[])
 }
 
 /// `track` is the column range under the glass capsule. Labels sit in that range,
@@ -54,6 +76,8 @@ pub(crate) fn render_bar_in(
     theme: Theme,
     glass: bool,
     track: Option<(u16, u16)>,
+    edit: Option<LabelEdit<'_>>,
+    custom: &[bool],
 ) -> Bar {
     let cols = usize::from(cols);
     if titles.is_empty() || cols == 0 {
@@ -123,12 +147,19 @@ pub(crate) fn render_bar_in(
         // One breathing cell separates the title from the close button.
         let reserve = if close.is_some() { tail + 2 } else { 0 };
         let label_end = end.saturating_sub(reserve);
+        let editing = edit.as_ref().copied().filter(|item| item.index == index);
+        let custom_label = custom.get(index).copied().unwrap_or(false);
         // On glass the number, icon and title sit in the middle of the segment, as the
         // labels of a segmented control. They move left only when the close mark needs room.
         let lead = if glass {
             let number = (index + 1).to_string().len();
             let fixed = number + 1 + 2 + icon_gap;
-            let (_, title_width) = fit_title(title, label_end.saturating_sub(start + lead + fixed));
+            let room = label_end.saturating_sub(start + lead + fixed);
+            let title_width = match editing {
+                Some(edit) => edited_columns(edit, room),
+                None if custom_label => fit_plain(title, room).1,
+                None => fit_title(title, room).1,
+            };
             let content = fixed + title_width;
             let centered = span.saturating_sub(content) / 2;
             centered.min(label_end.saturating_sub(start + content)).max(lead)
@@ -149,8 +180,20 @@ pub(crate) fn render_bar_in(
                 text_start = (text_start + icon_gap).min(label_end);
             }
         }
-        let (fitted, _) = fit_title(title, label_end.saturating_sub(text_start));
+        let room = label_end.saturating_sub(text_start);
+        let (fitted, cursor_col) = if let Some(edit) = editing {
+            let window = edit_window(edit.text, room, edit.cursor);
+            let cursor_col = edit.cursor_on.then_some(window.cursor_col);
+            (Cow::Owned(window.visible), cursor_col)
+        } else if custom_label {
+            (fit_plain(title, room).0, None)
+        } else {
+            (fit_title(title, room).0, None)
+        };
         paint(&mut cells[text_start..label_end], &fitted, fg, bg, flags);
+        if let Some(cursor_col) = cursor_col {
+            paint_caret(&mut cells[text_start..label_end], cursor_col, fg, bg, flags);
+        }
         let number_at = start + lead;
         if active_tab && number_at < end.saturating_sub(reserve) {
             // The number also marks the active tab when the bar is full.
@@ -175,6 +218,8 @@ pub(crate) fn render_bar_in(
             start: start as u16,
             end: end as u16,
             close,
+            label_at: text_start as u16,
+            label_cols: room as u16,
         });
         start = end;
     }
@@ -215,11 +260,25 @@ pub(crate) fn paint_icon(cells: &mut [Cell], agent: Option<Agent>, fg: u32, bg: 
 }
 
 pub(crate) fn fit_title(title: &str, width: usize) -> (Cow<'_, str>, usize) {
+    fit_text(title, width, true)
+}
+
+/// Like `fit_title`, but keeps a name the user typed, including a leading mark.
+pub(crate) fn fit_plain(title: &str, width: usize) -> (Cow<'_, str>, usize) {
+    fit_text(title, width, false)
+}
+
+fn fit_text(title: &str, width: usize, strip_status: bool) -> (Cow<'_, str>, usize) {
     if width == 0 {
         return (Cow::Borrowed(""), 0);
     }
-    let title = without_status(title);
-    let title = if title.is_empty() { "shell" } else { title };
+    let stripped;
+    let title = if strip_status {
+        stripped = without_status(title);
+        if stripped.is_empty() { "shell" } else { stripped }
+    } else {
+        title
+    };
     // Count the same cells as paint, including when the title has emoji or wide characters.
     let title_width = title.chars().filter_map(UnicodeWidthChar::width).sum();
     if title_width <= width {
@@ -244,6 +303,239 @@ pub(crate) fn fit_title(title: &str, width: usize) -> (Cow<'_, str>, usize) {
 
 /// Drops the activity mark an agent puts before its title, such as Claude's `✳` or a
 /// Braille spinner. The tab already shows the agent's icon, and the mark only pushed the text away from it.
+pub(crate) fn display_title(title: &str) -> &str {
+    let shown = without_status(title);
+    if shown.is_empty() { "shell" } else { shown }
+}
+
+/// `None` clears the custom name so the shell title shows again.
+pub(crate) fn committed_label(draft: &str, shell_title: &str) -> Option<String> {
+    let text = draft.trim();
+    if text.is_empty() || text == display_title(shell_title) {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+impl LabelDraft {
+    pub(crate) fn new(text: String) -> Self {
+        let cursor = text.chars().count();
+        Self { text, cursor }
+    }
+
+    pub(crate) fn insert(&mut self, extra: &str) {
+        let extra: String = extra.chars().filter(|ch| !ch.is_control()).collect();
+        if extra.is_empty() {
+            return;
+        }
+        let mut chars: Vec<char> = self.text.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let room = MAX_LABEL_CHARS.saturating_sub(chars.len());
+        let add: Vec<char> = extra.chars().take(room).collect();
+        let added = add.len();
+        chars.splice(cursor..cursor, add);
+        self.cursor = cursor + added;
+        self.text = chars.into_iter().collect();
+    }
+
+    pub(crate) fn backspace(&mut self, word: bool) {
+        let chars: Vec<char> = self.text.chars().collect();
+        if self.cursor == 0 || chars.is_empty() {
+            return;
+        }
+        let cursor = self.cursor.min(chars.len());
+        let start = if word { word_left(&chars, cursor) } else { cursor - 1 };
+        let mut next = chars;
+        next.drain(start..cursor);
+        self.cursor = start;
+        self.text = next.into_iter().collect();
+    }
+
+    pub(crate) fn delete_forward(&mut self, word: bool) {
+        let chars: Vec<char> = self.text.chars().collect();
+        if self.cursor >= chars.len() {
+            return;
+        }
+        let end = if word { word_right(&chars, self.cursor) } else { self.cursor + 1 };
+        let mut next = chars;
+        next.drain(self.cursor..end);
+        self.text = next.into_iter().collect();
+    }
+
+    pub(crate) fn left(&mut self, word: bool) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        self.cursor = if word { word_left(&chars, cursor) } else { cursor.saturating_sub(1) };
+    }
+
+    pub(crate) fn right(&mut self, word: bool) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        self.cursor = if word { word_right(&chars, cursor) } else { (cursor + 1).min(chars.len()) };
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.cursor = self.text.chars().count();
+    }
+
+    pub(crate) fn click(&mut self, width: usize, col: usize) {
+        self.cursor = edit_cursor_at(&self.text, width, self.cursor, col);
+    }
+}
+
+fn word_left(chars: &[char], cursor: usize) -> usize {
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn word_right(chars: &[char], cursor: usize) -> usize {
+    let mut index = cursor.min(chars.len());
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+struct EditWindow {
+    visible: String,
+    cursor_col: usize,
+    origin: usize,
+    columns: usize,
+}
+
+fn columns_of(text: &str) -> usize {
+    text.chars().map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0)).sum()
+}
+
+fn edited_columns(edit: LabelEdit<'_>, room: usize) -> usize {
+    let window = edit_window(edit.text, room, edit.cursor);
+    let caret = usize::from(window.cursor_col >= window.columns && window.cursor_col < room);
+    window.columns + caret
+}
+
+/// The slice of a label that fits in `width` columns, with the cursor kept on screen.
+fn edit_window(text: &str, width: usize, cursor: usize) -> EditWindow {
+    let chars: Vec<char> = text.chars().collect();
+    let widths: Vec<usize> = chars.iter().map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0)).collect();
+    let cursor = cursor.min(chars.len());
+    if width == 0 {
+        return EditWindow { visible: String::new(), cursor_col: 0, origin: cursor, columns: 0 };
+    }
+    let caret_extra = usize::from(cursor == chars.len());
+    let total = widths.iter().sum::<usize>() + caret_extra;
+    if total <= width {
+        return EditWindow {
+            visible: text.to_string(),
+            cursor_col: widths[..cursor].iter().sum(),
+            origin: 0,
+            columns: total - caret_extra,
+        };
+    }
+    if cursor < chars.len() && widths[cursor] >= width {
+        let visible = chars[cursor].to_string();
+        return EditWindow {
+            visible,
+            cursor_col: 0,
+            origin: cursor,
+            columns: widths[cursor].min(width),
+        };
+    }
+    // One column stays free for a leading ellipsis when the start scrolls away.
+    let budget = width - 1;
+    let mut start = cursor;
+    let mut used = caret_extra;
+    if cursor < chars.len() {
+        used += widths[cursor];
+    }
+    while start > 0 {
+        let next = widths[start - 1];
+        if used + next > budget {
+            break;
+        }
+        used += next;
+        start -= 1;
+    }
+    let mut end = if cursor < chars.len() { cursor + 1 } else { cursor };
+    while end < chars.len() {
+        let next = widths[end];
+        if used + next > budget {
+            break;
+        }
+        used += next;
+        end += 1;
+    }
+    let body: String = chars[start..end].iter().collect();
+    let cursor_col = widths[start..cursor].iter().sum();
+    if start == 0 {
+        EditWindow { columns: columns_of(&body), cursor_col, origin: 0, visible: body }
+    } else {
+        let mut visible = String::from("…");
+        visible.push_str(&body);
+        EditWindow {
+            columns: columns_of(&visible),
+            cursor_col: 1 + cursor_col,
+            origin: start,
+            visible,
+        }
+    }
+}
+
+pub(crate) fn field_view(text: &str, width: usize, cursor: usize) -> (String, usize) {
+    let window = edit_window(text, width, cursor);
+    (window.visible, window.cursor_col)
+}
+
+fn edit_cursor_at(text: &str, width: usize, cursor: usize, col: usize) -> usize {
+    let window = edit_window(text, width, cursor);
+    if width == 0 {
+        return window.origin;
+    }
+    let ellipsis = window.origin > 0 && window.visible.starts_with('…');
+    if ellipsis && col == 0 {
+        return window.origin;
+    }
+    let target = col.saturating_sub(usize::from(ellipsis));
+    let mut used = 0;
+    let mut index = window.origin;
+    for ch in window.visible.chars().skip(usize::from(ellipsis)) {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width == 0 {
+            index += 1;
+            continue;
+        }
+        if target < used + ch_width {
+            return index;
+        }
+        used += ch_width;
+        index += 1;
+    }
+    index
+}
+
+fn paint_caret(cells: &mut [Cell], col: usize, fg: u32, bg: u32, flags: u32) {
+    if col >= cells.len() || cells[col].flags & SPACER != 0 {
+        return;
+    }
+    if cells[col].cp == 0 {
+        cells[col] = Cell { cp: u32::from(' '), fg, bg, flags };
+    }
+    cells[col].flags |= REVERSE;
+}
+
 fn without_status(title: &str) -> &str {
     let title = title.trim_start();
     let mut chars = title.chars();
@@ -480,10 +772,79 @@ mod tests {
     fn glass_labels_follow_the_capsule_columns() {
         let theme = crate::color::theme(0);
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
-        let bar = render_bar_in(&titles, &[], 0, 100, theme, true, Some((2, 90)));
+        let bar = render_bar_in(&titles, &[], 0, 100, theme, true, Some((2, 90)), None, &[]);
         assert_eq!(bar.spans[0].start, 2);
         assert_eq!(bar.spans[2].end, 90);
         assert_eq!(bar.spans[0].end, bar.spans[1].start);
         assert_eq!(bar.spans[1].end, bar.spans[2].start);
+    }
+
+    #[test]
+    fn editing_a_label_paints_the_draft_and_a_block_cursor() {
+        let theme = crate::color::theme(0);
+        let edit = LabelEdit { index: 1, text: "beta", cursor: 4, cursor_on: true };
+        let bar = render_bar_in(
+            &["alpha".into(), "old".into()],
+            &[],
+            1,
+            80,
+            theme,
+            false,
+            None,
+            Some(edit),
+            &[],
+        );
+        let span = bar.spans[1];
+        let text: String = bar.cells[span.label_at as usize..(span.label_at + span.label_cols) as usize]
+            .iter()
+            .filter_map(|cell| char::from_u32(cell.cp))
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(text.starts_with("beta"), "{text}");
+        let caret = bar.cells.iter().find(|cell| cell.flags & REVERSE != 0).expect("caret");
+        assert_eq!(caret.cp, u32::from(' '));
+        let middle = LabelEdit { index: 0, text: "beta", cursor: 1, cursor_on: true };
+        let bar = render_bar_in(&["beta".into(), "old".into()], &[], 0, 80, theme, false, None, Some(middle), &[]);
+        let span = bar.spans[0];
+        let caret = bar.cells[span.label_at as usize..]
+            .iter()
+            .find(|cell| cell.flags & REVERSE != 0)
+            .expect("caret on the letter");
+        assert_eq!(caret.cp, u32::from('e'));
+    }
+
+    #[test]
+    fn a_custom_label_keeps_a_leading_mark() {
+        let theme = crate::color::theme(0);
+        let bar = render_bar_in(&["* notes".into()], &[], 0, 40, theme, false, None, None, &[true]);
+        let text: String = bar.cells.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
+        assert!(text.contains('*'), "{text}");
+    }
+
+    #[test]
+    fn the_editor_keeps_the_cursor_inside_a_narrow_tab() {
+        let window = edit_window("abcdefghijklmnopqrstuvwxyz", 5, 26);
+        assert!(window.visible.starts_with('…'));
+        assert!(window.visible.ends_with("yz"));
+        assert!(window.cursor_col < 5);
+        assert_eq!(edit_cursor_at("abcdef", 20, 6, 0), 0);
+        assert_eq!(edit_cursor_at("abcdef", 20, 6, 3), 3);
+        assert_eq!(edit_cursor_at("abcdef", 20, 6, 6), 6);
+        assert_eq!(edit_cursor_at("abcdef", 20, 6, 9), 6);
+    }
+
+    #[test]
+    fn committing_the_shell_title_clears_the_custom_name() {
+        assert_eq!(committed_label("  build  ", "shell"), Some("build".into()));
+        assert_eq!(committed_label("shell", "shell"), None);
+        assert_eq!(committed_label("   ", "rustty"), None);
+        assert_eq!(committed_label("Problema", "✳ Problema"), None);
+        let mut draft = LabelDraft::new("one two".into());
+        draft.left(true);
+        assert_eq!(draft.cursor, 4);
+        draft.backspace(true);
+        assert_eq!(draft.text, "two");
+        draft.insert("\nab");
+        assert_eq!(draft.text, "abtwo");
     }
 }

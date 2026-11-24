@@ -94,7 +94,7 @@ pub fn render(
     // The subject is centered on the window and moves aside only when a button is in the way.
     let room = right_start - left_end;
     let prefix = if room >= 6 { 3 } else { 0 };
-    let (label, label_width) = tabs::fit_title(title, room - prefix);
+    let (label, label_width) = tabs::fit_plain(title, room - prefix);
     let width = prefix + label_width;
     let start = ((cols - width) / 2).clamp(left_end, right_start - width);
     if prefix > 0 {

@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
@@ -291,8 +291,18 @@ fn pty_loop(
 struct Tab {
     id: u64,
     title: String,
+    /// Name typed on the tab. The shell title stays in `title` and comes back when this is cleared.
+    label: Option<String>,
     agent: Option<Agent>,
     session: Session,
+}
+
+fn visible_title(tab: &Tab) -> String {
+    if let Some(label) = &tab.label {
+        label.clone()
+    } else {
+        tabs::display_title(&tab.title).to_string()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -301,6 +311,14 @@ struct TabDrag {
     origin_x: f64,
     armed: bool,
 }
+
+struct TabLabelEdit {
+    index: usize,
+    draft: tabs::LabelDraft,
+}
+
+/// Pause between blinks of the caret in a tab label.
+const LABEL_BLINK: Duration = Duration::from_millis(530);
 
 /// A cell as `(col, absolute line)`. The line survives scrolling, so a selection stays on its text.
 type Point = (u16, u64);
@@ -381,6 +399,11 @@ struct App {
     scroll_drag: bool,
     /// Tab being reordered. `armed` is set once the pointer has moved enough to count as a drag.
     tab_drag: Option<TabDrag>,
+    /// Label opened by a double-click on its tab.
+    tab_edit: Option<TabLabelEdit>,
+    last_tab_click: Option<(Instant, usize)>,
+    label_blink_on: bool,
+    label_blink_at: Option<Instant>,
 }
 
 impl App {
@@ -496,6 +519,7 @@ impl App {
         self.tabs.push(Tab {
             id,
             title: "shell".into(),
+            label: None,
             agent: None,
             session,
         });
@@ -524,15 +548,21 @@ impl App {
             self.tabs[index].title = title;
         }
         self.bar_dirty = true;
-        if let Some(window) = &self.window {
-            window.set_title(&self.tabs[index].title);
-        }
+        self.sync_window_title();
         self.redraw();
     }
 
     fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
+        }
+        if self.tab_edit.as_ref().is_some_and(|edit| edit.index == index) {
+            self.tab_edit = None;
+            self.label_blink_at = None;
+        } else if let Some(edit) = &mut self.tab_edit {
+            if edit.index > index {
+                edit.index -= 1;
+            }
         }
         self.tabs.remove(index);
         self.confirm_dirty |= self.confirm_close;
@@ -547,6 +577,7 @@ impl App {
         }
         if self.tabs.len() == 1 {
             // The tab bar goes away and gives its rows back to the grid.
+            self.commit_label_edit();
             self.fit();
         }
         let active = self.active;
@@ -632,8 +663,8 @@ impl App {
             if snap.title_changed && snap.title != self.tabs[active].title && !snap.title.is_empty() {
                 self.tabs[active].title = snap.title.clone();
                 self.bar_dirty = true;
-                if let Some(window) = &self.window {
-                    window.set_title(&snap.title);
+                if self.tabs[active].label.is_none() && self.tab_edit.is_none() {
+                    self.sync_window_title();
                 }
             }
         }
@@ -672,8 +703,16 @@ impl App {
             );
         }
         if self.bar_dirty {
-            let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
+            let titles: Vec<String> = self
+                .tabs
+                .iter()
+                .map(|tab| tab.label.clone().unwrap_or_else(|| tab.title.clone()))
+                .collect();
+            let custom: Vec<bool> = self.tabs.iter().map(|tab| tab.label.is_some()).collect();
             let agents: Vec<Option<Agent>> = self.tabs.iter().map(|tab| tab.agent).collect();
+            let edited = self.tab_edit.as_ref().map(|edit| {
+                (edit.index, edit.draft.text.clone(), edit.draft.cursor, self.label_blink_on)
+            });
             let cell_w = self.face.cell_w().max(1);
             let cols = (size.width / cell_w).clamp(1, 1024) as u16;
             let one_tab = self.tabs.len() <= 1;
@@ -684,12 +723,23 @@ impl App {
                     let margin = (self.ui.glass_tune.margin * window.scale_factor() as f32).round();
                     glass_track_cols(cols, size.width, cell_w, margin)
                 });
-                tabs::render_bar_in(&titles, &agents, active, cols, theme, self.ui.glass, track)
+                let edit = edited.as_ref().map(|(index, text, cursor, on)| tabs::LabelEdit {
+                    index: *index,
+                    text,
+                    cursor: *cursor,
+                    cursor_on: *on,
+                });
+                tabs::render_bar_in(&titles, &agents, active, cols, theme, self.ui.glass, track, edit, &custom)
             };
             gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar);
+            let caption = if let Some((_, text, _, _)) = edited.as_ref().filter(|(index, ..)| *index == active) {
+                text.clone()
+            } else {
+                visible_title(&self.tabs[active])
+            };
             let tab = &self.tabs[active];
             self.title_bar = titlebar::render(
-                &tab.title,
+                &caption,
                 tab.agent,
                 cols,
                 theme,
@@ -742,9 +792,18 @@ impl App {
         } else {
             self.panel = None;
         }
-        if draw_confirm {
+        if draw_confirm || self.tab_edit.is_some() {
             self.close_dialog = if self.confirm_close {
                 confirm::render(self.grid_cols, self.grid_rows, theme, self.tabs.len())
+            } else if let Some(edit) = &self.tab_edit {
+                confirm::render_rename(
+                    self.grid_cols,
+                    self.grid_rows,
+                    theme,
+                    &edit.draft.text,
+                    edit.draft.cursor,
+                    self.label_blink_on,
+                )
             } else {
                 None
             };
@@ -776,7 +835,8 @@ impl App {
                 shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, tune.sheet, tune.radius));
             }
             let overlay = shapes.len();
-            if let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close) {
+            if let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close || self.tab_edit.is_some())
+            {
                 let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
                 let pad = (f64::from(tune.dialog_pad) * scale) as f32;
                 shapes.push(sheet(rect, origin, cell, pad, scale, theme, tune.dialog, tune.radius));
@@ -1048,6 +1108,10 @@ impl App {
         if self.tabs.is_empty() || event.state == ElementState::Released {
             return;
         }
+        if self.tab_edit.is_some() {
+            self.on_label_key(event);
+            return;
+        }
         self.pending_link = None;
         if self.confirm_close {
             match event.logical_key {
@@ -1072,6 +1136,14 @@ impl App {
         }
         if self.selection.is_some() && matches!(event.logical_key, Key::Named(winit::keyboard::NamedKey::Escape)) {
             self.clear_selection();
+            return;
+        }
+        if self.mods.control_key()
+            && self.mods.alt_key()
+            && self.mods.shift_key()
+            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyW))
+        {
+            self.start_label_edit(self.active.min(self.tabs.len() - 1));
             return;
         }
         let plain = event.key_without_modifiers();
@@ -1118,6 +1190,7 @@ impl App {
                 self.focus_tab(next);
             }
             Some(Input::GotoTab(index)) => self.focus_tab(index),
+            Some(Input::RenameTab) => self.start_label_edit(active),
             None => {}
         }
     }
@@ -1207,8 +1280,8 @@ impl App {
         true
     }
 
-    fn begin_tab_drag(&mut self) -> bool {
-        if self.ui.open || self.tabs.len() < 2 {
+    fn on_bar_press(&mut self) -> bool {
+        if self.tabs.len() < 2 {
             return false;
         }
         let Some((x, y)) = self.cursor else {
@@ -1218,12 +1291,190 @@ impl App {
             return false;
         }
         let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
-        let Some(BarHit::Select(index)) = tabs::hit(&self.bar, col) else {
+        let Some(hit) = tabs::hit(&self.bar, col) else {
             return false;
         };
+        let BarHit::Select(index) = hit else {
+            self.last_tab_click = None;
+            return false;
+        };
+        if self.note_tab_click(index) {
+            self.focus_tab(index);
+            self.start_label_edit(index);
+            return true;
+        }
+        if self.ui.open {
+            return false;
+        }
         self.focus_tab(index);
         self.tab_drag = Some(TabDrag { index, origin_x: x, armed: false });
         true
+    }
+
+    fn note_tab_click(&mut self, index: usize) -> bool {
+        let now = Instant::now();
+        let double = self.last_tab_click.is_some_and(|(at, previous)| {
+            previous == index && now.saturating_duration_since(at) < self.desktop.double_click_time
+        });
+        if double {
+            self.last_tab_click = None;
+        } else {
+            self.last_tab_click = Some((now, index));
+        }
+        double
+    }
+
+    fn start_label_edit(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        let text = visible_title(tab);
+        self.tab_drag = None;
+        self.tab_edit = Some(TabLabelEdit { index, draft: tabs::LabelDraft::new(text) });
+        self.confirm_dirty = true;
+        self.poke_label_cursor();
+    }
+
+    fn hovering_label_edit(&self, x: f64, y: f64) -> bool {
+        let Some(edit) = &self.tab_edit else { return false };
+        if !self.is_bar_y(y) {
+            return false;
+        }
+        let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
+        matches!(tabs::hit(&self.bar, col), Some(BarHit::Select(index)) if index == edit.index)
+    }
+
+    fn rename_click(&mut self) -> bool {
+        let Some((x, y)) = self.cursor else { return false };
+        let geometry = self.close_dialog.as_ref().map(|dialog| {
+            (dialog.field, dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows)
+        });
+        let Some((field, origin_col, origin_row, cols, rows)) = geometry else { return false };
+        if self.is_title_y(y) || self.is_bar_y(y) {
+            return false;
+        }
+        let Some((col, row)) = self.cell_at(x, y) else { return false };
+        let Some(local_col) = col.checked_sub(origin_col) else { return false };
+        let Some(local_row) = row.checked_sub(origin_row) else { return false };
+        if local_col >= cols || local_row >= rows {
+            return false;
+        }
+        if let Some((field_col, field_row, field_cols)) = field {
+            if local_row == field_row && (field_col..field_col + field_cols).contains(&local_col) {
+                let offset = usize::from(local_col - field_col);
+                let width = usize::from(field_cols);
+                if let Some(edit) = &mut self.tab_edit {
+                    edit.draft.click(width, offset);
+                }
+                self.poke_label_cursor();
+            }
+        }
+        true
+    }
+
+    fn place_label_cursor(&mut self) -> bool {
+        let Some(edit) = &self.tab_edit else { return false };
+        let index = edit.index;
+        let Some((x, y)) = self.cursor else { return false };
+        if !self.is_bar_y(y) {
+            return false;
+        }
+        let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
+        if !matches!(tabs::hit(&self.bar, col), Some(BarHit::Select(hit)) if hit == index) {
+            return false;
+        }
+        let Some(span) = self.bar.spans.get(index) else { return false };
+        let width = usize::from(span.label_cols);
+        let offset = usize::from(col.saturating_sub(span.label_at)).min(width);
+        if let Some(edit) = &mut self.tab_edit {
+            edit.draft.click(width, offset);
+        }
+        self.poke_label_cursor();
+        true
+    }
+
+    fn on_label_key(&mut self, event: &winit::event::KeyEvent) {
+        let ctrl = self.mods.control_key();
+        let word = ctrl || self.mods.alt_key();
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_label_edit();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.commit_label_edit();
+                return;
+            }
+            Key::Named(NamedKey::Backspace) => self.edit_draft(|draft| draft.backspace(word)),
+            Key::Named(NamedKey::Delete) => self.edit_draft(|draft| draft.delete_forward(word)),
+            Key::Named(NamedKey::ArrowLeft) => self.edit_draft(|draft| draft.left(word)),
+            Key::Named(NamedKey::ArrowRight) => self.edit_draft(|draft| draft.right(word)),
+            Key::Named(NamedKey::Home) => self.edit_draft(tabs::LabelDraft::home),
+            Key::Named(NamedKey::End) => self.edit_draft(tabs::LabelDraft::end),
+            _ if self.mods.super_key() => return,
+            _ if label_paste(event, self.mods) => {
+                self.paste_label();
+                return;
+            }
+            _ if ctrl => return,
+            _ => {
+                let Some(text) = event.text.as_deref() else { return };
+                let text = text.to_string();
+                self.edit_draft(|draft| draft.insert(&text));
+            }
+        }
+        self.poke_label_cursor();
+    }
+
+    fn edit_draft(&mut self, edit: impl FnOnce(&mut tabs::LabelDraft)) {
+        if let Some(label) = &mut self.tab_edit {
+            edit(&mut label.draft);
+        }
+    }
+
+    fn paste_label(&mut self) {
+        let Some(text) = self.clipboard.get(false) else { return };
+        self.edit_draft(|draft| draft.insert(&text));
+        self.poke_label_cursor();
+    }
+
+    fn commit_label_edit(&mut self) {
+        let Some(edit) = self.tab_edit.take() else { return };
+        if let Some(tab) = self.tabs.get_mut(edit.index) {
+            tab.label = tabs::committed_label(&edit.draft.text, &tab.title);
+        }
+        self.finish_label_edit();
+    }
+
+    fn cancel_label_edit(&mut self) {
+        if self.tab_edit.take().is_some() {
+            self.finish_label_edit();
+        }
+    }
+
+    fn finish_label_edit(&mut self) {
+        self.label_blink_at = None;
+        self.confirm_dirty = true;
+        if self.hover_icon == CursorIcon::Text {
+            self.hover_icon = CursorIcon::Default;
+            if let Some(window) = &self.window {
+                window.set_cursor(CursorIcon::Default);
+            }
+        }
+        self.bar_dirty = true;
+        self.sync_window_title();
+        self.redraw();
+    }
+
+    fn poke_label_cursor(&mut self) {
+        self.label_blink_on = true;
+        self.label_blink_at = Some(Instant::now() + LABEL_BLINK);
+        self.bar_dirty = true;
+        self.redraw();
+    }
+
+    fn sync_window_title(&self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(window) = &self.window else { return };
+        window.set_title(tab.label.as_deref().unwrap_or(&tab.title));
     }
 
     fn drag_tab(&mut self, x: f64) {
@@ -1251,6 +1502,20 @@ impl App {
         }
     }
 
+    fn retarget_label_edit(&mut self, from: usize, to: usize) {
+        let Some(edit) = &mut self.tab_edit else { return };
+        let index = edit.index;
+        edit.index = if index == from {
+            to
+        } else if from < index && index <= to {
+            index - 1
+        } else if to <= index && index < from {
+            index + 1
+        } else {
+            index
+        };
+    }
+
     fn tab_drop_index(&self, x: f64) -> Option<usize> {
         let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
         tabs::drop_index(&self.bar, col)
@@ -1266,6 +1531,8 @@ impl App {
         if let Some(drag) = &mut self.tab_drag {
             drag.index = to;
         }
+        self.retarget_label_edit(from, to);
+        self.last_tab_click = None;
         for (index, tab) in self.tabs.iter().enumerate() {
             tab.session.visible.store(index == to, Ordering::Relaxed);
         }
@@ -1471,7 +1738,10 @@ impl App {
             self.on_click();
             return;
         }
-        if self.try_scroll_drag() || self.begin_tab_drag() || self.begin_selection() {
+        if self.tab_edit.is_some() && !self.rename_click() && !self.place_label_cursor() {
+            self.cancel_label_edit();
+        }
+        if self.try_scroll_drag() || self.on_bar_press() || self.begin_selection() {
             return;
         }
         self.on_click();
@@ -1997,6 +2267,16 @@ fn bar_contains_y(height: u32, bar_h: u32, y: f64) -> bool {
     y >= f64::from(height.saturating_sub(bar_h)) && y < f64::from(height)
 }
 
+fn label_paste(event: &winit::event::KeyEvent, mods: ModifiersState) -> bool {
+    if matches!(event.logical_key, Key::Named(NamedKey::Insert)) && mods.shift_key() {
+        return true;
+    }
+    if !mods.control_key() {
+        return false;
+    }
+    matches!(event.key_without_modifiers().as_ref(), Key::Character(value) if value.eq_ignore_ascii_case("v"))
+}
+
 fn strip_col(x: f64, cell_w: u32, cols: usize) -> u16 {
     ((x / f64::from(cell_w)) as usize).min(cols.saturating_sub(1)) as u16
 }
@@ -2151,9 +2431,13 @@ impl ApplicationHandler<Wake> for App {
                         self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_TICK);
                     }
                 }
-                if self.tab_drag.is_none() && cell != self.link_cell {
+                let on_label = self.tab_drag.is_none() && self.hovering_label_edit(position.x, position.y);
+                let label_cursor = on_label || (self.tab_edit.is_some() && cell.is_none() && self.hover_icon == CursorIcon::Text);
+                if self.tab_drag.is_none() && (cell != self.link_cell || label_cursor) {
                     self.link_cell = cell;
-                    let icon = if cell.is_some() && self.link_at(position.x, position.y).is_some() {
+                    let icon = if on_label {
+                        CursorIcon::Text
+                    } else if cell.is_some() && self.link_at(position.x, position.y).is_some() {
                         CursorIcon::Pointer
                     } else if cell.is_some() {
                         CursorIcon::Text
@@ -2230,6 +2514,22 @@ impl ApplicationHandler<Wake> for App {
             self.autoscroll_at = at;
             if let Some(at) = at {
                 until = until.min(at);
+            }
+        }
+        if self.tab_edit.is_some() {
+            match self.label_blink_at {
+                Some(at) if now >= at => {
+                    self.label_blink_on = !self.label_blink_on;
+                    self.label_blink_at = Some(now + LABEL_BLINK);
+                    self.bar_dirty = true;
+                    self.redraw();
+                    until = until.min(now + LABEL_BLINK);
+                }
+                Some(at) => until = until.min(at),
+                None => {
+                    self.label_blink_at = Some(now + LABEL_BLINK);
+                    until = until.min(now + LABEL_BLINK);
+                }
             }
         }
         if let Some((at, url)) = self.pending_link.clone() {
@@ -2332,6 +2632,10 @@ pub fn run() -> anyhow::Result<()> {
         wheel_frac: 0.0,
         scroll_drag: false,
         tab_drag: None,
+        tab_edit: None,
+        last_tab_click: None,
+        label_blink_on: true,
+        label_blink_at: None,
     };
     app.open_tab().context("opening the pty")?;
     event_loop.run_app(&mut app).context("window loop")?;
@@ -2404,7 +2708,7 @@ mod tests {
         let track = super::glass_track_cols(100, size.width, 10, tune.margin);
         assert_eq!(track, (1, 99));
         for active in [0usize, 2] {
-            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track));
+            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track), None, &[]);
             let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, false, false, &tune);
             let container = shapes[0];
             let pill = shapes[1];

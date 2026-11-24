@@ -14,6 +14,8 @@ pub enum Input {
     GotoTab(usize),
     Copy,
     Paste,
+    /// Kitty's set-tab-title: `ctrl+alt+shift+w`.
+    RenameTab,
 }
 
 pub fn encode(event: &KeyEvent, mods: ModifiersState, app_cursor: bool, rows: u16) -> Option<Input> {
@@ -56,6 +58,10 @@ pub fn encode_parts(
         }
     }
 
+    if ctrl && alt && shift && is_rename_key(plain, logical) {
+        return Some(Input::RenameTab);
+    }
+
     if ctrl && !alt {
         if shift {
             if let Some(ch) = key_char(plain).or_else(|| key_char(logical)) {
@@ -93,6 +99,12 @@ pub fn encode_parts(
         return None;
     }
     Some(Input::Bytes(prefix_alt(bytes, alt)))
+}
+
+fn is_rename_key(plain: &Key, logical: &Key) -> bool {
+    key_char(plain)
+        .or_else(|| key_char(logical))
+        .is_some_and(|ch| ch.eq_ignore_ascii_case(&'w'))
 }
 
 fn tab_action(logical: &Key, plain: &Key, shift: bool) -> Option<Input> {
@@ -404,6 +416,18 @@ mod tests {
         let key = Key::Character("T".into());
         let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert!(matches!(press(key, Some("T"), None, mods), Some(Input::NewTab)));
+    }
+
+    #[test]
+    fn ctrl_alt_shift_w_renames_the_tab() {
+        let key = Key::Character("W".into());
+        let mods = ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SHIFT;
+        assert!(matches!(press(key, None, None, mods), Some(Input::RenameTab)));
+        let close = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(matches!(
+            press(Key::Character("W".into()), None, None, close),
+            Some(Input::CloseTab)
+        ));
     }
 
     #[test]

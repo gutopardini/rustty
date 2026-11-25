@@ -4,7 +4,7 @@
 
 A performance-focused CLI for LLMs. Written in Rust, drawn on the GPU, with the NPU on the roadmap.
 
-<img src="docs/rustty-glass.png" alt="Rustty in Glass mode" width="820">
+<img src="docs/rustty-glass.png?v=2" alt="Rustty in Glass mode" width="820">
 
 </div>
 
@@ -22,7 +22,7 @@ The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. 
 
 <div align="center">
 
-<img src="docs/rustty-appearance.png" alt="Appearance panel with Glass mode on and the Ink style" width="820">
+<img src="docs/rustty-appearance.png?v=2" alt="Appearance panel with Glass mode on and the Ink style" width="820">
 
 </div>
 
@@ -38,7 +38,7 @@ The window is a grid of cells, not a texture of the whole frame. A dirty row is 
 
 <div align="center">
 
-<img src="docs/rustty-agents.png" alt="Tabs for a shell, Claude, and Cursor Agent" width="820">
+<img src="docs/rustty-agents.png?v=2" alt="Tabs for Claude, Codex, Antigravity, and Cursor Agent" width="820">
 
 </div>
 
@@ -118,7 +118,7 @@ The close button on the title bar asks before it closes the window when more tha
 
 <div align="center">
 
-<img src="docs/rustty-close.png" alt="Confirmation before closing three open tabs" width="820">
+<img src="docs/rustty-close.png?v=2" alt="Confirmation before closing three open tabs" width="820">
 
 </div>
 

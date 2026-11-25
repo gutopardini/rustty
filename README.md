@@ -48,6 +48,12 @@ While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab 
 
 Next to the settings gear sits a colored three-layer icon (`Ctrl+Shift+L`). Its color reflects the lowest remaining quota at a glance — cyan/lavender when healthy, amber below 45%, coral below 20% — without opening the popover. Clicking it opens a floating overlay directly below the top bar, rendered on the GPU above the grid: frosted glass with an iridescent rim in Glass mode, or a flat elevated card matching the active theme when Glass mode is off.
 
+<div align="center">
+
+<img src="docs/rustty-limits.png" alt="AI Limits popover in Glass mode showing Claude, Codex, Gemini, and Cursor quotas" width="820">
+
+</div>
+
 Each row shows the agent's icon and a bar tinted with that icon's dominant palette color. Providers with two rolling windows combine them into a single row: the weekly (`7d`) limit on the main bar and the five-hour (`5h`) limit on a thin bar underneath. Click a row to inspect both values, click `↻` (or press `R`) to refresh, or press `Esc` to close. The addon can be turned off in **Appearance** (`limits=off` in `ui.conf`).
 
 Collection stays off the render path and does not poll in the background:

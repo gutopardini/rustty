@@ -40,7 +40,7 @@ struct DialogLayer {
 }
 
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -163,6 +163,52 @@ impl Renderer {
         };
         surface.configure(&device, &config);
         tracing::info!(alpha = ?config.alpha_mode, "surface");
+        Self::build(Some(surface), device, queue, config)
+    }
+
+    /// Headless Vulkan renderer targeting an offscreen `Rgba8Unorm` texture (for automated docs screenshots).
+    pub fn new_offscreen(width: u32, height: u32) -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .context("no Vulkan adapter")?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rustty-offscreen"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .context("opening the Vulkan device")?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+        };
+        Self::build(None, device, queue, config)
+    }
+
+    fn build(
+        surface: Option<wgpu::Surface<'static>>,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: wgpu::SurfaceConfiguration,
+    ) -> anyhow::Result<Self> {
+        let format = config.format;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rustty-cells"),
@@ -498,7 +544,7 @@ impl Renderer {
         layer.set(&self.queue, self.config.width, self.config.height, scale, light, tune, shapes, overlay);
     }
 
-    pub(crate) fn upload_dialog(
+    pub fn upload_dialog(
         &mut self,
         atlas: &mut Atlas,
         face: &Face,
@@ -520,7 +566,7 @@ impl Renderer {
         );
     }
 
-    pub(crate) fn upload_popover(
+    pub fn upload_popover(
         &mut self,
         atlas: &mut Atlas,
         face: &Face,
@@ -698,7 +744,9 @@ impl Renderer {
         }
         self.config.width = size.width;
         self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
     }
 
     /// `lo` is inclusive and `hi` is exclusive. `(0, 0)` clears the highlight.
@@ -791,11 +839,14 @@ impl Renderer {
         if count == 0 {
             return Ok(());
         }
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = &self.surface else {
+            anyhow::bail!("offscreen renderer has no surface");
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Validation => {
@@ -803,70 +854,159 @@ impl Renderer {
             }
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        if let Some(corners) = &mut self.frame {
-            corners.prepare(&self.queue, self.config.width, self.config.height);
+        let cmd = self.encode_pass(&view, count, show_terminal_overlays);
+        self.queue.submit([cmd]);
+        self.queue.present(frame);
+        Ok(())
+    }
+
+    /// Renders the current frame offscreen and reads back premultiplied RGBA8 pixels.
+    pub fn render_to_rgba(&mut self, show_terminal_overlays: bool) -> anyhow::Result<Vec<u8>> {
+        let count = u32::from(self.cols) * u32::from(self.rows);
+        let width = self.config.width;
+        let height = self.config.height;
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-target"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rustty-offscreen"),
+        });
+        self.record_pass(&mut encoder, &view, count, show_terminal_overlays);
+
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let unpadded = width * 4;
+        let padded = unpadded.div_ceil(align) * align;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen-readback"),
+            size: u64::from(padded) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(5)),
+        });
+        rx.recv().context("waiting for readback")??;
+
+        let mapped = slice.get_mapped_range()?;
+        let mut out = Vec::with_capacity((unpadded * height) as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            out.extend_from_slice(&mapped[start..start + unpadded as usize]);
         }
+        drop(mapped);
+        staging.unmap();
+        Ok(out)
+    }
+
+    fn encode_pass(
+        &mut self,
+        view: &wgpu::TextureView,
+        count: u32,
+        show_terminal_overlays: bool,
+    ) -> wgpu::CommandBuffer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rustty"),
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cells"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color(self.clear, self.glass)),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if let Some(glass) = self.glass_layer.as_ref() {
-                glass.draw(&mut pass);
+        self.record_pass(&mut encoder, view, count, show_terminal_overlays);
+        encoder.finish()
+    }
+
+    fn record_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        count: u32,
+        show_terminal_overlays: bool,
+    ) {
+        if let Some(corners) = &mut self.frame {
+            corners.prepare(&self.queue, self.config.width, self.config.height);
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cells"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color(self.clear, self.glass)),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(glass) = self.glass_layer.as_ref() {
+            glass.draw(&mut pass);
+        }
+        pass.set_pipeline(&self.pipeline);
+        if self.title_count > 0 {
+            pass.set_bind_group(0, &self.title_bind, &[]);
+            pass.draw(0..6, 0..self.title_count + 1);
+        }
+        if self.bar_count > 0 {
+            pass.set_bind_group(0, &self.bar_bind, &[]);
+            pass.draw(0..6, 0..self.bar_count + 1);
+        }
+        if count > 0 {
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.draw(0..6, 0..count);
+        }
+        if show_terminal_overlays {
+            if let Some(images) = &self.images {
+                images.draw(&mut pass);
             }
-            pass.set_pipeline(&self.pipeline);
-            if self.title_count > 0 {
-                pass.set_bind_group(0, &self.title_bind, &[]);
-                pass.draw(0..6, 0..self.title_count + 1);
-            }
-            if self.bar_count > 0 {
-                pass.set_bind_group(0, &self.bar_bind, &[]);
-                pass.draw(0..6, 0..self.bar_count + 1);
-            }
-            if count > 0 {
-                pass.set_bind_group(0, &self.bind, &[]);
-                pass.draw(0..6, 0..count);
-            }
-            if show_terminal_overlays {
-                if let Some(images) = &self.images {
-                    images.draw(&mut pass);
-                }
-                if self.scrollbar_visible {
-                    pass.set_pipeline(&self.pipeline);
-                    pass.set_bind_group(0, &self.bind, &[]);
-                    pass.draw(0..6, count..count + 1);
-                }
-            }
-            if let Some(glass) = self.glass_layer.as_ref() {
-                glass.draw_overlay(&mut pass);
+            if self.scrollbar_visible {
                 pass.set_pipeline(&self.pipeline);
-            }
-            if let Some(dialog) = &self.dialog {
-                pass.set_bind_group(0, &dialog.bind, &[]);
-                pass.draw(0..6, 0..dialog.count);
-            }
-            if let Some(frame) = &self.frame {
-                frame.draw(&mut pass);
+                pass.set_bind_group(0, &self.bind, &[]);
+                pass.draw(0..6, count..count + 1);
             }
         }
-        self.queue.submit([encoder.finish()]);
-        self.queue.present(frame);
-        Ok(())
+        if let Some(glass) = self.glass_layer.as_ref() {
+            glass.draw_overlay(&mut pass);
+            pass.set_pipeline(&self.pipeline);
+        }
+        if let Some(dialog) = &self.dialog {
+            pass.set_bind_group(0, &dialog.bind, &[]);
+            pass.draw(0..6, 0..dialog.count);
+        }
+        if let Some(frame) = &self.frame {
+            frame.draw(&mut pass);
+        }
     }
 
     fn ensure_grid(&mut self, cols: u16, rows: u16) {

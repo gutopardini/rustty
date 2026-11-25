@@ -44,6 +44,45 @@ The window is a grid of cells, not a texture of the whole frame. A dirty row is 
 
 While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab shows that icon. Otherwise it shows Rustty. The title bar mirrors the active tab's icon and title.
 
+## AI Limits
+
+Next to the settings gear sits a colored three-layer icon (`Ctrl+Shift+L`). Its color reflects the lowest remaining quota at a glance — cyan/lavender when healthy, amber below 45%, coral below 20% — without opening the popover. Clicking it opens a floating overlay directly below the top bar, rendered on the GPU above the grid: frosted glass with an iridescent rim in Glass mode, or a flat elevated card matching the active theme when Glass mode is off.
+
+Each row shows the agent's icon and a bar tinted with that icon's dominant palette color. Providers with two rolling windows combine them into a single row: the weekly (`7d`) limit on the main bar and the five-hour (`5h`) limit on a thin bar underneath. Click a row to inspect both values, click `↻` (or press `R`) to refresh, or press `Esc` to close. The addon can be turned off in **Appearance** (`limits=off` in `ui.conf`).
+
+Collection stays off the render path and does not poll in the background:
+
+- **Built-in local readers (O(1), zero subprocesses):** reads `7d` and `5h` rate limits from the tail of the latest Codex session (`~/.codex/sessions`), local context usage from Antigravity, Claude Code, and Cursor transcripts, and passively captures Antigravity's `/usage` view when shown in a tab. While closed, Rustty only checks file metadata (`stat`) every 30 seconds and re-reads only when a source changes.
+- **Automatic `7d` + `5h` bridges for Claude Code and Antigravity (`agy`):** both CLIs pipe live rate-limit JSON to a `statusLine` command on each turn. Install the bundled scripts to mirror them into `~/.config/rustty/limits.json`:
+
+```bash
+install -Dm755 scripts/claude-limits-bridge.py "$HOME/.config/rustty/claude-limits-bridge.py"
+install -Dm755 scripts/agy-limits-bridge.py "$HOME/.config/rustty/agy-limits-bridge.py"
+```
+
+Then add `statusLine` to `~/.claude/settings.json`:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "python3 ~/.config/rustty/claude-limits-bridge.py"
+}
+```
+
+And to `~/.gemini/antigravity-cli/settings.json` (`stack_with_default: true` keeps the default bar intact):
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "python3 ~/.config/rustty/agy-limits-bridge.py",
+  "enabled": true,
+  "padding": 0,
+  "stack_with_default": true
+}
+```
+
+- **Custom entries (`~/.config/rustty/limits.json`):** any script or hook can write entries (`id`, `label`, `percent` or `used_percent`, `color`, `agent`, `resets_at`, and optional `sub` for a nested `5h` bar). An optional `limits_cmd=...` key in `ui.conf` runs on demand when refreshing (with a 30-second cooldown and 4-second timeout).
+
 ## The NPU
 
 `rustty-probe` reports the Vulkan device and, when present, the Intel NPU. Lines that leave the screen are hashed and written into a buffer mapped on that processor. The firmware does not run a graph until a compiled `RTY1` command buffer is submitted. That graph is the planned path for scrollback search. Until then, the index stays on the CPU and the screen stays on the GPU.
@@ -67,6 +106,7 @@ While Claude, Codex, Kiro, Antigravity, or Cursor is in the foreground, the tab 
 | `Ctrl+Shift+V` | paste |
 | middle-click | paste the primary selection |
 | `Ctrl+,` | appearance |
+| `Ctrl+Shift+L` | AI limits |
 
 The close button on the title bar asks before it closes the window when more than one tab is open. One tab closes immediately.
 

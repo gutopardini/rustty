@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::agent::Agent;
 use crate::cell::{BOLD, Cell, DIM};
 use crate::color::{Rgb, Theme};
+use crate::tabs;
 
 /// Maximum cells the overlay layer allocates for a popover.
 pub(crate) const MAX_CELLS: usize = 1024;
@@ -120,7 +121,8 @@ pub enum PopoverHit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterLayout {
     pub row: u16,
-    pub dot_col: u16,
+    /// Fallback colored status dot column when the entry has no agent icon.
+    pub dot_col: Option<u16>,
     pub bar_col: u16,
     pub bar_cols: u16,
     pub fill: f32,
@@ -178,18 +180,308 @@ impl Popover {
     }
 }
 
-/// Curated vibrant colors matching the inspiration card.
+/// Curated fallback palette for custom entries without a known agent icon.
 const PALETTE: [Rgb; 6] = [
     Rgb::new(0x18, 0xD2, 0xFF), // Electric cyan
     Rgb::new(0x7C, 0x6C, 0xFF), // Indigo violet
     Rgb::new(0x1E, 0xE6, 0xA8), // Mint emerald
-    Rgb::new(0xFB, 0x8C, 0x45), // Warm coral-orange
-    Rgb::new(0x38, 0xBD, 0xF8), // Sky blue
-    Rgb::new(0xF4, 0x72, 0xB6), // Rose pink
+    Rgb::new(0xD9, 0x77, 0x57), // Claude terracotta
+    Rgb::new(0x31, 0x86, 0xFF), // Antigravity/Gemini blue
+    Rgb::new(0x9E, 0xA6, 0xB2), // Cursor metallic silver
 ];
+
+/// Dominant brand color sampled from each agent's SVG icon in `assets/agents/source/`.
+fn agent_color(agent: Agent) -> Rgb {
+    match agent {
+        Agent::Claude => Rgb::new(0xD9, 0x77, 0x57),      // claude.svg (#D97757)
+        Agent::Codex => Rgb::new(0x7A, 0x9D, 0xFF),       // codex.svg (#7A9DFF)
+        Agent::Antigravity => Rgb::new(0x31, 0x86, 0xFF), // antigravity.svg (#3186FF)
+        Agent::Cursor => Rgb::new(0x9E, 0xA6, 0xB2),      // cursor.svg metallic silver
+        Agent::Kiro => Rgb::new(0x9B, 0x5C, 0xFF),        // kiro.svg (#9B5CFF)
+    }
+}
+
+/// Lighter companion color from the same icon palette for the nested 5h sub-bar.
+fn agent_sub_color(agent: Agent) -> Rgb {
+    match agent {
+        Agent::Claude => Rgb::new(0xF2, 0xA4, 0x7E),
+        Agent::Codex => Rgb::new(0xB1, 0xA7, 0xFF), // codex.svg light stop (#B1A7FF)
+        Agent::Antigravity => Rgb::new(0x74, 0x9B, 0xFF),
+        Agent::Cursor => Rgb::new(0xD4, 0xDA, 0xE2),
+        Agent::Kiro => Rgb::new(0xC5, 0x9E, 0xFF),
+    }
+}
 
 const WARN_COLOR: Rgb = Rgb::new(0xFB, 0x92, 0x3C);
 const CRIT_COLOR: Rgb = Rgb::new(0xF8, 0x5A, 0x62);
+
+/// Quota snapshot captured directly from an on-screen CLI `/usage` view (e.g. Antigravity `agy`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedLimit {
+    pub id: String,
+    pub label: String,
+    pub percent: u8,
+    pub color: Rgb,
+    pub agent: Agent,
+    pub resets_at: Option<u64>,
+    pub sub: Option<CapturedSubLimit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedSubLimit {
+    pub label: String,
+    pub percent: u8,
+    pub color: Rgb,
+    pub resets_at: Option<u64>,
+}
+
+/// Parses Antigravity (`agy`) `/usage` output visible in the terminal viewport:
+///
+/// ```text
+/// GEMINI MODELS
+/// Weekly Limit Remaining
+/// [████░░] 74.67%
+/// Refreshes in 6d 14h 44m
+/// Five Hour Limit Remaining
+/// [██░░░░] 30.92%
+/// Refreshes in 2h 33m
+/// ```
+pub fn parse_screen_limits(screen: &str, now_unix: u64) -> Option<CapturedLimit> {
+    if !screen.contains("Limit Remaining") && !screen.contains("limit remaining") {
+        return None;
+    }
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    // Scope to the GEMINI MODELS section when a group heading is present, so a CLAUDE MODELS
+    // block further down does not mix into the Gemini entry.
+    let mut in_gemini = !lines.iter().any(|line| {
+        let upper = line.to_ascii_uppercase();
+        upper.contains("MODELS") && !upper.contains("GEMINI")
+    });
+    let mut weekly: Option<(u8, Option<u64>)> = None;
+    let mut five_hour: Option<(u8, Option<u64>)> = None;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let upper = lines[i].to_ascii_uppercase();
+        if upper.contains("GEMINI MODELS")
+            || (upper.contains("WITHIN THIS GROUP") && upper.contains("GEMINI"))
+        {
+            in_gemini = true;
+            i += 1;
+            continue;
+        }
+        if upper.contains(" MODELS") && !upper.contains("GEMINI") && !upper.contains("WITHIN THIS GROUP") {
+            in_gemini = false;
+            i += 1;
+            continue;
+        }
+        if in_gemini {
+            if upper.contains("WEEKLY LIMIT REMAINING") {
+                if let Some(parsed) = parse_limit_block(&lines[i + 1..], now_unix) {
+                    weekly = Some(parsed);
+                }
+            } else if upper.contains("FIVE HOUR LIMIT REMAINING") || upper.contains("5 HOUR LIMIT REMAINING") {
+                if let Some(parsed) = parse_limit_block(&lines[i + 1..], now_unix) {
+                    five_hour = Some(parsed);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    match (weekly, five_hour) {
+        (Some((p7, r7)), Some((p5, r5))) => Some(CapturedLimit {
+            id: "gemini".to_string(),
+            label: "Gemini".to_string(),
+            percent: p7,
+            color: agent_color(Agent::Antigravity),
+            agent: Agent::Antigravity,
+            resets_at: r7,
+            sub: Some(CapturedSubLimit {
+                label: "5h".to_string(),
+                percent: p5,
+                color: agent_sub_color(Agent::Antigravity),
+                resets_at: r5,
+            }),
+        }),
+        (Some((p, r)), None) | (None, Some((p, r))) => Some(CapturedLimit {
+            id: "gemini".to_string(),
+            label: "Gemini".to_string(),
+            percent: p,
+            color: agent_color(Agent::Antigravity),
+            agent: Agent::Antigravity,
+            resets_at: r,
+            sub: None,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn parse_limit_block(following: &[&str], now_unix: u64) -> Option<(u8, Option<u64>)> {
+    let mut percent = None;
+    let mut resets_at = None;
+    for line in following.iter().take(6) {
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("LIMIT REMAINING")
+            || (upper.contains(" MODELS") && !upper.contains("WITHIN THIS GROUP"))
+        {
+            break;
+        }
+        if percent.is_none() {
+            percent = extract_percent(line);
+        }
+        if resets_at.is_none()
+            && (upper.contains("REFRESHES IN") || upper.contains("RESETS IN"))
+            && let Some(secs) = parse_duration_secs(line)
+        {
+            resets_at = Some(now_unix.saturating_add(secs));
+        }
+    }
+    percent.map(|p| (p, resets_at))
+}
+
+fn extract_percent(line: &str) -> Option<u8> {
+    let idx = line.find('%')?;
+    let before = line[..idx].trim_end();
+    let start = before
+        .rfind(|c: char| !matches!(c, '0'..='9' | '.'))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let num: f64 = before[start..].parse().ok()?;
+    Some(num.round().clamp(0.0, 100.0) as u8)
+}
+
+fn parse_duration_secs(line: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut matched = false;
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if token.len() < 2 {
+            continue;
+        }
+        let (digits, unit) = token.split_at(token.len() - 1);
+        let Ok(value) = digits.parse::<u64>() else { continue };
+        let mult = match unit {
+            "d" | "D" => 86_400,
+            "h" | "H" => 3_600,
+            "m" | "M" => 60,
+            "s" | "S" => 1,
+            _ => continue,
+        };
+        total = total.saturating_add(value.saturating_mul(mult));
+        matched = true;
+    }
+    matched.then_some(total)
+}
+
+/// Atomically upserts one captured limit into `~/.config/rustty/limits.json`, preserving all
+/// other existing entries untouched.
+pub fn persist_captured(captured: &CapturedLimit) {
+    let path = json_path();
+    persist_captured_to(&path, captured);
+}
+
+fn persist_captured_to(path: &Path, captured: &CapturedLimit) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut title = "AI Limits".to_string();
+    let mut subtitle = "Quota · Models".to_string();
+    let mut kept = Vec::new();
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        let array = if trimmed.starts_with('[') {
+            Some(trimmed)
+        } else if trimmed.starts_with('{') {
+            if let Some(t) = json_str(trimmed, "title")
+                && !t.is_empty()
+            {
+                title = t;
+            }
+            if let Some(s) = json_str(trimmed, "subtitle")
+                && !s.is_empty()
+            {
+                subtitle = s;
+            }
+            ["items", "entries", "limits", "models"]
+                .into_iter()
+                .find_map(|key| {
+                    let needle = format!("\"{key}\"");
+                    let pos = trimmed.find(&needle)?;
+                    let after = trimmed[pos + needle.len()..].trim_start().strip_prefix(':')?.trim_start();
+                    extract_bracket_array(after)
+                })
+        } else {
+            None
+        };
+        if let Some(array) = array {
+            for obj in iter_json_objects(array) {
+                let id = json_str(obj, "id")
+                    .or_else(|| json_str(obj, "label"))
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if id != captured.id {
+                    kept.push(obj.to_string());
+                }
+            }
+        }
+    }
+    kept.push(format_captured_json(captured));
+    let mut out = format!(
+        "{{\n  \"title\": \"{}\",\n  \"subtitle\": \"{}\",\n  \"items\": [\n",
+        escape_json(&title),
+        escape_json(&subtitle),
+    );
+    for (idx, obj) in kept.iter().enumerate() {
+        out.push_str("    ");
+        out.push_str(obj);
+        if idx + 1 < kept.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("  ]\n}\n");
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+fn format_captured_json(c: &CapturedLimit) -> String {
+    let agent = match c.agent {
+        Agent::Claude => "claude",
+        Agent::Codex => "codex",
+        Agent::Kiro => "kiro",
+        Agent::Antigravity => "antigravity",
+        Agent::Cursor => "cursor",
+    };
+    let mut parts = vec![
+        format!("\"id\": \"{}\"", escape_json(&c.id)),
+        format!("\"label\": \"{}\"", escape_json(&c.label)),
+        format!("\"percent\": {}", c.percent),
+        format!("\"color\": \"#{:02X}{:02X}{:02X}\"", c.color.r, c.color.g, c.color.b),
+        format!("\"agent\": \"{agent}\""),
+    ];
+    if let Some(ts) = c.resets_at {
+        parts.push(format!("\"resets_at\": {ts}"));
+    }
+    if let Some(sub) = &c.sub {
+        let mut sub_parts = vec![
+            format!("\"label\": \"{}\"", escape_json(&sub.label)),
+            format!("\"percent\": {}", sub.percent),
+            format!("\"color\": \"#{:02X}{:02X}{:02X}\"", sub.color.r, sub.color.g, sub.color.b),
+        ];
+        if let Some(ts) = sub.resets_at {
+            sub_parts.push(format!("\"resets_at\": {ts}"));
+        }
+        parts.push(format!("\"sub\": {{{}}}", sub_parts.join(", ")));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
+fn escape_json(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// Default path of the optional JSON drop-in file (`~/.config/rustty/limits.json`).
 pub fn json_path() -> PathBuf {
@@ -423,12 +715,12 @@ pub(crate) fn parse_codex_rate_limits(text: &str, now_unix: u64) -> Vec<Entry> {
             id: "codex".to_string(),
             label: "Codex".to_string(),
             percent: p7,
-            color: PALETTE[0],
+            color: agent_color(Agent::Codex),
             hint: h7,
             sub: Some(SubLimit {
                 label: l5,
                 percent: p5,
-                color: Rgb::new(0x8B, 0x7C, 0xFF),
+                color: agent_sub_color(Agent::Codex),
                 hint: h5,
             }),
             agent: Some(Agent::Codex),
@@ -437,7 +729,7 @@ pub(crate) fn parse_codex_rate_limits(text: &str, now_unix: u64) -> Vec<Entry> {
             id: "codex".to_string(),
             label: "Codex".to_string(),
             percent: p,
-            color: PALETTE[0],
+            color: agent_color(Agent::Codex),
             hint: h,
             sub: None,
             agent: Some(Agent::Codex),
@@ -494,10 +786,10 @@ pub(crate) fn parse_agy_transcript(text: &str) -> Option<Entry> {
         let used = input + cache;
         let (id, label, color, window) = match model.to_ascii_lowercase().as_str() {
             m if m.contains("gemini") || m.contains("neon") || m.contains("carbon") || m.contains("argon") || m.contains("hydrogen") || m.contains("flash") => {
-                ("gemini", "Gemini", PALETTE[2], 1_000_000.0)
+                ("gemini", "Gemini", agent_color(Agent::Antigravity), 1_000_000.0)
             }
-            m if m.contains("claude") => ("agy-claude", "Agy Claude", PALETTE[3], 200_000.0),
-            _ => ("antigravity", "Antigravity", PALETTE[2], 1_000_000.0),
+            m if m.contains("claude") => ("agy-claude", "Agy Claude", agent_color(Agent::Claude), 200_000.0),
+            _ => ("antigravity", "Antigravity", agent_color(Agent::Antigravity), 1_000_000.0),
         };
         let window = if used > window { 1_000_000.0 } else { window };
         let remaining = ((1.0 - used / window) * 100.0).round().clamp(0.0, 100.0) as u8;
@@ -568,7 +860,7 @@ pub(crate) fn cursor_entry_from_bytes(bytes: u64) -> Entry {
         id: "cursor".to_string(),
         label: "Cursor".to_string(),
         percent: remaining,
-        color: PALETTE[1],
+        color: agent_color(Agent::Cursor),
         hint: Some("ctx".to_string()),
         sub: None,
         agent: Some(Agent::Cursor),
@@ -601,7 +893,7 @@ pub(crate) fn parse_claude_session(text: &str) -> Option<Entry> {
             id: "claude".to_string(),
             label: "Claude".to_string(),
             percent: remaining,
-            color: PALETTE[3],
+            color: agent_color(Agent::Claude),
             hint: Some("ctx".to_string()),
             sub: None,
             agent: Some(Agent::Claude),
@@ -698,12 +990,17 @@ pub(crate) fn apply_json(text: &str, now_unix: u64, snap: &mut Snapshot, seen: &
             continue;
         };
         let id = json_str(top, "id").unwrap_or_else(|| label.to_ascii_lowercase());
+        let agent = json_str(top, "agent")
+            .and_then(|name| parse_agent(&name))
+            .or_else(|| parse_agent(&id))
+            .or_else(|| parse_agent(&label));
         let color = json_str(top, "color")
             .and_then(|hex| parse_hex_color(&hex))
-            .unwrap_or(PALETTE[(snap.entries.len() + idx) % PALETTE.len()]);
+            .unwrap_or_else(|| {
+                agent.map(agent_color).unwrap_or(PALETTE[(snap.entries.len() + idx) % PALETTE.len()])
+            });
         let hint = json_str(top, "reset").or_else(|| json_str(top, "hint")).or(reset_hint);
-        let agent = json_str(top, "agent").and_then(|name| parse_agent(&name));
-        let sub = parse_sub_limit(sub_obj, top, color, now_unix);
+        let sub = parse_sub_limit(sub_obj, top, color, agent, now_unix);
         push_unique(
             &mut snap.entries,
             seen,
@@ -726,12 +1023,20 @@ impl<'a> CowObj<'a> {
     }
 }
 
-fn parse_sub_limit(sub_obj: Option<&str>, top: &str, parent_color: Rgb, now_unix: u64) -> Option<SubLimit> {
-    let default_color = Rgb::new(
-        parent_color.r.saturating_add(45),
-        parent_color.g.saturating_add(45),
-        parent_color.b.saturating_add(35),
-    );
+fn parse_sub_limit(
+    sub_obj: Option<&str>,
+    top: &str,
+    parent_color: Rgb,
+    agent: Option<Agent>,
+    now_unix: u64,
+) -> Option<SubLimit> {
+    let default_color = agent.map(agent_sub_color).unwrap_or_else(|| {
+        Rgb::new(
+            parent_color.r.saturating_add(45),
+            parent_color.g.saturating_add(45),
+            parent_color.b.saturating_add(35),
+        )
+    });
     if let Some(sub) = sub_obj {
         let resets_at = json_f64(sub, "resets_at").map(|v| v.round() as u64);
         let (percent, reset_hint) = if let Some(p) = json_f64(sub, "percent").or_else(|| json_f64(sub, "remaining")) {
@@ -1049,13 +1354,13 @@ fn render_horizontal(
     paint(&mut cells, width, refresh_row, text_col, refresh_mark, if refreshing { accent } else { muted }, bg, DIM);
     let refresh_zone = Some((refresh_row, text_col.saturating_sub(1), text_col + 3));
 
-    // Right column: dot + label + GPU gradient bar + percentage.
+    // Right column: agent icon (or fallback dot) + label + GPU gradient bar + percentage.
     let right_start = divider_col + 2;
     let pct_width = 4u16; // "100%"
     let pct_col = cols.saturating_sub(pct_width + 2);
-    let dot_col = right_start;
-    let label_col = dot_col + 2;
-    let label_width = 9u16;
+    let icon_col = right_start;
+    let label_col = icon_col + 3;
+    let label_width = 8u16;
     let bar_col = label_col + label_width + 1;
     let bar_cols = pct_col.saturating_sub(bar_col + 1).max(4);
 
@@ -1074,6 +1379,15 @@ fn render_horizontal(
             let selected = selected_row == Some(idx);
             let label_flags = if active || selected { BOLD } else { 0 };
             let label_fg = if selected { accent } else { fg };
+            let dot_col = if let Some(agent) = entry.agent {
+                let start = usize::from(row) * width + usize::from(icon_col);
+                if start + 2 <= cells.len() {
+                    tabs::paint_icon(&mut cells[start..start + 2], Some(agent), fg, bg);
+                }
+                None
+            } else {
+                Some(icon_col)
+            };
             paint(
                 &mut cells,
                 width,
@@ -1175,9 +1489,9 @@ fn render_compact(
     paint(&mut cells, width, 1, refresh_col, refresh_mark, if refreshing { accent } else { muted }, bg, 0);
     let refresh_zone = Some((1, refresh_col.saturating_sub(1), cols));
 
-    let dot_col = 2u16;
-    let label_col = 4u16;
-    let label_width = 8u16;
+    let icon_col = 2u16;
+    let label_col = 5u16;
+    let label_width = 7u16;
     let pct_col = cols.saturating_sub(5);
     let bar_col = label_col + label_width + 1;
     let bar_cols = pct_col.saturating_sub(bar_col + 1).max(3);
@@ -1192,6 +1506,15 @@ fn render_compact(
             let row = 3 + idx as u16;
             let active = active_agent.is_some() && entry.agent == active_agent;
             let selected = selected_row == Some(idx);
+            let dot_col = if let Some(agent) = entry.agent {
+                let start = usize::from(row) * width + usize::from(icon_col);
+                if start + 2 <= cells.len() {
+                    tabs::paint_icon(&mut cells[start..start + 2], Some(agent), fg, bg);
+                }
+                None
+            } else {
+                Some(icon_col)
+            };
             paint(
                 &mut cells,
                 width,
@@ -1344,6 +1667,48 @@ mod tests {
     }
 
     #[test]
+    fn captures_antigravity_gemini_weekly_and_five_hour_limits_from_screen() {
+        let screen = "\
+GEMINI MODELS
+  Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon
+
+  Weekly Limit Remaining
+  [████████████████████░░░░░] 74.67%
+  Refreshes in 6d 14h 44m
+
+  Five Hour Limit Remaining
+  [████████░░░░░░░░░░░░░░░░░] 30.92%
+  Refreshes in 2h 33m
+";
+        let now = 2_000_000_000u64;
+        let captured = parse_screen_limits(screen, now).expect("captured");
+        assert_eq!(captured.id, "gemini");
+        assert_eq!(captured.label, "Gemini");
+        assert_eq!(captured.percent, 75);
+        assert_eq!(captured.resets_at, Some(now + 6 * 86_400 + 14 * 3_600 + 44 * 60));
+        let sub = captured.sub.as_ref().expect("5h sub");
+        assert_eq!(sub.label, "5h");
+        assert_eq!(sub.percent, 31);
+        assert_eq!(sub.resets_at, Some(now + 2 * 3_600 + 33 * 60));
+
+        // Round-trip through atomic limits.json persistence preserving unrelated entries.
+        let path = std::env::temp_dir().join(format!("rustty-limits-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, r#"{"items":[{"id":"claude","label":"Claude","percent":80}]}"#).unwrap();
+        persist_captured_to(&path, &captured);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut snap = Snapshot::default();
+        let mut seen = HashSet::new();
+        apply_json(&text, now, &mut snap, &mut seen);
+        assert_eq!(snap.entries.len(), 2);
+        let gemini = snap.entries.iter().find(|e| e.id == "gemini").expect("gemini");
+        assert_eq!(gemini.percent, 75);
+        assert_eq!(gemini.sub.as_ref().expect("5h").percent, 31);
+        assert!(snap.entries.iter().any(|e| e.id == "claude"));
+    }
+
+    #[test]
     fn horizontal_and_compact_popovers_fit_and_hit_test() {
         let theme = crate::color::theme(0);
         let snap = Snapshot {
@@ -1358,6 +1723,8 @@ mod tests {
         let wide = render_popover(90, 24, theme, &snap, Some(Agent::Claude), None, false, Some(88)).expect("wide");
         assert!(wide.divider_v.is_some());
         assert_eq!(wide.meters.len(), 2);
+        assert_eq!(wide.meters[0].dot_col, None);
+        assert!(wide.cells.iter().any(|cell| cell.cp == Agent::Claude.icon()));
         assert_eq!(wide.health, Health::Crit);
         assert!(wide.contains(wide.origin_col, wide.origin_row));
         let row0 = wide.origin_row + wide.meters[0].row;

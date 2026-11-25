@@ -1154,6 +1154,16 @@ impl Term {
         lines.join("\n")
     }
 
+    /// Plain text of the recent viewport and scrollback tail (up to `max_lines` lines), used to
+    /// capture on-screen quota summaries (e.g. `agy /usage`) even if they scroll up slightly.
+    pub fn recent_text(&self, max_lines: usize) -> String {
+        let bottom = self.dropped + (self.scrollback.len() + usize::from(self.rows)).saturating_sub(1) as u64;
+        let span = (max_lines.max(usize::from(self.rows)) as u64).saturating_sub(1);
+        let start = bottom.saturating_sub(span).max(self.dropped);
+        let last_col = self.cols.saturating_sub(1);
+        self.selected_text((0, start), (last_col, bottom))
+    }
+
     /// The word under this cell, or the cell itself when it is not part of a word.
     pub fn word_span(&self, col: u16, row: u16) -> ((u16, u16), (u16, u16)) {
         let glyphs = self.glyphs(row);

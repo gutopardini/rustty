@@ -367,6 +367,7 @@ struct App {
     limits_fingerprint: limits::Fingerprint,
     next_limits_probe: Instant,
     last_limits_cmd: Option<Instant>,
+    last_screen_capture: Option<(String, u8, Option<u8>)>,
     bar_hover: Option<tabs::BarHover>,
     link_cell: Option<(u16, u16)>,
     hover_icon: CursorIcon,
@@ -623,6 +624,49 @@ impl App {
             self.bar_dirty = true;
             self.redraw();
         }
+        self.scan_screen_limits();
+    }
+
+    /// Passively captures on-screen quota panels (such as Antigravity `agy /usage`) across open
+    /// tabs (including recent scrollback lines) and persists them to `~/.config/rustty/limits.json`.
+    fn scan_screen_limits(&mut self) {
+        if !self.ui.limits || self.tabs.is_empty() {
+            return;
+        }
+        let now_unix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let active = self.active.min(self.tabs.len() - 1);
+        let mut found = None;
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            if idx != active && tab.agent != Some(Agent::Antigravity) {
+                continue;
+            }
+            let Ok(term) = tab.session.term.try_lock() else {
+                continue;
+            };
+            let screen = term.recent_text(80);
+            drop(term);
+            if let Some(captured) = limits::parse_screen_limits(&screen, now_unix) {
+                found = Some(captured);
+                break;
+            }
+        }
+        let Some(captured) = found else {
+            return;
+        };
+        let key = (
+            captured.id.clone(),
+            captured.percent,
+            captured.sub.as_ref().map(|sub| sub.percent),
+        );
+        if self.last_screen_capture.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_screen_capture = Some(key);
+        limits::persist_captured(&captured);
+        self.refresh_limits(false);
     }
 
     /// Picks up glass keys edited in `ui.conf` while the window is open.
@@ -971,6 +1015,7 @@ impl App {
             return;
         }
         self.close_settings();
+        self.scan_screen_limits();
         self.limits_open = true;
         self.limits_dirty = true;
         self.limits_selected = None;
@@ -2494,12 +2539,14 @@ fn push_limits_shapes(
     let bar_h = (cell.1 * 0.38).clamp(6.0 * s, 10.0 * s);
     for meter in &popover.meters {
         let row_cy = origin.1 + (f32::from(popover.origin_row + meter.row) + 0.5) * cell.1;
-        let dot_cx = origin.0 + (f32::from(popover.origin_col + meter.dot_col) + 0.5) * cell.0;
-        shapes.push(
-            GlassShape::new(dot_cx - dot_d * 0.5, row_cy - dot_d * 0.5, dot_d, dot_d, GLASS_DOT)
-                .with_tint(meter.color, 1.0)
-                .with_icon(glass_flag),
-        );
+        if let Some(dot_col) = meter.dot_col {
+            let dot_cx = origin.0 + (f32::from(popover.origin_col + dot_col) + 0.5) * cell.0;
+            shapes.push(
+                GlassShape::new(dot_cx - dot_d * 0.5, row_cy - dot_d * 0.5, dot_d, dot_d, GLASS_DOT)
+                    .with_tint(meter.color, 1.0)
+                    .with_icon(glass_flag),
+            );
+        }
         let bx = origin.0 + f32::from(popover.origin_col + meter.bar_col) * cell.0;
         let bw = f32::from(meter.bar_cols) * cell.0;
         if let Some((sub_fill, sub_color)) = meter.sub {
@@ -3051,6 +3098,7 @@ pub fn run() -> anyhow::Result<()> {
         limits_fingerprint: limits::Fingerprint::default(),
         next_limits_probe: Instant::now() + Duration::from_secs(30),
         last_limits_cmd: None,
+        last_screen_capture: None,
         bar_hover: None,
         link_cell: None,
         hover_icon: CursorIcon::Default,

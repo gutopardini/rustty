@@ -17,6 +17,10 @@ pub struct Ui {
     pub cwd: Option<PathBuf>,
     /// Translucent window with the desktop blurred behind it, and glass controls in the bars.
     pub glass: bool,
+    /// Shows the AI Limits addon button in the top bar and enables its popover.
+    pub limits: bool,
+    /// Optional shell command that prints JSON quota entries on demand when refreshing AI Limits.
+    pub limits_cmd: Option<String>,
     /// Frost, shadow, pill, sheets and spacing of glass mode. Each field is a key in the file.
     pub glass_tune: GlassTune,
 }
@@ -39,6 +43,8 @@ impl Ui {
             font: 0,
             cwd: None,
             glass: false,
+            limits: true,
+            limits_cmd: None,
             glass_tune: GlassTune::default(),
         };
         ui.apply_text(&text);
@@ -66,6 +72,10 @@ impl Ui {
                 "style" => self.style = color::theme_index(value),
                 "font" => self.select_path(PathBuf::from(value)),
                 "glass" => self.glass = matches!(value, "on" | "true" | "1" | "yes"),
+                "limits" => self.limits = matches!(value, "on" | "true" | "1" | "yes"),
+                "limits_cmd" => {
+                    self.limits_cmd = (!value.is_empty()).then(|| value.to_string());
+                }
                 "cwd" => {
                     let path = PathBuf::from(value);
                     if path.is_dir() {
@@ -88,9 +98,15 @@ impl Ui {
             .as_ref()
             .map(|path| format!("cwd={}\n", path.display()))
             .unwrap_or_default();
+        let limits_cmd = self
+            .limits_cmd
+            .as_ref()
+            .map(|cmd| format!("limits_cmd={cmd}\n"))
+            .unwrap_or_default();
         let glass = if self.glass { "on" } else { "off" };
+        let limits = if self.limits { "on" } else { "off" };
         let text = format!(
-            "size={}\nstyle={}\nfont={}\nglass={glass}\n{}{cwd}",
+            "size={}\nstyle={}\nfont={}\nglass={glass}\nlimits={limits}\n{}{limits_cmd}{cwd}",
             self.size,
             color::theme(self.style).id,
             font,
@@ -774,6 +790,7 @@ pub enum PanelHit {
     PrevFont,
     NextFont,
     Glass,
+    Limits,
     Style(usize),
     /// Opens the glass controls.
     GlassLook,
@@ -817,6 +834,7 @@ const KEYS: &[(&str, &str)] = &[
     ("drag a tab", "move the tab"),
     ("click a link", "open it"),
     ("Ctrl+,", "appearance"),
+    ("Ctrl+Shift+L", "AI limits"),
     ("Ctrl+Enter", "insert a newline"),
     ("Shift+Enter", "insert a newline"),
     ("Esc", "back or close"),
@@ -868,10 +886,12 @@ impl Panel {
     }
 }
 
-/// Row of the glass switch, and the first row of the style list below it.
+/// Row of the glass switch, AI limits switch, and the first row of the style list below them.
 const GLASS_ROW: u16 = 6;
-const STYLE_LIST: u16 = 9;
+const LIMITS_ROW: u16 = 8;
+const STYLE_LIST: u16 = 11;
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     grid_cols: u16,
     grid_rows: u16,
@@ -880,6 +900,7 @@ pub fn render_panel(
     size: f32,
     style: usize,
     glass: bool,
+    limits: bool,
     page: Option<GlassPage>,
     keys: Option<u16>,
 ) -> Option<Panel> {
@@ -933,6 +954,12 @@ pub fn render_panel(
         paint(&mut cells, width, GLASS_ROW + 1, cols - 4, "[>]", theme.accent.pack(), theme.panel.pack(), 0);
         zones.push(Zone { col: 0, end: cols, row: GLASS_ROW + 1, action: PanelHit::GlassLook });
     }
+
+    paint(&mut cells, width, LIMITS_ROW, 1, "AI Limits", theme.fg.pack(), theme.panel.pack(), 0);
+    let lim_switch = if limits { "[ on]" } else { "[off]" };
+    let lim_fg = if limits { theme.accent.pack() } else { theme.muted.pack() };
+    paint(&mut cells, width, LIMITS_ROW, cols - 6, lim_switch, lim_fg, theme.panel.pack(), 0);
+    zones.push(Zone { col: 0, end: cols, row: LIMITS_ROW, action: PanelHit::Limits });
 
     paint(&mut cells, width, STYLE_LIST - 1, 1, "Style", theme.muted.pack(), theme.panel.pack(), 0);
     for (index, item) in THEMES.iter().enumerate() {
@@ -1195,7 +1222,7 @@ mod tests {
     #[test]
     fn style_row_and_size_buttons_are_hits() {
         let theme = color::theme(0);
-        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, None, None).expect("panel");
+        let panel = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, true, None, None).expect("panel");
         assert_eq!(panel.hit(panel.origin_col + 1, panel.origin_row + 4), Some(PanelHit::Smaller));
         assert_eq!(panel.hit(panel.origin_col + panel.cols - 2, panel.origin_row + 4), Some(PanelHit::Larger));
         assert_eq!(panel.hit(panel.origin_col + 4, panel.origin_row + 4), Some(PanelHit::Smaller));
@@ -1205,6 +1232,7 @@ mod tests {
         assert!(size_text.contains("Size: 15 px"), "{size_text}");
         assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + STYLE_LIST), Some(PanelHit::Style(0)));
         assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + GLASS_ROW), Some(PanelHit::Glass));
+        assert_eq!(panel.hit(panel.origin_col + 2, panel.origin_row + LIMITS_ROW), Some(PanelHit::Limits));
         let glass_row = &panel.cells[usize::from(panel.cols) * 6..usize::from(panel.cols) * 7];
         let glass_text: String = glass_row.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
         assert!(glass_text.contains("Glass mode") && glass_text.contains("[off]"), "{glass_text}");
@@ -1243,13 +1271,13 @@ mod tests {
     #[test]
     fn look_row_opens_the_glass_controls_for_the_style_on_screen() {
         let theme = color::theme(0);
-        let off = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, None, None).expect("panel");
+        let off = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, true, None, None).expect("panel");
         assert_eq!(off.hit(off.origin_col + 2, off.origin_row + GLASS_ROW + 1), None);
-        let on = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, true, None, None).expect("panel");
+        let on = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, true, true, None, None).expect("panel");
         assert_eq!(on.hit(on.origin_col + 2, on.origin_row + GLASS_ROW + 1), Some(PanelHit::GlassLook));
 
         let page = GlassPage { tune: GlassTune::default(), light: false, scroll: 0 };
-        let glass = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, true, Some(page), None).expect("glass");
+        let glass = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, true, true, Some(page), None).expect("glass");
         assert_eq!(glass.hit(glass.origin_col + 1, glass.origin_row), Some(PanelHit::GlassBack));
         assert_eq!(
             glass.hit(glass.origin_col + 1, glass.origin_row + 2),
@@ -1278,7 +1306,7 @@ mod tests {
         tune.nudge(GlassControl::Opacity, 1, false);
         tune.nudge(GlassControl::BodyTop, 1, false);
         tune.nudge(GlassControl::BodyTop, -1, true);
-        let keys = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, None, Some(0)).expect("keys");
+        let keys = render_panel(80, 24, theme, "JetBrains Mono", 15.0, 0, false, true, None, Some(0)).expect("keys");
         assert_eq!(keys.hit(keys.origin_col + 1, keys.origin_row), Some(PanelHit::KeysBack));
         let key_row = &keys.cells[usize::from(keys.cols)..usize::from(keys.cols) * 2];
         let key_text: String = key_row.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();

@@ -26,10 +26,12 @@ use crate::color::{self, Theme};
 use crate::confirm::{self, Choice, Dialog};
 use crate::font::{Atlas, Face};
 use crate::gpu::{
-    GlassShape, Renderer, GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_PILL, GLASS_SHEET, ICON_CLOSE,
-    ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
+    GlassShape, Renderer, GLASS_BAR, GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_DOT,
+    GLASS_LIMITS_CARD, GLASS_LIMITS_ICON, GLASS_PILL, GLASS_SHEET, ICON_CLOSE, ICON_LIMITS_CRIT,
+    ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
 };
 use crate::input::{self, Input};
+use crate::limits::{self, Health as LimitsHealth, Popover, PopoverHit};
 use crate::npu::{Indexer, Scheduler};
 use crate::pty::Pty;
 use crate::settings::{self, Panel, PanelHit, Ui};
@@ -41,6 +43,7 @@ use crate::titlebar::{self, TitleBar, TitleHit};
 enum Wake {
     Frame(u64),
     Closed(u64),
+    Limits(limits::Snapshot),
 }
 
 struct Session {
@@ -354,6 +357,16 @@ struct App {
     title_bar: TitleBar,
     last_title_click: Option<Instant>,
     settings_hot: bool,
+    limits_hot: bool,
+    limits_open: bool,
+    limits_dirty: bool,
+    limits_loading: bool,
+    limits_selected: Option<usize>,
+    limits_snap: limits::Snapshot,
+    limits_popover: Option<Popover>,
+    limits_fingerprint: limits::Fingerprint,
+    next_limits_probe: Instant,
+    last_limits_cmd: Option<Instant>,
     bar_hover: Option<tabs::BarHover>,
     link_cell: Option<(u16, u16)>,
     hover_icon: CursorIcon,
@@ -492,6 +505,7 @@ impl App {
         self.grid_cols = cols;
         self.grid_rows = rows;
         self.bar_dirty = true;
+        self.limits_dirty = true;
         for tab in &self.tabs {
             let resized = tab.session.update(|term| {
                 if cols != term.cols() || rows != term.rows() {
@@ -759,6 +773,7 @@ impl App {
                 window.is_maximized(),
                 &self.desktop.buttons,
                 true,
+                self.ui.limits,
                 self.ui.glass,
             );
             gpu.upload_title(&mut self.atlas, &self.face, &self.title_bar.cells, theme.bar);
@@ -783,6 +798,7 @@ impl App {
                 self.ui.size,
                 self.ui.style,
                 self.ui.glass,
+                self.ui.limits,
                 page,
                 keys,
             );
@@ -825,11 +841,33 @@ impl App {
             }
             gpu.upload_dialog(&mut self.atlas, &self.face, self.close_dialog.as_ref());
             self.confirm_dirty = false;
+        } else if self.limits_dirty || self.limits_open {
+            if self.limits_open {
+                let anchor = (!self.title_bar.limits.is_empty()).then_some(self.title_bar.settings.end.max(self.title_bar.limits.end));
+                self.limits_popover = limits::render_popover(
+                    self.grid_cols,
+                    self.grid_rows,
+                    theme,
+                    &self.limits_snap,
+                    self.tabs[active].agent,
+                    self.limits_selected,
+                    self.limits_loading,
+                    anchor,
+                );
+            } else {
+                self.limits_popover = None;
+            }
+            gpu.upload_popover(&mut self.atlas, &self.face, self.limits_popover.as_ref());
+            self.limits_dirty = false;
         }
-        if self.ui.glass {
-            let scale = window.scale_factor();
-            let tune = self.ui.glass_tune;
-            let mut shapes = glass_shapes(
+        let scale = window.scale_factor();
+        let tune = self.ui.glass_tune;
+        let light = is_light(theme);
+        let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
+        let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
+        let limits_health = self.limits_snap.health();
+        let mut shapes = if self.ui.glass {
+            glass_shapes(
                 &self.bar,
                 &self.title_bar,
                 size,
@@ -837,37 +875,72 @@ impl App {
                 self.face.cell_w().max(1),
                 scale,
                 self.settings_hot || self.ui.open,
+                self.limits_hot || self.limits_open,
+                limits_health,
                 window.is_maximized(),
                 &tune,
-            );
-            let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
-            let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
-            if let Some(panel) = &self.panel {
-                // The panel replaces the grid cells it covers, so its sheet goes under the grid.
-                let rect = (panel.origin_col, panel.origin_row, panel.cols, panel.rows);
-                shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, tune.sheet, tune.radius));
-            }
-            let overlay = shapes.len();
-            if let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close || self.tab_edit.is_some())
-            {
-                let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
-                let pad = (f64::from(tune.dialog_pad) * scale) as f32;
-                shapes.push(sheet(rect, origin, cell, pad, scale, theme, tune.dialog, tune.radius));
-                let inset = (f64::from(tune.button_inset) * scale).round() as f32;
-                for (cols, rows, choice) in dialog.buttons() {
-                    let x = origin.0 + f32::from(dialog.origin_col + cols.start) * cell.0 + inset;
-                    let y = origin.1 + f32::from(dialog.origin_row + rows.start) * cell.1 + inset;
-                    let w = f32::from(cols.end - cols.start) * cell.0 - 2.0 * inset;
-                    let h = f32::from(rows.end - rows.start) * cell.1 - 2.0 * inset;
-                    let button = GlassShape::new(x, y, w, h, GLASS_BUTTON);
-                    shapes.push(match choice {
-                        confirm::Choice::Close => button.with_tint(theme.danger, tune.danger),
-                        confirm::Choice::Cancel => button,
-                    });
-                }
-            }
-            gpu.set_glass_shapes(&shapes, overlay, scale as f32, is_light(theme), &tune);
+            )
+        } else {
+            Vec::new()
+        };
+        if self.ui.glass
+            && let Some(panel) = &self.panel
+        {
+            // The panel replaces the grid cells it covers, so its sheet goes under the grid.
+            let rect = (panel.origin_col, panel.origin_row, panel.cols, panel.rows);
+            shapes.push(sheet(rect, origin, cell, 0.0, scale, theme, tune.sheet, tune.radius));
         }
+        let overlay = shapes.len();
+        if !self.ui.glass {
+            // In opaque mode, draw both the AI limits layers and settings gear as matched,
+            // centered vector icons on top of the title bar with the same optical size.
+            if !self.title_bar.limits.is_empty() {
+                shapes.push(opaque_title_icon(
+                    &self.title_bar.limits,
+                    scrollbar.top,
+                    self.face.cell_w().max(1),
+                    scale,
+                    self.limits_hot || self.limits_open,
+                    limits_icon(limits_health),
+                    None,
+                ));
+            }
+            if !self.title_bar.settings.is_empty() {
+                shapes.push(opaque_title_icon(
+                    &self.title_bar.settings,
+                    scrollbar.top,
+                    self.face.cell_w().max(1),
+                    scale,
+                    self.settings_hot || self.ui.open,
+                    crate::gpu::ICON_GEAR,
+                    Some((theme.fg, 0.86)),
+                ));
+            }
+        }
+        if self.ui.glass
+            && let Some(dialog) = self.close_dialog.as_ref().filter(|_| self.confirm_close || self.tab_edit.is_some())
+        {
+            let rect = (dialog.origin_col, dialog.origin_row, dialog.cols, dialog.rows);
+            let pad = (f64::from(tune.dialog_pad) * scale) as f32;
+            shapes.push(sheet(rect, origin, cell, pad, scale, theme, tune.dialog, tune.radius));
+            let inset = (f64::from(tune.button_inset) * scale).round() as f32;
+            for (cols, rows, choice) in dialog.buttons() {
+                let x = origin.0 + f32::from(dialog.origin_col + cols.start) * cell.0 + inset;
+                let y = origin.1 + f32::from(dialog.origin_row + rows.start) * cell.1 + inset;
+                let w = f32::from(cols.end - cols.start) * cell.0 - 2.0 * inset;
+                let h = f32::from(rows.end - rows.start) * cell.1 - 2.0 * inset;
+                let button = GlassShape::new(x, y, w, h, GLASS_BUTTON);
+                shapes.push(match choice {
+                    confirm::Choice::Close => button.with_tint(theme.danger, tune.danger),
+                    confirm::Choice::Cancel => button,
+                });
+            }
+        } else if self.limits_open
+            && let Some(popover) = &self.limits_popover
+        {
+            push_limits_shapes(&mut shapes, popover, origin, cell, scale, theme, self.ui.glass, light, &tune);
+        }
+        gpu.set_glass_shapes(&shapes, overlay, scale as f32, light, &tune);
         if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(tab_id)) {
             tracing::warn!(%err, "frame");
         }
@@ -883,13 +956,84 @@ impl App {
             self.close_settings();
             return;
         }
+        self.close_limits();
         self.panel_dirty = true;
         self.bar_dirty = true;
         self.redraw();
     }
 
+    fn toggle_limits(&mut self) {
+        if !self.ui.limits {
+            return;
+        }
+        if self.limits_open {
+            self.close_limits();
+            return;
+        }
+        self.close_settings();
+        self.limits_open = true;
+        self.limits_dirty = true;
+        self.limits_selected = None;
+        self.bar_dirty = true;
+        self.refresh_limits(false);
+        self.redraw();
+    }
+
+    fn close_limits(&mut self) {
+        if !self.limits_open && self.limits_popover.is_none() {
+            return;
+        }
+        self.limits_open = false;
+        self.limits_popover = None;
+        self.limits_selected = None;
+        self.limits_dirty = true;
+        self.bar_dirty = true;
+        self.redraw();
+    }
+
+    fn refresh_limits(&mut self, force_cmd: bool) {
+        if self.limits_loading {
+            return;
+        }
+        let allow_cmd = self.ui.limits_cmd.is_some()
+            && (force_cmd
+                || self
+                    .last_limits_cmd
+                    .is_none_or(|at| at.elapsed() >= limits::cmd_cooldown()));
+        if allow_cmd {
+            self.last_limits_cmd = Some(Instant::now());
+        }
+        self.limits_loading = true;
+        if self.limits_open {
+            self.limits_dirty = true;
+        }
+        let cmd = self.ui.limits_cmd.clone();
+        let proxy = self.proxy.clone();
+        std::thread::Builder::new()
+            .name("rustty-limits".into())
+            .spawn(move || {
+                let snap = limits::collect(cmd.as_deref(), allow_cmd);
+                let _ = proxy.send_event(Wake::Limits(snap));
+            })
+            .ok();
+    }
+
+    fn toggle_limits_addon(&mut self) {
+        self.ui.limits = !self.ui.limits;
+        if !self.ui.limits {
+            self.close_limits();
+        } else {
+            self.refresh_limits(false);
+        }
+        self.bar_dirty = true;
+        self.panel_dirty = true;
+        self.ui.save();
+        self.redraw();
+    }
+
     fn ask_close(&mut self) {
         self.close_settings();
+        self.close_limits();
         self.confirm_close = true;
         self.confirm_dirty = true;
         self.scroll_drag = false;
@@ -933,6 +1077,7 @@ impl App {
         }
         self.bar_dirty = true;
         self.panel_dirty = true;
+        self.limits_dirty = true;
         self.ui.save();
         self.redraw();
     }
@@ -955,6 +1100,7 @@ impl App {
         }
         self.bar_dirty = true;
         self.panel_dirty = true;
+        self.limits_dirty = true;
         self.ui.save();
         self.redraw();
     }
@@ -1029,6 +1175,7 @@ impl App {
             PanelHit::PrevFont => self.apply_font(-1),
             PanelHit::NextFont => self.apply_font(1),
             PanelHit::Glass => self.toggle_glass(),
+            PanelHit::Limits => self.toggle_limits_addon(),
             PanelHit::Style(index) => self.apply_style(index),
             PanelHit::GlassLook => {
                 self.glass_page = true;
@@ -1134,6 +1281,20 @@ impl App {
             }
             return;
         }
+        if self.limits_open {
+            match event.logical_key.as_ref() {
+                Key::Named(NamedKey::Escape) => {
+                    self.close_limits();
+                    return;
+                }
+                Key::Character("r") | Key::Character("R") => {
+                    self.refresh_limits(true);
+                    self.redraw();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.ui.open && matches!(event.logical_key, Key::Named(winit::keyboard::NamedKey::Escape)) {
             if self.keys_page {
                 self.keys_page = false;
@@ -1157,6 +1318,14 @@ impl App {
             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyW))
         {
             self.start_label_edit(self.active.min(self.tabs.len() - 1));
+            return;
+        }
+        if self.mods.control_key()
+            && self.mods.shift_key()
+            && !self.mods.alt_key()
+            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyL))
+        {
+            self.toggle_limits();
             return;
         }
         let plain = event.key_without_modifiers();
@@ -1266,7 +1435,7 @@ impl App {
     }
 
     fn try_scroll_drag(&mut self) -> bool {
-        if self.ui.open || self.tabs.is_empty() {
+        if self.ui.open || self.limits_open || self.tabs.is_empty() {
             return false;
         }
         let (Some((x, y)), Some(window)) = (self.cursor, &self.window) else {
@@ -1316,7 +1485,7 @@ impl App {
             self.start_label_edit(index);
             return true;
         }
-        if self.ui.open {
+        if self.ui.open || self.limits_open {
             return false;
         }
         self.focus_tab(index);
@@ -1338,6 +1507,7 @@ impl App {
     }
 
     fn start_label_edit(&mut self, index: usize) {
+        self.close_limits();
         let Some(tab) = self.tabs.get(index) else { return };
         let text = visible_title(tab);
         self.tab_drag = None;
@@ -1786,7 +1956,7 @@ impl App {
     }
 
     fn begin_selection(&mut self) -> bool {
-        if self.ui.open || self.tabs.is_empty() {
+        if self.ui.open || self.limits_open || self.tabs.is_empty() {
             return false;
         }
         let Some((x, y)) = self.cursor else {
@@ -1908,7 +2078,7 @@ impl App {
     }
 
     fn paste(&mut self, primary: bool) {
-        if self.tabs.is_empty() || self.ui.open || self.confirm_close {
+        if self.tabs.is_empty() || self.ui.open || self.limits_open || self.confirm_close {
             return;
         }
         let Some(text) = self.clipboard.get(primary) else {
@@ -1963,11 +2133,36 @@ impl App {
             }
             return;
         }
-        if !self.confirm_close && !self.ui.open {
+        if !self.confirm_close && !self.ui.open && !self.limits_open {
                 if let Some(target) = self.link_at(x, y) {
                     open_target(&target);
                     return;
                 }
+        }
+        if self.limits_open {
+            if let Some((col, row)) = self.cell_at(x, y)
+                && let Some(popover) = &self.limits_popover
+            {
+                if let Some(hit) = popover.hit(col, row) {
+                    match hit {
+                        PopoverHit::Refresh => {
+                            self.refresh_limits(true);
+                            self.redraw();
+                        }
+                        PopoverHit::Row(idx) => {
+                            self.limits_selected = if self.limits_selected == Some(idx) { None } else { Some(idx) };
+                            self.limits_dirty = true;
+                            self.redraw();
+                        }
+                    }
+                    return;
+                }
+                if popover.contains(col, row) {
+                    return;
+                }
+            }
+            self.close_limits();
+            return;
         }
         if self.ui.open {
             if let Some((col, row)) = self.cell_at(x, y) {
@@ -1999,6 +2194,7 @@ impl App {
                 }
             }
             TitleHit::Settings => self.toggle_settings(),
+            TitleHit::Limits => self.toggle_limits(),
             TitleHit::Minimize => window.set_minimized(true),
             TitleHit::Maximize => {
                 window.set_maximized(!window.is_maximized());
@@ -2049,7 +2245,7 @@ impl App {
                 && titlebar::hit(&self.title_bar, strip_col(x, self.face.cell_w(), self.title_bar.cells.len()))
                     == TitleHit::Drag
         });
-        if !on_title || self.ui.open || self.confirm_close {
+        if !on_title || self.ui.open || self.limits_open || self.confirm_close {
             return false;
         }
         let action = match button {
@@ -2186,8 +2382,158 @@ fn glass_track_cols(cols: u16, width: u32, cell_w: u32, margin: f32) -> (u16, u1
     (left as u16, right as u16)
 }
 
+/// Maps quota health to its colored 3-layer icon variant.
+fn limits_icon(health: LimitsHealth) -> f32 {
+    match health {
+        LimitsHealth::Ok => ICON_LIMITS_OK,
+        LimitsHealth::Warn => ICON_LIMITS_WARN,
+        LimitsHealth::Crit => ICON_LIMITS_CRIT,
+    }
+}
+
+/// Centered top-bar vector icon (AI limits or settings gear) sized harmoniously for opaque mode.
+fn opaque_title_icon(
+    range: &Range<u16>,
+    chrome_h: u32,
+    cell_w: u32,
+    scale: f64,
+    lit: bool,
+    icon: f32,
+    tint: Option<(crate::color::Rgb, f32)>,
+) -> GlassShape {
+    let cw = cell_w.max(1) as f32;
+    let chrome = chrome_h as f32;
+    let s = scale as f32;
+    let mark = f32::from(range.start + (range.end - range.start) / 2);
+    let center = (mark + 0.5) * cw;
+    let slot_w = f32::from(range.end - range.start) * cw;
+    let side = (chrome * 0.72).min(slot_w * 0.84).clamp(16.0 * s, 26.0 * s);
+    let mut shape = GlassShape::new(center - side * 0.5, (chrome - side) * 0.5, side, side, GLASS_LIMITS_ICON)
+        .with_icon(icon)
+        .lit(lit);
+    if let Some((color, alpha)) = tint {
+        shape = shape.with_tint(color, alpha);
+    }
+    shape
+}
+
+/// Floating AI Limits card, hero 3-layer icon, divider, status dots and smooth gradient bars.
+#[allow(clippy::too_many_arguments)]
+fn push_limits_shapes(
+    shapes: &mut Vec<GlassShape>,
+    popover: &Popover,
+    origin: (f32, f32),
+    cell: (f32, f32),
+    scale: f64,
+    theme: Theme,
+    glass: bool,
+    light: bool,
+    tune: &crate::settings::GlassTune,
+) {
+    let s = scale as f32;
+    let pad = (f64::from(tune.dialog_pad) * scale) as f32;
+    let x = origin.0 + f32::from(popover.origin_col) * cell.0 - pad;
+    let y = origin.1 + f32::from(popover.origin_row) * cell.1 - pad * 0.5;
+    let w = f32::from(popover.cols) * cell.0 + 2.0 * pad;
+    let h = f32::from(popover.rows) * cell.1 + pad;
+    let radius = if glass { 20.0 * s } else { 12.0 * s };
+    let (card_rgb, card_alpha) = if glass && !light {
+        (crate::color::Rgb::new(0x10, 0x13, 0x1B), tune.dialog.max(0.86))
+    } else if glass {
+        (theme.panel, tune.dialog.max(0.88))
+    } else {
+        (theme.panel, 1.0)
+    };
+    shapes.push(
+        GlassShape::new(x, y, w, h, GLASS_LIMITS_CARD)
+            .with_radius(radius)
+            .with_tint(card_rgb, card_alpha)
+            .lit(glass),
+    );
+
+    // Hero 3-layer icon on the left side (or header in compact layout).
+    let (ic, ir, iw, ih) = popover.hero_icon;
+    let ix = origin.0 + f32::from(popover.origin_col + ic) * cell.0;
+    let iy = origin.1 + f32::from(popover.origin_row + ir) * cell.1;
+    let icon_w = f32::from(iw) * cell.0;
+    let icon_h = f32::from(ih) * cell.1;
+    let side = icon_w.min(icon_h).max(16.0 * s);
+    shapes.push(
+        GlassShape::new(
+            ix + (icon_w - side) * 0.5,
+            iy + (icon_h - side) * 0.5,
+            side,
+            side,
+            GLASS_LIMITS_ICON,
+        )
+        .with_icon(limits_icon(popover.health)),
+    );
+
+    // Divider hairline.
+    let line_w = (1.0 * s).max(1.0);
+    if let Some((col, r0, r1)) = popover.divider_v {
+        let dx = origin.0 + (f32::from(popover.origin_col + col) + 0.5) * cell.0 - line_w * 0.5;
+        let dy = origin.1 + f32::from(popover.origin_row + r0) * cell.1;
+        let dh = f32::from(r1.saturating_sub(r0)) * cell.1;
+        if dh >= 4.0 {
+            shapes.push(GlassShape::new(dx.round(), dy, line_w, dh, GLASS_DIVIDER));
+        }
+    }
+    if let Some((row, c0, c1)) = popover.divider_h {
+        let dx = origin.0 + f32::from(popover.origin_col + c0) * cell.0;
+        let dy = origin.1 + (f32::from(popover.origin_row + row) + 0.5) * cell.1 - line_w * 0.5;
+        let dw = f32::from(c1.saturating_sub(c0)) * cell.0;
+        if dw >= 8.0 {
+            shapes.push(GlassShape::new(dx, dy.round(), dw, line_w, GLASS_DIVIDER));
+        }
+    }
+
+    // Status dots and smooth rounded gradient progress bars.
+    let glass_flag = if glass { 1.0 } else { 0.0 };
+    let dot_d = (cell.1 * 0.36).clamp(6.0 * s, 10.0 * s);
+    let bar_h = (cell.1 * 0.38).clamp(6.0 * s, 10.0 * s);
+    for meter in &popover.meters {
+        let row_cy = origin.1 + (f32::from(popover.origin_row + meter.row) + 0.5) * cell.1;
+        let dot_cx = origin.0 + (f32::from(popover.origin_col + meter.dot_col) + 0.5) * cell.0;
+        shapes.push(
+            GlassShape::new(dot_cx - dot_d * 0.5, row_cy - dot_d * 0.5, dot_d, dot_d, GLASS_DOT)
+                .with_tint(meter.color, 1.0)
+                .with_icon(glass_flag),
+        );
+        let bx = origin.0 + f32::from(popover.origin_col + meter.bar_col) * cell.0;
+        let bw = f32::from(meter.bar_cols) * cell.0;
+        if let Some((sub_fill, sub_color)) = meter.sub {
+            let main_h = (cell.1 * 0.28).clamp(5.0 * s, 8.0 * s);
+            let sub_h = (cell.1 * 0.14).clamp(2.5 * s, 4.0 * s);
+            let gap = (2.0 * s).max(1.5);
+            let total_h = main_h + gap + sub_h;
+            let top_y = row_cy - total_h * 0.5;
+            shapes.push(
+                GlassShape::new(bx, top_y, bw, main_h, GLASS_BAR)
+                    .with_amount(meter.fill)
+                    .with_tint(meter.color, 1.0)
+                    .with_icon(glass_flag),
+            );
+            shapes.push(
+                GlassShape::new(bx, top_y + main_h + gap, bw, sub_h, GLASS_BAR)
+                    .with_amount(sub_fill)
+                    .with_tint(sub_color, 1.0)
+                    .with_icon(glass_flag),
+            );
+        } else {
+            shapes.push(
+                GlassShape::new(bx, row_cy - bar_h * 0.5, bw, bar_h, GLASS_BAR)
+                    .with_amount(meter.fill)
+                    .with_tint(meter.color, 1.0)
+                    .with_icon(glass_flag),
+            );
+        }
+    }
+}
+
 /// The glass under the bars: a capsule around the tabs with a pill on the selected one,
-/// a round button behind the settings gear, and one behind each window control.
+/// a round button behind the AI limits icon, the settings gear, and each window control.
+#[allow(clippy::too_many_arguments)]
 fn glass_shapes(
     bar: &Bar,
     title: &TitleBar,
@@ -2196,6 +2542,8 @@ fn glass_shapes(
     cell_w: u32,
     scale: f64,
     settings_lit: bool,
+    limits_lit: bool,
+    limits_health: LimitsHealth,
     maximized: bool,
     tune: &crate::settings::GlassTune,
 ) -> Vec<GlassShape> {
@@ -2241,15 +2589,16 @@ fn glass_shapes(
             }
         }
     }
-    // The gear and the window buttons share one size and one rule for their center.
+    // The addon icon, the gear and the window buttons share one size and one rule for their center.
     let maximize = if maximized { ICON_RESTORE } else { ICON_MAXIMIZE };
     let buttons = [
+        (&title.limits, Some(limits_icon(limits_health))),
         (&title.settings, None),
         (&title.minimize, Some(ICON_MINIMIZE)),
         (&title.maximize, Some(maximize)),
         (&title.close, Some(ICON_CLOSE)),
     ];
-    for (range, icon) in buttons {
+    for (index, (range, icon)) in buttons.into_iter().enumerate() {
         if range.is_empty() {
             continue;
         }
@@ -2258,9 +2607,17 @@ fn glass_shapes(
         let center = (mark + 0.5) * cw;
         let side = (cap_h - tune.button_inset * scale).min(f32::from(range.end - range.start) * cw).max(1.0);
         let button = GlassShape::new(center - side * 0.5, (chrome - side) * 0.5, side, side, GLASS_BUTTON);
-        shapes.push(match icon {
-            Some(icon) => button.with_icon(icon),
-            None => button.lit(settings_lit).with_gear(),
+        shapes.push(match (index, icon) {
+            (0, Some(icon)) => {
+                let b = button.lit(limits_lit).with_icon(icon);
+                match limits_health {
+                    LimitsHealth::Crit => b.with_tint(crate::color::Rgb::new(0xF8, 0x5A, 0x62), 0.16),
+                    LimitsHealth::Warn => b.with_tint(crate::color::Rgb::new(0xFB, 0x92, 0x3C), 0.12),
+                    LimitsHealth::Ok => b,
+                }
+            }
+            (_, Some(icon)) => button.with_icon(icon),
+            (_, None) => button.lit(settings_lit).with_gear(),
         });
     }
     shapes
@@ -2429,14 +2786,18 @@ impl ApplicationHandler<Wake> for App {
                     self.drag_tab(position.x);
                 }
                 let title_col = strip_col(position.x, self.face.cell_w(), self.title_bar.cells.len());
-                let hot = self.is_title_y(position.y) && self.title_bar.settings.contains(&title_col);
-                if hot != self.settings_hot {
+                let on_title = self.is_title_y(position.y);
+                let hot = on_title && self.title_bar.settings.contains(&title_col);
+                let lim_hot = on_title && self.title_bar.limits.contains(&title_col);
+                if hot != self.settings_hot || lim_hot != self.limits_hot {
                     self.settings_hot = hot;
+                    self.limits_hot = lim_hot;
                     self.bar_dirty = true;
                     self.redraw();
                 }
                 let bar_hover = if self.tabs.len() > 1
                     && !self.ui.open
+                    && !self.limits_open
                     && !self.confirm_close
                     && self.tab_drag.is_none()
                     && self.is_bar_y(position.y)
@@ -2452,6 +2813,7 @@ impl ApplicationHandler<Wake> for App {
                     self.redraw();
                 }
                 let cell = if self.ui.open
+                    || self.limits_open
                     || self.confirm_close
                     || self.is_title_y(position.y)
                     || self.is_bar_y(position.y)
@@ -2472,14 +2834,22 @@ impl ApplicationHandler<Wake> for App {
                 }
                 let on_label = self.tab_drag.is_none() && self.hovering_label_edit(position.x, position.y);
                 let on_close = self.tab_drag.is_none() && bar_hover.is_some_and(|item| item.close);
+                let on_popover_hit = self.limits_open
+                    && self
+                        .cell_at(position.x, position.y)
+                        .and_then(|(col, row)| self.limits_popover.as_ref().and_then(|p| p.hit(col, row)))
+                        .is_some();
+                let on_top_btn = self.limits_hot || self.settings_hot;
                 let bar_cursor = on_label
                     || on_close
+                    || on_popover_hit
+                    || on_top_btn
                     || (cell.is_none() && matches!(self.hover_icon, CursorIcon::Text | CursorIcon::Pointer));
                 if self.tab_drag.is_none() && (cell != self.link_cell || bar_cursor) {
                     self.link_cell = cell;
                     let icon = if on_label {
                         CursorIcon::Text
-                    } else if on_close {
+                    } else if on_close || on_popover_hit || on_top_btn {
                         CursorIcon::Pointer
                     } else if cell.is_some() && self.link_at(position.x, position.y).is_some() {
                         CursorIcon::Pointer
@@ -2497,7 +2867,10 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                if self.bar_hover.take().is_some() || std::mem::replace(&mut self.settings_hot, false) {
+                let cleared_bar = self.bar_hover.take().is_some();
+                let cleared_settings = std::mem::replace(&mut self.settings_hot, false);
+                let cleared_limits = std::mem::replace(&mut self.limits_hot, false);
+                if cleared_bar || cleared_settings || cleared_limits {
                     self.bar_dirty = true;
                     self.redraw();
                 }
@@ -2543,6 +2916,19 @@ impl ApplicationHandler<Wake> for App {
                     event_loop.exit();
                 }
             }
+            Wake::Limits(snap) => {
+                self.limits_loading = false;
+                let health_changed = snap.health() != self.limits_snap.health();
+                self.limits_snap = snap;
+                self.limits_fingerprint = limits::sources_fingerprint();
+                if self.limits_open {
+                    self.limits_dirty = true;
+                }
+                if health_changed || self.limits_open {
+                    self.bar_dirty = true;
+                    self.redraw();
+                }
+            }
         }
     }
 
@@ -2551,6 +2937,14 @@ impl ApplicationHandler<Wake> for App {
         if now >= self.next_agent_scan {
             self.refresh_agents();
             self.refresh_glass_tune();
+            if self.ui.limits && now >= self.next_limits_probe {
+                self.next_limits_probe = now + Duration::from_secs(30);
+                let fp = limits::sources_fingerprint();
+                if fp != self.limits_fingerprint {
+                    self.limits_fingerprint = fp;
+                    self.refresh_limits(false);
+                }
+            }
             self.next_agent_scan = now + Duration::from_secs(1);
         }
         let mut until = self.next_agent_scan;
@@ -2643,9 +3037,20 @@ pub fn run() -> anyhow::Result<()> {
             maximize: 0..0,
             close: 0..0,
             settings: 0..0,
+            limits: 0..0,
         },
         last_title_click: None,
         settings_hot: false,
+        limits_hot: false,
+        limits_open: false,
+        limits_dirty: false,
+        limits_loading: false,
+        limits_selected: None,
+        limits_snap: limits::Snapshot::default(),
+        limits_popover: None,
+        limits_fingerprint: limits::Fingerprint::default(),
+        next_limits_probe: Instant::now() + Duration::from_secs(30),
+        last_limits_cmd: None,
         bar_hover: None,
         link_cell: None,
         hover_icon: CursorIcon::Default,
@@ -2689,6 +3094,9 @@ pub fn run() -> anyhow::Result<()> {
         label_blink_at: None,
     };
     app.open_tab().context("opening the pty")?;
+    if app.ui.limits {
+        app.refresh_limits(false);
+    }
     event_loop.run_app(&mut app).context("window loop")?;
     std::thread::sleep(Duration::from_millis(20));
     Ok(())
@@ -2716,9 +3124,21 @@ mod tests {
         let theme = crate::color::theme(0);
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
         let bar = crate::tabs::render_bar(&titles, &[], 1, 100, theme, true);
-        let title = crate::titlebar::render("shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, true);
+        let title = crate::titlebar::render("shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, false, true);
         let size = PhysicalSize::new(1000, 600);
-        let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, true, false, &crate::settings::GlassTune::default());
+        let shapes = glass_shapes(
+            &bar,
+            &title,
+            size,
+            40,
+            10,
+            1.0,
+            true,
+            false,
+            crate::limits::Health::Ok,
+            false,
+            &crate::settings::GlassTune::default(),
+        );
         let kinds: Vec<u32> = shapes.iter().map(|shape| shape.kind).collect();
         assert_eq!(kinds, vec![GLASS_CONTAINER, GLASS_PILL, GLASS_BUTTON, GLASS_BUTTON]);
         let [container, pill, settings, close] = [shapes[0], shapes[1], shapes[2], shapes[3]];
@@ -2753,14 +3173,26 @@ mod tests {
         let tune = crate::settings::GlassTune::default();
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
         let title = crate::titlebar::render(
-            "shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, true,
+            "shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, false, true,
         );
         let size = PhysicalSize::new(1000, 600);
         let track = super::glass_track_cols(100, size.width, 10, tune.margin);
         assert_eq!(track, (1, 99));
         for active in [0usize, 2] {
             let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track), None, &[], None);
-            let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, false, false, &tune);
+            let shapes = glass_shapes(
+                &bar,
+                &title,
+                size,
+                40,
+                10,
+                1.0,
+                false,
+                false,
+                crate::limits::Health::Ok,
+                false,
+                &tune,
+            );
             let container = shapes[0];
             let pill = shapes[1];
             let dividers: Vec<_> = shapes.iter().filter(|shape| shape.kind == GLASS_DIVIDER).collect();

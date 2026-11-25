@@ -18,8 +18,11 @@ mod images;
 
 use frame::Frame;
 pub use glass::{
-    GlassShape, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER, DIVIDER as GLASS_DIVIDER, ICON_CLOSE,
-    ICON_GEAR, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE, PILL as GLASS_PILL, SHEET as GLASS_SHEET,
+    GlassShape, BAR as GLASS_BAR, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER,
+    DIVIDER as GLASS_DIVIDER, DOT as GLASS_DOT, ICON_CLOSE, ICON_GEAR, ICON_LIMITS_CRIT,
+    ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
+    LIMITS_CARD as GLASS_LIMITS_CARD, LIMITS_ICON as GLASS_LIMITS_ICON, PILL as GLASS_PILL,
+    SHEET as GLASS_SHEET,
 };
 use glass::Glass;
 use images::Images;
@@ -475,13 +478,11 @@ impl Renderer {
         if let Some(frame) = &mut self.frame {
             frame.set_glass(opacity.is_some());
         }
-        if opacity.is_none() {
-            self.glass_layer = None;
-        }
     }
 
-    /// Glass capsules, buttons and sheets, in physical pixels. Shapes before `overlay` are
-    /// drawn under the bars and the grid. The rest go over the grid, under the dialog text.
+    /// Vector shapes in physical pixels: glass capsules/buttons/sheets, plus the AI Limits
+    /// icon and floating card (which also draw cleanly in opaque mode). Shapes before `overlay`
+    /// are drawn under the bars and the grid; the rest go over the grid, under overlay text.
     pub fn set_glass_shapes(
         &mut self,
         shapes: &[GlassShape],
@@ -490,7 +491,7 @@ impl Renderer {
         light: bool,
         tune: &crate::settings::GlassTune,
     ) {
-        if self.glass.is_none() {
+        if shapes.is_empty() && self.glass_layer.is_none() {
             return;
         }
         let layer = self.glass_layer.get_or_insert_with(|| Glass::new(&self.device, self.config.format));
@@ -507,23 +508,70 @@ impl Renderer {
             self.dialog = None;
             return;
         };
-        let cells: Vec<_> = dialog
-            .cells
+        self.upload_overlay_cells(
+            atlas,
+            face,
+            dialog.origin_col,
+            dialog.origin_row,
+            dialog.cols,
+            dialog.rows,
+            &dialog.cells,
+            self.glass.is_some(),
+        );
+    }
+
+    pub(crate) fn upload_popover(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        popover: Option<&crate::limits::Popover>,
+    ) {
+        let Some(popover) = popover else {
+            self.dialog = None;
+            return;
+        };
+        self.upload_overlay_cells(
+            atlas,
+            face,
+            popover.origin_col,
+            popover.origin_row,
+            popover.cols,
+            popover.rows,
+            &popover.cells,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_overlay_cells(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        origin_col: u16,
+        origin_row: u16,
+        cols: u16,
+        rows: u16,
+        source: &[crate::cell::Cell],
+        transparent_bg: bool,
+    ) {
+        let max_cells = confirm::MAX_CELLS.max(crate::limits::MAX_CELLS);
+        let cells: Vec<_> = source
             .iter()
+            .take(max_cells)
             .map(|cell| resolve(atlas, face, cell))
             .collect();
         self.flush_atlas(atlas);
 
         let layer = self.dialog.get_or_insert_with(|| {
             let uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("close-dialog-uniforms"),
+                label: Some("overlay-dialog-uniforms"),
                 size: std::mem::size_of::<Uniforms>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let cells = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("close-dialog-cells"),
-                size: (confirm::MAX_CELLS * std::mem::size_of::<GpuCell>()) as u64,
+                label: Some("overlay-dialog-cells"),
+                size: (max_cells * std::mem::size_of::<GpuCell>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -550,18 +598,17 @@ impl Renderer {
         let cell_w = atlas.cell_w() as f32;
         let cell_h = atlas.cell_h() as f32;
         let uniforms = Uniforms {
-            cols: u32::from(dialog.cols),
-            rows: u32::from(dialog.rows),
+            cols: u32::from(cols),
+            rows: u32::from(rows),
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
-            pad_x: self.left_w + f32::from(dialog.origin_col) * cell_w,
-            pad_y: self.top_h + self.grid_pad_top + f32::from(dialog.origin_row) * cell_h,
+            pad_x: self.left_w + f32::from(origin_col) * cell_w,
+            pad_y: self.top_h + self.grid_pad_top + f32::from(origin_row) * cell_h,
             cell_w,
             cell_h,
             surf_w,
             surf_h: self.config.height as f32,
-            // On glass the dialog's cells in the window color let its sheet show.
-            glass: u32::from(self.glass.is_some()),
+            glass: u32::from(transparent_bg),
             glass_key: self.clear.pack(),
             ..bytemuck::Zeroable::zeroed()
         };
@@ -779,7 +826,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(glass) = self.glass_layer.as_ref().filter(|_| self.glass.is_some()) {
+            if let Some(glass) = self.glass_layer.as_ref() {
                 glass.draw(&mut pass);
             }
             pass.set_pipeline(&self.pipeline);
@@ -805,7 +852,7 @@ impl Renderer {
                     pass.draw(0..6, count..count + 1);
                 }
             }
-            if let Some(glass) = self.glass_layer.as_ref().filter(|_| self.glass.is_some()) {
+            if let Some(glass) = self.glass_layer.as_ref() {
                 glass.draw_overlay(&mut pass);
                 pass.set_pipeline(&self.pipeline);
             }

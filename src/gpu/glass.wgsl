@@ -56,6 +56,10 @@ const PILL: u32 = 1u;
 const BUTTON: u32 = 2u;
 const SHEET: u32 = 3u;
 const DIVIDER: u32 = 4u;
+const LIMITS_ICON: u32 = 5u;
+const LIMITS_CARD: u32 = 6u;
+const BAR: u32 = 7u;
+const DOT: u32 = 8u;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -135,6 +139,68 @@ fn box_distance(p: vec2<f32>, center: vec2<f32>, half: vec2<f32>) -> f32 {
     return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
 }
 
+fn ndot(a: vec2<f32>, b: vec2<f32>) -> f32 {
+    return a.x * b.x - a.y * b.y;
+}
+
+// Exact Euclidean signed distance to a symmetric diamond with half-axes `b`.
+fn sd_rhombus(p: vec2<f32>, b: vec2<f32>) -> f32 {
+    let q = abs(p);
+    let h = clamp(ndot(b - 2.0 * q, b) / max(dot(b, b), 0.0001), -1.0, 1.0);
+    let d = length(q - 0.5 * b * vec2<f32>(1.0 - h, 1.0 + h));
+    return d * sign(q.x * b.y + q.y * b.x - b.x * b.y);
+}
+
+// Three stacked isometric diamonds colored by quota health (6 = ok, 7 = warn, 8 = crit).
+fn layers_icon(p: vec2<f32>, center: vec2<f32>, side: f32, icon: u32, light: bool) -> vec4<f32> {
+    let rx = 0.35 * side;
+    let ry = 0.165 * side;
+    let rr = max(0.025 * side, 0.5);
+    let step = 0.155 * side;
+    let gap = max(0.035 * side, 0.9);
+    let c0 = center + vec2<f32>(0.0, -0.165 * side);
+    let c1 = c0 + vec2<f32>(0.0, step);
+    let c2 = c0 + vec2<f32>(0.0, 2.0 * step);
+
+    let d0 = sd_rhombus(p - c0, vec2<f32>(rx, ry)) - rr;
+    let d1_raw = sd_rhombus(p - c1, vec2<f32>(rx, ry)) - rr;
+    let d2_raw = sd_rhombus(p - c2, vec2<f32>(rx, ry)) - rr;
+    let d1 = max(d1_raw, -(d0 - gap));
+    let d2 = max(d2_raw, -(d1_raw - gap));
+
+    let a0 = clamp(0.5 - d0, 0.0, 1.0);
+    let a1 = clamp(0.5 - d1, 0.0, 1.0);
+    let a2 = clamp(0.5 - d2, 0.0, 1.0);
+
+    let gx = clamp((p.x - (center.x - rx)) / max(2.0 * rx, 1.0), 0.0, 1.0);
+    var col0: vec3<f32>;
+    var col1: vec3<f32>;
+    var col2: vec3<f32>;
+    if (icon == 8u) {
+        col0 = mix(vec3<f32>(1.00, 0.40, 0.44), vec3<f32>(0.96, 0.24, 0.46), gx);
+        col1 = mix(vec3<f32>(0.99, 0.58, 0.28), vec3<f32>(0.94, 0.36, 0.38), gx);
+        col2 = mix(vec3<f32>(0.82, 0.36, 0.76), vec3<f32>(0.64, 0.40, 0.92), gx);
+    } else if (icon == 7u) {
+        col0 = mix(vec3<f32>(1.00, 0.82, 0.30), vec3<f32>(0.98, 0.60, 0.24), gx);
+        col1 = mix(vec3<f32>(0.94, 0.66, 0.48), vec3<f32>(0.86, 0.48, 0.36), gx);
+        col2 = mix(vec3<f32>(0.60, 0.54, 0.96), vec3<f32>(0.76, 0.62, 0.96), gx);
+    } else {
+        col0 = mix(vec3<f32>(0.08, 0.96, 0.84), vec3<f32>(0.10, 0.80, 1.00), gx);
+        col1 = mix(vec3<f32>(0.18, 0.74, 0.98), vec3<f32>(0.38, 0.58, 0.98), gx);
+        col2 = mix(vec3<f32>(0.56, 0.54, 0.98), vec3<f32>(0.76, 0.68, 0.98), gx);
+    }
+    if (light) {
+        col0 = col0 * 0.84;
+        col1 = col1 * 0.84;
+        col2 = col2 * 0.84;
+    }
+
+    var out = vec4<f32>(col2 * a2, a2);
+    out = over(vec4<f32>(col1 * a1, a1), out);
+    out = over(vec4<f32>(col0 * a0, a0), out);
+    return out;
+}
+
 // The window controls as strokes, all with one weight, sized on the button.
 fn control_distance(icon: u32, p: vec2<f32>, c: vec2<f32>, side: f32) -> f32 {
     let w = 0.085 * side;
@@ -177,6 +243,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // Measured before any branch: derivatives need every pixel of the quad.
     let g = gear_distance(p, center, min(half.x, half.y) * 0.50);
     let gear_cover = clamp(0.5 - g / max(fwidth(g), 0.001), 0.0, 1.0);
+    let g_flat = gear_distance(p, center, min(half.x, half.y) * 0.68);
+    let gear_flat_cover = clamp(0.5 - g_flat / max(fwidth(g_flat), 0.001), 0.0, 1.0);
     // 0 at the top edge of the shape, 1 at the bottom.
     let t = clamp((p.y - shape.rect.y) / max(shape.rect.w, 1.0), 0.0, 1.0);
     let depth = -d;
@@ -185,6 +253,113 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         let tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
         let a = select(0.14, 0.16, light) * cover;
         return vec4<f32>(tint * a, a);
+    }
+
+    if (shape.kind == LIMITS_ICON) {
+        var out = vec4<f32>(0.0);
+        if (shape.lit > 0.01) {
+            let hover_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+            let ha = shape.lit * select(0.11, 0.09, light) * cover;
+            out = vec4<f32>(hover_tint * ha, ha);
+        }
+        let icon = u32(shape.icon + 0.5);
+        if (icon == 1u) {
+            let ink_col = select(vec3<f32>(look.ink), shape.tint.rgb, shape.tint.a > 0.0);
+            let base_a = select(look.ink_alpha, shape.tint.a, shape.tint.a > 0.0);
+            let a = gear_flat_cover * clamp(base_a + shape.lit * 0.12, 0.0, 1.0);
+            return over(vec4<f32>(ink_col * a, a), out);
+        }
+        let side = 2.0 * min(half.x, half.y);
+        let mark = layers_icon(p, center, side * 0.92, icon, light);
+        return over(mark, out);
+    }
+
+    if (shape.kind == LIMITS_CARD) {
+        let glass_on = shape.lit > 0.5;
+        let spread = max(look.sheet_spread * s, 0.001);
+        let d_drop = sd_round(p - vec2<f32>(0.0, look.sheet_y * s), center, half, r);
+        let drop_strength = select(look.sheet_shadow * 0.85, look.sheet_shadow * 1.15, glass_on);
+        let drop = (1.0 - smoothstep(-0.3 * spread, spread, d_drop)) * drop_strength;
+        var card = vec4<f32>(0.0, 0.0, 0.0, drop * (1.0 - cover));
+
+        let body_a = select(1.0, shape.tint.a, glass_on);
+        let body = vec4<f32>(shape.tint.rgb * body_a, body_a) * cover;
+        card = over(body, card);
+
+        let u = clamp((p.x - shape.rect.x) / max(shape.rect.z, 1.0), 0.0, 1.0);
+        if (glass_on) {
+            let frost = mix(look.frost_top * 1.15, look.frost_bottom, t) * cover;
+            card = over(vec4<f32>(frost), card);
+
+            // Subtle ambient corner sheen echoing the cyan-violet-copper rim.
+            let left_glow = exp(-length(vec2<f32>(u * 1.4, t * 1.2)) * 2.2) * select(0.09, 0.04, light);
+            let right_glow = exp(-length(vec2<f32>((1.0 - u) * 1.5, (1.0 - t) * 1.3)) * 2.3) * select(0.08, 0.035, light);
+            let sheen = vec3<f32>(0.10, 0.82, 0.96) * left_glow + vec3<f32>(0.76, 0.44, 0.86) * right_glow;
+            card = over(vec4<f32>(sheen * cover, (left_glow + right_glow) * 0.35 * cover), card);
+
+            // Iridescent luminous rim: cyan -> violet/magenta -> warm copper-rose.
+            let c_left = vec3<f32>(0.10, 0.88, 1.00);
+            let c_mid = vec3<f32>(0.72, 0.44, 0.98);
+            let c_right = vec3<f32>(0.94, 0.62, 0.56);
+            let spectrum = select(
+                mix(c_left, c_mid, u * 2.0),
+                mix(c_mid, c_right, (u - 0.5) * 2.0),
+                u > 0.5,
+            );
+            let edge_fade = mix(1.0, 0.32, smoothstep(0.28, 1.0, t));
+            let rim_w = 1.35 * s;
+            let rim = (1.0 - smoothstep(0.0, rim_w, abs(d))) * edge_fade * select(0.78, 0.52, light);
+            let inner_glow = (1.0 - smoothstep(0.0, 7.5 * s, max(depth, 0.0))) * cover * edge_fade * select(0.16, 0.07, light);
+            let edge_a = clamp(rim + inner_glow, 0.0, 1.0);
+            card = over(vec4<f32>(spectrum * edge_a, edge_a), card);
+        } else {
+            // Opaque mode: crisp subtle themed border without glass bloom.
+            let border_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+            let rim = (1.0 - smoothstep(0.0, 1.15 * s, abs(d))) * select(0.16, 0.18, light);
+            card = over(vec4<f32>(border_tint * rim, rim), card);
+        }
+        return card;
+    }
+
+    if (shape.kind == BAR) {
+        let glass_on = shape.icon > 0.5;
+        let fill = clamp(shape.lit, 0.0, 1.0);
+        let track_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+        let track_a = select(0.09, 0.11, light) * cover;
+        var out = vec4<f32>(track_tint * track_a, track_a);
+
+        if (fill > 0.005) {
+            let min_w = min(shape.rect.w, shape.rect.z);
+            let fill_w = clamp(shape.rect.z * fill, min_w, shape.rect.z);
+            let f_half = vec2<f32>(fill_w * 0.5, half.y);
+            let f_center = vec2<f32>(shape.rect.x + f_half.x, center.y);
+            let f_r = min(r, f_half.x);
+            let d_fill = sd_round(p, f_center, f_half, f_r);
+            let f_cover = clamp(0.5 - d_fill, 0.0, 1.0) * cover;
+
+            let fx = clamp((p.x - shape.rect.x) / max(fill_w, 1.0), 0.0, 1.0);
+            let left_col = shape.tint.rgb * 0.80 + vec3<f32>(0.04, 0.02, 0.12);
+            let right_col = min(shape.tint.rgb * 1.16 + vec3<f32>(0.06), vec3<f32>(1.0));
+            var bar_col = mix(left_col, right_col, fx);
+            if (glass_on) {
+                let top_sheen = (1.0 - smoothstep(0.0, 0.55, t)) * 0.20;
+                bar_col = min(bar_col + vec3<f32>(top_sheen), vec3<f32>(1.0));
+                let glow = (1.0 - smoothstep(0.0, 5.0 * s, max(d_fill, 0.0))) * select(0.24, 0.10, light) * (1.0 - f_cover);
+                out = over(vec4<f32>(shape.tint.rgb * glow, glow), out);
+            }
+            out = over(vec4<f32>(bar_col * f_cover, f_cover), out);
+        }
+        return out;
+    }
+
+    if (shape.kind == DOT) {
+        let glass_on = shape.icon > 0.5;
+        var out = vec4<f32>(0.0);
+        if (glass_on) {
+            let glow = (1.0 - smoothstep(0.0, 4.0 * s, max(d, 0.0))) * select(0.30, 0.12, light) * (1.0 - cover);
+            out = vec4<f32>(shape.tint.rgb * glow, glow);
+        }
+        return over(vec4<f32>(shape.tint.rgb * cover, cover), out);
     }
 
     if (shape.kind == PILL) {
@@ -233,7 +408,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let icon = u32(shape.icon + 0.5);
-    if (icon != 0u) {
+    if (icon >= 6u) {
+        let side = 2.0 * min(half.x, half.y);
+        let mark = layers_icon(p, center, side * 0.80, icon, light);
+        color = over(mark, color);
+    } else if (icon != 0u) {
         var mark = gear_cover;
         if (icon >= 2u) {
             let side = 2.0 * min(half.x, half.y);

@@ -14,6 +14,14 @@ pub const BUTTON: u32 = 2;
 pub const SHEET: u32 = 3;
 /// A subtle vertical hairline separating two inactive tabs inside the capsule.
 pub const DIVIDER: u32 = 4;
+/// Standalone colored 3-layer isometric icon (top bar in opaque mode, or hero inside AI Limits).
+pub const LIMITS_ICON: u32 = 5;
+/// Floating AI Limits popover card (`lit > 0.5` enables frosted glass + iridescent rim).
+pub const LIMITS_CARD: u32 = 6;
+/// Smooth rounded progress bar (`lit` = fill fraction `0..=1`, `icon > 0.5` = glass glow).
+pub const BAR: u32 = 7;
+/// Crisp colored status dot (`icon > 0.5` = subtle glass glow).
+pub const DOT: u32 = 8;
 
 pub const ICON_NONE: f32 = 0.0;
 pub const ICON_GEAR: f32 = 1.0;
@@ -21,8 +29,11 @@ pub const ICON_CLOSE: f32 = 2.0;
 pub const ICON_MINIMIZE: f32 = 3.0;
 pub const ICON_MAXIMIZE: f32 = 4.0;
 pub const ICON_RESTORE: f32 = 5.0;
+pub const ICON_LIMITS_OK: f32 = 6.0;
+pub const ICON_LIMITS_WARN: f32 = 7.0;
+pub const ICON_LIMITS_CRIT: f32 = 8.0;
 
-const MAX_SHAPES: usize = 32;
+const MAX_SHAPES: usize = 64;
 
 /// A rounded rectangle in physical pixels.
 #[repr(C)]
@@ -67,6 +78,11 @@ impl GlassShape {
 
     pub fn lit(mut self, lit: bool) -> Self {
         self.lit = if lit { 1.0 } else { 0.0 };
+        self
+    }
+
+    pub fn with_amount(mut self, value: f32) -> Self {
+        self.lit = value.clamp(0.0, 1.0);
         self
     }
 }

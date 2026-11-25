@@ -22,6 +22,7 @@ mod ft;
 pub mod gpu;
 mod graphics;
 pub mod input;
+pub mod limits;
 pub mod npu;
 pub mod pty;
 mod scope;

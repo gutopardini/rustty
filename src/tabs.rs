@@ -6,8 +6,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::Agent;
 use crate::cell::{
-    AGENT_ICON, BOLD, Cell, QUAD, REVERSE, SPACER, TAB, TAB_ACTIVE, TAB_FROM_LEFT_SHIFT, TAB_FROM_RIGHT_SHIFT,
-    WIDE,
+    AGENT_ICON, BOLD, Cell, DIM, QUAD, REVERSE, SPACER, TAB, TAB_ACTIVE, TAB_FROM_LEFT_SHIFT,
+    TAB_FROM_RIGHT_SHIFT, WIDE,
 };
 use crate::color::Theme;
 
@@ -15,10 +15,20 @@ use crate::color::Theme;
 pub struct TabSpan {
     pub start: u16,
     pub end: u16,
+    /// Visible close column when the tab is active or hovered.
     pub close: Option<u16>,
+    /// Column where the close button sits when shown, used for hover detection.
+    pub(crate) close_slot: Option<u16>,
     /// First column of the title text, and how many columns that text may use.
     pub label_at: u16,
     pub label_cols: u16,
+}
+
+/// Pointer hover state on the tab strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BarHover {
+    pub tab: usize,
+    pub close: bool,
 }
 
 /// Draft shown in one tab while its label is being typed.
@@ -63,11 +73,12 @@ pub fn render_bar(
     theme: Theme,
     glass: bool,
 ) -> Bar {
-    render_bar_in(titles, agents, active, cols, theme, glass, None, None, &[])
+    render_bar_in(titles, agents, active, cols, theme, glass, None, None, &[], None)
 }
 
 /// `track` is the column range under the glass capsule. Labels sit in that range,
 /// split the same way the pill splits the capsule.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_bar_in(
     titles: &[String],
     agents: &[Option<Agent>],
@@ -78,6 +89,7 @@ pub(crate) fn render_bar_in(
     track: Option<(u16, u16)>,
     edit: Option<LabelEdit<'_>>,
     custom: &[bool],
+    hover: Option<BarHover>,
 ) -> Bar {
     let cols = usize::from(cols);
     if titles.is_empty() || cols == 0 {
@@ -135,37 +147,22 @@ pub(crate) fn render_bar_in(
             };
         }
         let span = end - start;
-        // Wide tabs get more air at the edges. The icon keeps one cell to each side,
-        // the same as the number before it.
-        let (lead, tail) = if span >= 20 { (4, 4) } else { (1, 1) };
+        // Compact left-aligned padding keeps titles readable without truncating early,
+        // and anchors the close button neatly inside the right edge.
+        let (lead, tail) = if span >= 16 { (2, 2) } else { (1, 1) };
         let icon_gap = 1;
-        let close = if span >= lead + icon_gap + tail + 6 {
+        let close_slot = if span >= lead + icon_gap + tail + 6 {
             Some((end - tail - 1) as u16)
         } else {
             None
         };
-        // One breathing cell separates the title from the close button.
-        let reserve = if close.is_some() { tail + 2 } else { 0 };
+        let show_close = active_tab || hover.is_some_and(|item| item.tab == index);
+        let close = close_slot.filter(|_| show_close);
+        // Reserve the close slot consistently so hovering a tab never shifts its title.
+        let reserve = if close_slot.is_some() { tail + 2 } else { tail };
         let label_end = end.saturating_sub(reserve);
         let editing = edit.as_ref().copied().filter(|item| item.index == index);
         let custom_label = custom.get(index).copied().unwrap_or(false);
-        // On glass the number, icon and title sit in the middle of the segment, as the
-        // labels of a segmented control. They move left only when the close mark needs room.
-        let lead = if glass {
-            let number = (index + 1).to_string().len();
-            let fixed = number + 1 + 2 + icon_gap;
-            let room = label_end.saturating_sub(start + lead + fixed);
-            let title_width = match editing {
-                Some(edit) => edited_columns(edit, room),
-                None if custom_label => fit_plain(title, room).1,
-                None => fit_title(title, room).1,
-            };
-            let content = fixed + title_width;
-            let centered = span.saturating_sub(content) / 2;
-            centered.min(label_end.saturating_sub(start + content)).max(lead)
-        } else {
-            lead
-        };
         let prefix = format!("{:lead$}{} ", "", index + 1, lead = lead);
         let can_fit_prefix_and_icon = start + prefix.width() + 2 <= label_end;
         let mut text_start = start;
@@ -195,19 +192,30 @@ pub(crate) fn render_bar_in(
             paint_caret(&mut cells[text_start..label_end], cursor_col, fg, bg, flags);
         }
         let number_at = start + lead;
-        if active_tab && number_at < end.saturating_sub(reserve) {
-            // The number also marks the active tab when the bar is full.
-            let prefix_end = (number_at + (index + 1).to_string().len()).min(end.saturating_sub(reserve));
+        if can_fit_prefix_and_icon && number_at < label_end {
+            let prefix_end = (number_at + (index + 1).to_string().len()).min(label_end);
+            let (num_fg, num_flags) = if active_tab {
+                (theme.accent.pack(), BOLD)
+            } else {
+                (theme.muted.pack(), DIM)
+            };
             for cell in &mut cells[number_at..prefix_end] {
-                cell.fg = theme.accent.pack();
+                cell.fg = num_fg;
+                cell.flags = num_flags;
             }
         }
         if let Some(col) = close {
+            let close_hot = hover.is_some_and(|item| item.tab == index && item.close);
+            let (close_fg, close_flags) = if close_hot {
+                (theme.fg.pack(), BOLD)
+            } else {
+                (theme.tab_fg.pack(), 0)
+            };
             cells[col as usize] = Cell {
                 cp: u32::from('×'),
-                fg,
+                fg: close_fg,
                 bg,
-                flags,
+                flags: close_flags,
             };
         }
         // The shader rounds the ends. The gap between them separates tabs of the same color.
@@ -218,6 +226,7 @@ pub(crate) fn render_bar_in(
             start: start as u16,
             end: end as u16,
             close,
+            close_slot,
             label_at: text_start as u16,
             label_cols: room as u16,
         });
@@ -236,6 +245,16 @@ pub fn hit(bar: &Bar, col: u16) -> Option<BarHit> {
     } else {
         None
     }
+}
+
+/// Tab under `col` and whether the pointer sits over its close slot.
+pub(crate) fn hover(bar: &Bar, col: u16) -> Option<BarHover> {
+    let index = bar.spans.iter().position(|span| (span.start..span.end).contains(&col))?;
+    let span = bar.spans[index];
+    Some(BarHover {
+        tab: index,
+        close: span.close_slot == Some(col),
+    })
 }
 
 /// Tab under `col`, including the margin past the first and last tabs.
@@ -414,17 +433,6 @@ struct EditWindow {
     visible: String,
     cursor_col: usize,
     origin: usize,
-    columns: usize,
-}
-
-fn columns_of(text: &str) -> usize {
-    text.chars().map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0)).sum()
-}
-
-fn edited_columns(edit: LabelEdit<'_>, room: usize) -> usize {
-    let window = edit_window(edit.text, room, edit.cursor);
-    let caret = usize::from(window.cursor_col >= window.columns && window.cursor_col < room);
-    window.columns + caret
 }
 
 /// The slice of a label that fits in `width` columns, with the cursor kept on screen.
@@ -433,7 +441,7 @@ fn edit_window(text: &str, width: usize, cursor: usize) -> EditWindow {
     let widths: Vec<usize> = chars.iter().map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0)).collect();
     let cursor = cursor.min(chars.len());
     if width == 0 {
-        return EditWindow { visible: String::new(), cursor_col: 0, origin: cursor, columns: 0 };
+        return EditWindow { visible: String::new(), cursor_col: 0, origin: cursor };
     }
     let caret_extra = usize::from(cursor == chars.len());
     let total = widths.iter().sum::<usize>() + caret_extra;
@@ -442,7 +450,6 @@ fn edit_window(text: &str, width: usize, cursor: usize) -> EditWindow {
             visible: text.to_string(),
             cursor_col: widths[..cursor].iter().sum(),
             origin: 0,
-            columns: total - caret_extra,
         };
     }
     if cursor < chars.len() && widths[cursor] >= width {
@@ -451,7 +458,6 @@ fn edit_window(text: &str, width: usize, cursor: usize) -> EditWindow {
             visible,
             cursor_col: 0,
             origin: cursor,
-            columns: widths[cursor].min(width),
         };
     }
     // One column stays free for a leading ellipsis when the start scrolls away.
@@ -481,12 +487,11 @@ fn edit_window(text: &str, width: usize, cursor: usize) -> EditWindow {
     let body: String = chars[start..end].iter().collect();
     let cursor_col = widths[start..cursor].iter().sum();
     if start == 0 {
-        EditWindow { columns: columns_of(&body), cursor_col, origin: 0, visible: body }
+        EditWindow { cursor_col, origin: 0, visible: body }
     } else {
         let mut visible = String::from("…");
         visible.push_str(&body);
         EditWindow {
-            columns: columns_of(&visible),
             cursor_col: 1 + cursor_col,
             origin: start,
             visible,
@@ -645,8 +650,8 @@ mod tests {
         let bar = render_bar(&["shell".into()], &[], 0, 100, theme, false);
         assert_eq!(bar.spans[0].start, 0);
         assert_eq!(bar.spans[0].end, 100);
-        assert_eq!(bar.cells[4].cp, u32::from('1'));
-        assert_eq!(bar.cells[4].fg, theme.accent.pack());
+        assert_eq!(bar.cells[2].cp, u32::from('1'));
+        assert_eq!(bar.cells[2].fg, theme.accent.pack());
         assert_eq!(bar.cells[50].bg, theme.bg.pack());
         assert_eq!(hit(&bar, 50), Some(BarHit::Select(0)));
         assert_eq!(hit(&bar, 99), Some(BarHit::Select(0)));
@@ -675,11 +680,11 @@ mod tests {
         let icons: Vec<_> = agents.iter().copied().map(Some).collect();
         let bar = render_bar(&titles, &icons, 0, 120, crate::color::theme(0), false);
         for (index, span) in bar.spans.iter().enumerate() {
-            let icon = &bar.cells[usize::from(span.start) + 6];
+            let icon = &bar.cells[usize::from(span.start) + 4];
             assert_eq!(icon.cp, agents[index].icon());
             let shape = TAB | if index == 0 { TAB_ACTIVE } else { 0 };
             assert_eq!(icon.flags & (AGENT_ICON | WIDE | TAB | TAB_ACTIVE), AGENT_ICON | WIDE | shape);
-            assert_eq!(bar.cells[usize::from(span.start) + 7].flags, SPACER);
+            assert_eq!(bar.cells[usize::from(span.start) + 5].flags, SPACER);
         }
     }
 
@@ -715,9 +720,9 @@ mod tests {
         let bar = render_bar(&titles, &agents, 0, 120, theme, false);
         for span in &bar.spans {
             let start = usize::from(span.start);
-            assert_eq!(bar.cells[start + 7].flags, SPACER);
-            assert_eq!(bar.cells[start + 8].cp, 0);
-            assert_eq!(bar.cells[start + 9].cp, u32::from('P'));
+            assert_eq!(bar.cells[start + 5].flags, SPACER);
+            assert_eq!(bar.cells[start + 6].cp, 0);
+            assert_eq!(bar.cells[start + 7].cp, u32::from('P'));
         }
         assert_eq!(without_status("~/Git ✳ x"), "~/Git ✳ x");
         assert_eq!(without_status("* "), "* ");
@@ -728,12 +733,12 @@ mod tests {
     fn shell_tab_uses_rustty_icon_when_no_agent_is_running() {
         let theme = crate::color::theme(0);
         let bar = render_bar(&["shell".into()], &[None], 0, 80, theme, false);
-        assert_eq!(bar.cells[6].cp, crate::agent::RUSTTY_ICON);
+        assert_eq!(bar.cells[4].cp, crate::agent::RUSTTY_ICON);
         assert_eq!(
-            bar.cells[6].flags & (AGENT_ICON | WIDE | TAB | TAB_ACTIVE),
+            bar.cells[4].flags & (AGENT_ICON | WIDE | TAB | TAB_ACTIVE),
             AGENT_ICON | WIDE | TAB | TAB_ACTIVE
         );
-        assert_eq!(bar.cells[7].flags, SPACER);
+        assert_eq!(bar.cells[5].flags, SPACER);
     }
 
     #[test]
@@ -754,25 +759,55 @@ mod tests {
     }
 
     #[test]
-    fn glass_labels_sit_in_the_middle_of_their_segment() {
+    fn glass_tabs_left_align_and_show_close_on_active_or_hover_only() {
         let theme = crate::color::theme(0);
-        let bar = render_bar(&["alpha".into(), "beta".into()], &[None, None], 0, 100, theme, true);
-        for span in &bar.spans {
-            let (start, end) = (usize::from(span.start), usize::from(span.end));
-            let painted: Vec<usize> = (start..end)
-                .filter(|&col| ![0, u32::from(' '), u32::from('×')].contains(&bar.cells[col].cp))
-                .collect();
-            let left = painted[0] - start;
-            let right = end - 1 - painted[painted.len() - 1];
-            assert!(left.abs_diff(right) <= 2, "{left} {right}");
-        }
+        let titles = vec!["personal".to_string(), "Claude Code".to_string(), "Cursor Agent".to_string()];
+        let bar = render_bar_in(&titles, &[], 2, 92, theme, true, Some((1, 91)), None, &[], None);
+        // Active tab (2) shows its close mark and keeps the full title without truncating.
+        assert!(bar.spans[0].close.is_none());
+        assert!(bar.spans[1].close.is_none());
+        let active_close = bar.spans[2].close.expect("active close");
+        assert_eq!(bar.cells[usize::from(active_close)].cp, u32::from('×'));
+        assert_eq!(bar.spans[2].end - 1 - active_close, 2);
+        // Left-aligned: number sits 2 cols from the start of each tab.
+        assert_eq!(bar.cells[usize::from(bar.spans[0].start) + 2].cp, u32::from('1'));
+        assert_eq!(bar.cells[usize::from(bar.spans[2].start) + 2].cp, u32::from('3'));
+        let active_label: String = bar.cells
+            [usize::from(bar.spans[2].label_at)..usize::from(bar.spans[2].label_at + bar.spans[2].label_cols)]
+            .iter()
+            .filter_map(|cell| char::from_u32(cell.cp))
+            .filter(|ch| *ch != '\0')
+            .collect();
+        assert_eq!(active_label.trim_end(), "Cursor Agent");
+
+        // Hovering inactive tab 0 reveals its close button without shifting its title.
+        let slot = bar.spans[0].close_slot.expect("close slot");
+        assert_eq!(hover(&bar, slot), Some(BarHover { tab: 0, close: true }));
+        let hovered = render_bar_in(
+            &titles,
+            &[],
+            2,
+            92,
+            theme,
+            true,
+            Some((1, 91)),
+            None,
+            &[],
+            Some(BarHover { tab: 0, close: true }),
+        );
+        assert_eq!(hovered.spans[0].close, Some(slot));
+        assert_eq!(hovered.spans[0].label_at, bar.spans[0].label_at);
+        assert_eq!(hovered.spans[0].label_cols, bar.spans[0].label_cols);
+        assert_eq!(hovered.cells[usize::from(slot)].cp, u32::from('×'));
+        assert_eq!(hovered.cells[usize::from(slot)].fg, theme.fg.pack());
+        assert_eq!(hit(&hovered, slot), Some(BarHit::Close(0)));
     }
 
     #[test]
     fn glass_labels_follow_the_capsule_columns() {
         let theme = crate::color::theme(0);
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
-        let bar = render_bar_in(&titles, &[], 0, 100, theme, true, Some((2, 90)), None, &[]);
+        let bar = render_bar_in(&titles, &[], 0, 100, theme, true, Some((2, 90)), None, &[], None);
         assert_eq!(bar.spans[0].start, 2);
         assert_eq!(bar.spans[2].end, 90);
         assert_eq!(bar.spans[0].end, bar.spans[1].start);
@@ -793,6 +828,7 @@ mod tests {
             None,
             Some(edit),
             &[],
+            None,
         );
         let span = bar.spans[1];
         let text: String = bar.cells[span.label_at as usize..(span.label_at + span.label_cols) as usize]
@@ -804,7 +840,7 @@ mod tests {
         let caret = bar.cells.iter().find(|cell| cell.flags & REVERSE != 0).expect("caret");
         assert_eq!(caret.cp, u32::from(' '));
         let middle = LabelEdit { index: 0, text: "beta", cursor: 1, cursor_on: true };
-        let bar = render_bar_in(&["beta".into(), "old".into()], &[], 0, 80, theme, false, None, Some(middle), &[]);
+        let bar = render_bar_in(&["beta".into(), "old".into()], &[], 0, 80, theme, false, None, Some(middle), &[], None);
         let span = bar.spans[0];
         let caret = bar.cells[span.label_at as usize..]
             .iter()
@@ -816,7 +852,7 @@ mod tests {
     #[test]
     fn a_custom_label_keeps_a_leading_mark() {
         let theme = crate::color::theme(0);
-        let bar = render_bar_in(&["* notes".into()], &[], 0, 40, theme, false, None, None, &[true]);
+        let bar = render_bar_in(&["* notes".into()], &[], 0, 40, theme, false, None, None, &[true], None);
         let text: String = bar.cells.iter().filter_map(|cell| char::from_u32(cell.cp)).collect();
         assert!(text.contains('*'), "{text}");
     }

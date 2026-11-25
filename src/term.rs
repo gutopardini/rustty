@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
@@ -8,6 +9,8 @@ use crate::color::{self, Rgb, DEFAULT_BG, DEFAULT_FG};
 use crate::graphics::{decode_job, DecodeJob, Graphics, Image, Parser, Placement, Prepared, Update};
 
 const MAX_SCROLLBACK: usize = 10_000;
+const MAX_LINK_WRAP_LINES: usize = 64;
+const MAX_OSC8_URI_LEN: usize = 8192;
 
 #[derive(Clone, Copy)]
 struct Pen {
@@ -28,10 +31,183 @@ struct Cursor {
     col: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HyperlinkSpan {
+    start: u16,
+    end: u16,
+    uri: Arc<str>,
+}
+
+struct Line {
+    cells: Vec<Cell>,
+    /// True when output autowrapped from the end of this line onto the next line.
+    wrapped: bool,
+    /// Explicit OSC 8 hyperlink spans, sorted and non-overlapping. Empty on plain lines.
+    links: Vec<HyperlinkSpan>,
+}
+
+impl Line {
+    fn new(cols: usize, blank: Cell) -> Self {
+        Self {
+            cells: vec![blank; cols],
+            wrapped: false,
+            links: Vec::new(),
+        }
+    }
+
+    fn fill(&mut self, blank: Cell) {
+        self.cells.fill(blank);
+        self.wrapped = false;
+        self.links.clear();
+    }
+
+    fn link_at(&self, col: u16) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|span| span.start <= col && col < span.end)
+            .map(|span| span.uri.as_ref())
+    }
+
+    fn clear_links(&mut self, from: u16, to: u16) {
+        if self.links.is_empty() || from >= to {
+            return;
+        }
+        let mut index = 0;
+        while index < self.links.len() {
+            let span = &self.links[index];
+            if span.end <= from || span.start >= to {
+                index += 1;
+                continue;
+            }
+            if span.start >= from && span.end <= to {
+                self.links.remove(index);
+            } else if span.start < from && span.end > to {
+                let tail = HyperlinkSpan {
+                    start: to,
+                    end: span.end,
+                    uri: Arc::clone(&span.uri),
+                };
+                self.links[index].end = from;
+                self.links.insert(index + 1, tail);
+                index += 2;
+            } else if span.start < from {
+                self.links[index].end = from;
+                index += 1;
+            } else {
+                self.links[index].start = to;
+                index += 1;
+            }
+        }
+    }
+
+    fn set_link(&mut self, from: u16, to: u16, uri: &Arc<str>) {
+        if from >= to {
+            return;
+        }
+        self.clear_links(from, to);
+        if let Some(last) = self.links.last_mut()
+            && last.end == from
+            && last.uri == *uri
+        {
+            last.end = to;
+            return;
+        }
+        let pos = self.links.partition_point(|span| span.start < from);
+        self.links.insert(
+            pos,
+            HyperlinkSpan {
+                start: from,
+                end: to,
+                uri: Arc::clone(uri),
+            },
+        );
+        if pos + 1 < self.links.len()
+            && self.links[pos].end == self.links[pos + 1].start
+            && self.links[pos].uri == self.links[pos + 1].uri
+        {
+            self.links[pos].end = self.links[pos + 1].end;
+            self.links.remove(pos + 1);
+        }
+        if pos > 0
+            && self.links[pos - 1].end == self.links[pos].start
+            && self.links[pos - 1].uri == self.links[pos].uri
+        {
+            self.links[pos - 1].end = self.links[pos].end;
+            self.links.remove(pos);
+        }
+    }
+
+    fn shift_links_left(&mut self, col: u16, n: u16) {
+        if self.links.is_empty() || n == 0 {
+            return;
+        }
+        self.clear_links(col, col.saturating_add(n));
+        for span in &mut self.links {
+            if span.start >= col.saturating_add(n) {
+                span.start -= n;
+                span.end -= n;
+            }
+        }
+        self.merge_adjacent_links();
+    }
+
+    fn shift_links_right(&mut self, col: u16, n: u16, cols: u16) {
+        if self.links.is_empty() || n == 0 {
+            return;
+        }
+        let mut next = Vec::with_capacity(self.links.len() + 1);
+        for span in self.links.drain(..) {
+            if span.end <= col {
+                next.push(span);
+            } else if span.start < col {
+                next.push(HyperlinkSpan {
+                    start: span.start,
+                    end: col,
+                    uri: Arc::clone(&span.uri),
+                });
+                let start = col.saturating_add(n);
+                let end = span.end.saturating_add(n).min(cols);
+                if start < end {
+                    next.push(HyperlinkSpan {
+                        start,
+                        end,
+                        uri: span.uri,
+                    });
+                }
+            } else {
+                let start = span.start.saturating_add(n);
+                let end = span.end.saturating_add(n).min(cols);
+                if start < end {
+                    next.push(HyperlinkSpan {
+                        start,
+                        end,
+                        uri: span.uri,
+                    });
+                }
+            }
+        }
+        self.links = next;
+    }
+
+    fn merge_adjacent_links(&mut self) {
+        let mut index = 0;
+        while index + 1 < self.links.len() {
+            if self.links[index].end == self.links[index + 1].start
+                && self.links[index].uri == self.links[index + 1].uri
+            {
+                self.links[index].end = self.links[index + 1].end;
+                self.links.remove(index + 1);
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
 struct Screen {
     /// One owned row per visual line. Scrolling rotates these vectors, so a
     /// linefeed copies the row that leaves and not the rows that stay.
-    lines: Vec<Vec<Cell>>,
+    lines: Vec<Line>,
     graphics: Graphics,
     cols: u16,
     rows: u16,
@@ -41,7 +217,7 @@ impl Screen {
     fn new(cols: u16, rows: u16, blank: Cell) -> Self {
         let cols_n = usize::from(cols);
         Self {
-            lines: (0..rows).map(|_| vec![blank; cols_n]).collect(),
+            lines: (0..rows).map(|_| Line::new(cols_n, blank)).collect(),
             graphics: Graphics::default(),
             cols,
             rows,
@@ -81,8 +257,10 @@ pub struct Term {
     primary_cursor: Cursor,
     scroll_top: u16,
     scroll_bot: u16,
-    scrollback: VecDeque<Vec<Cell>>,
-    line_pool: Vec<Vec<Cell>>,
+    scrollback: VecDeque<Line>,
+    line_pool: Vec<Line>,
+    /// Active OSC 8 hyperlink URI applied to printed cells until closed.
+    hyperlink: Option<Arc<str>>,
     /// Packed scrollback records waiting for the NPU thread. Filled when a
     /// line leaves the top, so the reader never clones the row.
     pending: Vec<[u8; 64]>,
@@ -101,7 +279,10 @@ pub struct Term {
     last_snapshot_cursor: Option<(u16, u16)>,
     app_cursor: bool,
     origin_mode: bool,
+    insert_mode: bool,
     pending_wrap: bool,
+    last_char: Option<char>,
+    tab_stops: Vec<bool>,
     bracketed_paste: bool,
     mouse_normal: bool,
     mouse_button: bool,
@@ -135,6 +316,7 @@ impl Term {
             scroll_bot: rows - 1,
             scrollback: VecDeque::new(),
             line_pool: Vec::new(),
+            hyperlink: None,
             pending: Vec::new(),
             view_offset: 0,
             dropped: 0,
@@ -149,7 +331,10 @@ impl Term {
             last_snapshot_cursor: None,
             app_cursor: false,
             origin_mode: false,
+            insert_mode: false,
             pending_wrap: false,
+            last_char: None,
+            tab_stops: default_tab_stops(cols),
             bracketed_paste: false,
             mouse_normal: false,
             mouse_button: false,
@@ -180,17 +365,17 @@ impl Term {
             }
         };
         for line in &mut self.primary.lines {
-            for cell in line {
+            for cell in &mut line.cells {
                 repaint(cell);
             }
         }
         for line in &mut self.alt.lines {
-            for cell in line {
+            for cell in &mut line.cells {
                 repaint(cell);
             }
         }
         for line in &mut self.scrollback {
-            for cell in line {
+            for cell in &mut line.cells {
                 repaint(cell);
             }
         }
@@ -535,6 +720,7 @@ impl Term {
         self.primary_cursor.row = self.primary_cursor.row.min(rows - 1);
         self.primary_cursor.col = self.primary_cursor.col.min(cols - 1);
         self.pending_wrap = false;
+        resize_tab_stops(&mut self.tab_stops, cols);
         self.dirty = vec![true; usize::from(rows)];
         self.damage_all = true;
         self.view_offset = 0;
@@ -632,13 +818,313 @@ impl Term {
 
     /// Address or file path covering this cell of the visible screen.
     /// A trailing `:line` or `:line:column` stays clickable, and the returned path omits it.
+    /// Follows OSC 8 hyperlinks, soft-wrapped logical lines, and TUI-wrapped multi-line URLs.
     pub fn link_at(&self, row: u16, col: u16) -> Option<String> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
-        let mut cells = Vec::with_capacity(usize::from(self.cols));
-        self.append_visible(row, &mut cells);
-        url_covering(&cells, usize::from(col))
+        let target = self.visible_index(row);
+        let line = self.line_at(target)?;
+        if let Some(uri) = line.link_at(col) {
+            return classify_osc8(uri);
+        }
+        let (first, last) = self.soft_wrapped_span(target);
+        if first < last {
+            let mut combined = Vec::new();
+            let mut target_col = None;
+            for idx in first..=last {
+                let Some(part) = self.line_at(idx) else {
+                    return None;
+                };
+                let mut slice = part.cells.as_slice();
+                if idx < last && slice.last().is_some_and(|cell| cell.is_empty()) {
+                    slice = &slice[..slice.len() - 1];
+                }
+                if idx == target {
+                    let col = usize::from(col);
+                    if col >= slice.len() {
+                        return None;
+                    }
+                    target_col = Some(combined.len() + col);
+                }
+                combined.extend_from_slice(slice);
+            }
+            return target_col.and_then(|offset| url_covering(&combined, offset));
+        }
+        if let Some(url) = self.hard_wrapped_url_at(target, usize::from(col)) {
+            return Some(url);
+        }
+        url_covering(&line.cells, usize::from(col))
+    }
+
+    fn total_lines(&self) -> usize {
+        self.scrollback.len() + usize::from(self.rows)
+    }
+
+    fn visible_index(&self, row: u16) -> usize {
+        let history = self.scrollback.len();
+        let start = history.saturating_sub(self.view_offset);
+        start + usize::from(row)
+    }
+
+    fn line_at(&self, index: usize) -> Option<&Line> {
+        let history = self.scrollback.len();
+        if index < history {
+            self.scrollback.get(index)
+        } else {
+            self.screen().lines.get(index - history)
+        }
+    }
+
+    fn soft_wrapped_span(&self, target: usize) -> (usize, usize) {
+        let mut first = target;
+        let min_first = target.saturating_sub(MAX_LINK_WRAP_LINES);
+        while first > min_first {
+            if self.line_at(first - 1).is_some_and(|line| line.wrapped) {
+                first -= 1;
+            } else {
+                break;
+            }
+        }
+        let total = self.total_lines();
+        let max_last = (target + MAX_LINK_WRAP_LINES).min(total.saturating_sub(1));
+        let mut last = target;
+        while last < max_last {
+            if self.line_at(last).is_some_and(|line| line.wrapped) {
+                last += 1;
+            } else {
+                break;
+            }
+        }
+        (first, last)
+    }
+
+    /// Reconstructs a multi-line `http://` / `https://` URL wrapped explicitly by a TUI
+    /// (with cursor moves or newlines rather than terminal autowrap), including indented
+    /// or box-bordered layouts.
+    fn hard_wrapped_url_at(&self, target: usize, col: usize) -> Option<String> {
+        let target_line = self.line_at(target)?;
+        let (_, hovered_ch) = cell_char_at(&target_line.cells, col)?;
+        if is_link_delim(hovered_ch) || is_vertical_border(target_line.cells[col]) {
+            return None;
+        }
+        let left_border = (0..col)
+            .rev()
+            .find(|&c| is_vertical_border(target_line.cells[c]))
+            .map(|c| (c, target_line.cells[c].cp));
+        let right_border = ((col + 1)..target_line.cells.len())
+            .find(|&c| is_vertical_border(target_line.cells[c]))
+            .map(|c| (c, target_line.cells[c].cp));
+        let region_lo = left_border.map_or(0, |(c, _)| c + 1);
+        let region_hi = right_border.map_or(target_line.cells.len(), |(c, _)| c);
+        if region_hi <= region_lo + 8 {
+            return None;
+        }
+
+        let target_frame = frame_slice(target_line, region_lo, region_hi, left_border, right_border)?;
+        if col < target_frame.start_abs || col >= target_frame.end_abs {
+            return None;
+        }
+        let (tok_start, tok_end) =
+            token_covering_col(&target_line.cells, target_frame.start_abs, target_frame.end_abs, col)?;
+        let tok_text = token_text(&target_line.cells, tok_start, tok_end);
+
+        let (start_idx, url_start_abs) = if starts_with_scheme(&tok_text) && tok_end == target_frame.end_abs {
+            (target, tok_start)
+        } else if is_scheme_prefix(&tok_text) && tok_end == target_frame.end_abs {
+            let next_line = self.line_at(target + 1)?;
+            let next_frame = frame_slice(next_line, region_lo, region_hi, left_border, right_border)?;
+            let next_tok_end = leading_token_end(&next_line.cells, next_frame.start_abs, next_frame.end_abs)?;
+            let next_head = token_text(&next_line.cells, next_frame.start_abs, next_tok_end);
+            if starts_with_scheme(&format!("{tok_text}{next_head}")) {
+                (target, tok_start)
+            } else {
+                return None;
+            }
+        } else if tok_start == target_frame.start_abs && !starts_with_scheme(&tok_text) {
+            let cont_indent = target_frame.indent;
+            let mut cur = target;
+            let mut cur_head = tok_text;
+            let mut found = None;
+            while cur > 0 && target - cur < MAX_LINK_WRAP_LINES {
+                let prev_idx = cur - 1;
+                let Some(prev_line) = self.line_at(prev_idx) else {
+                    break;
+                };
+                if prev_line.wrapped {
+                    break;
+                }
+                let Some(prev_frame) =
+                    frame_slice(prev_line, region_lo, region_hi, left_border, right_border)
+                else {
+                    break;
+                };
+                let Some(prev_tok_start) =
+                    trailing_token_start(&prev_line.cells, prev_frame.start_abs, prev_frame.end_abs)
+                else {
+                    break;
+                };
+                let prev_tail = token_text(&prev_line.cells, prev_tok_start, prev_frame.end_abs);
+                let starts_here = starts_with_scheme(&prev_tail)
+                    || (is_scheme_prefix(&prev_tail)
+                        && starts_with_scheme(&format!("{prev_tail}{cur_head}")));
+                if starts_here {
+                    let indent_ok =
+                        region_lo + cont_indent <= prev_tok_start || prev_frame.indent == cont_indent;
+                    if indent_ok {
+                        found = Some((prev_idx, prev_tok_start));
+                    }
+                    break;
+                }
+                if prev_frame.indent == cont_indent && prev_tok_start == prev_frame.start_abs {
+                    cur_head = prev_tail;
+                    cur = prev_idx;
+                } else {
+                    break;
+                }
+            }
+            found?
+        } else {
+            return None;
+        };
+
+        let start_line = self.line_at(start_idx)?;
+        if start_line.wrapped {
+            return None;
+        }
+        let start_frame = frame_slice(start_line, region_lo, region_hi, left_border, right_border)?;
+        let mut wrap_col = start_frame.content_end;
+
+        let second_idx = start_idx + 1;
+        let second_line = self.line_at(second_idx)?;
+        let second_frame = frame_slice(second_line, region_lo, region_hi, left_border, right_border)?;
+        let cont_indent = second_frame.indent;
+        if !(region_lo + cont_indent <= url_start_abs || start_frame.indent == cont_indent) {
+            return None;
+        }
+        let mut last_tok_end =
+            leading_token_end(&second_line.cells, second_frame.start_abs, second_frame.end_abs)?;
+        let second_head = token_text(&second_line.cells, second_frame.start_abs, last_tok_end);
+        if starts_with_scheme(&second_head) {
+            return None;
+        }
+        if last_tok_end == second_frame.end_abs && second_frame.content_end > wrap_col {
+            wrap_col = second_frame.content_end;
+        }
+
+        let mut frames = vec![(start_idx, start_frame), (second_idx, second_frame)];
+        while frames.len() <= MAX_LINK_WRAP_LINES {
+            let (cur_idx, cur_frame) = *frames.last().expect("non-empty");
+            let Some(cur_line) = self.line_at(cur_idx) else {
+                break;
+            };
+            let next_idx = cur_idx + 1;
+            let Some(next_line) = self.line_at(next_idx) else {
+                break;
+            };
+            let Some(next_frame) =
+                frame_slice(next_line, region_lo, region_hi, left_border, right_border)
+            else {
+                break;
+            };
+            if last_tok_end != cur_frame.end_abs
+                || cur_line.wrapped
+                || next_frame.indent != cont_indent
+            {
+                break;
+            }
+            let Some(next_tok_end) =
+                leading_token_end(&next_line.cells, next_frame.start_abs, next_frame.end_abs)
+            else {
+                break;
+            };
+            let next_head = token_text(&next_line.cells, next_frame.start_abs, next_tok_end);
+            if starts_with_scheme(&next_head) {
+                break;
+            }
+            let reached_wrap = cur_frame.content_end.abs_diff(wrap_col) <= 2
+                || broke_at_url_sep(cur_line, cur_frame, &next_head, wrap_col);
+            if !reached_wrap {
+                break;
+            }
+            if next_tok_end == next_frame.end_abs && next_frame.content_end > wrap_col {
+                wrap_col = next_frame.content_end;
+            }
+            frames.push((next_idx, next_frame));
+            last_tok_end = next_tok_end;
+        }
+
+        let end_idx = frames.last()?.0;
+        if target < start_idx || target > end_idx {
+            return None;
+        }
+
+        // Verify the hovered column lies inside the URL span on `target`.
+        let hovered_in_url = if target == start_idx {
+            col >= url_start_abs && col < start_frame.end_abs
+        } else if target == end_idx {
+            let end_frame = frames.last()?.1;
+            col >= end_frame.start_abs && col < last_tok_end
+        } else {
+            let mid_frame = frames[target - start_idx].1;
+            col >= mid_frame.start_abs && col < mid_frame.end_abs
+        };
+        if !hovered_in_url {
+            return None;
+        }
+
+        // Anti-false-positive wrap margin check: all wrapped lines must reach the wrap margin
+        // (or break at a URL separator where the next segment did not fit), and that margin must
+        // either reach the region edge or repeat across 3+ lines.
+        let wrapped_lines = &frames[..frames.len() - 1];
+        for (pos, &(idx, frame)) in wrapped_lines.iter().enumerate() {
+            if frame.content_end.abs_diff(wrap_col) <= 2 {
+                continue;
+            }
+            let cur_line = self.line_at(idx)?;
+            let (next_idx, next_frame) = frames[pos + 1];
+            let next_line = self.line_at(next_idx)?;
+            let next_end = if pos + 1 == frames.len() - 1 {
+                last_tok_end
+            } else {
+                next_frame.end_abs
+            };
+            let next_head = token_text(&next_line.cells, next_frame.start_abs, next_end);
+            if !broke_at_url_sep(cur_line, frame, &next_head, wrap_col) {
+                return None;
+            }
+        }
+        let tail_tok_end_rel = last_tok_end.saturating_sub(region_lo);
+        if tail_tok_end_rel > wrap_col + 2 {
+            return None;
+        }
+        let region_width = region_hi - region_lo;
+        let hits_edge = if right_border.is_some() {
+            wrap_col + cont_indent.min(4) + 2 >= region_width
+        } else if cont_indent == 0 {
+            wrap_col + 1 >= region_width
+        } else {
+            wrap_col + cont_indent + 2 >= region_width
+        };
+        let repeated_column = frames.len() >= 3
+            && wrap_col.saturating_sub(cont_indent) >= 40
+            && wrapped_lines
+                .iter()
+                .filter(|(_, frame)| frame.content_end.abs_diff(wrap_col) <= 1)
+                .count()
+                >= 2;
+        if !hits_edge && !repeated_column {
+            return None;
+        }
+
+        let mut joined = String::new();
+        for (pos, &(idx, frame)) in frames.iter().enumerate() {
+            let line = self.line_at(idx)?;
+            let from = if pos == 0 { url_start_abs } else { frame.start_abs };
+            let to = if pos + 1 == frames.len() { last_tok_end } else { frame.end_abs };
+            joined.push_str(&token_text(&line.cells, from, to));
+        }
+        classify_link(&joined).filter(|url| starts_with_scheme(url))
     }
 
     /// Text between two absolute positions `(col, line)`, in reading order.
@@ -703,13 +1189,13 @@ impl Term {
         let index = line.checked_sub(self.dropped).and_then(|index| usize::try_from(index).ok());
         match index {
             Some(index) if index < history => {
-                let src = &self.scrollback[index];
+                let src = &self.scrollback[index].cells;
                 let n = src.len().min(cols);
                 dst.extend_from_slice(&src[..n]);
                 dst.resize(dst.len() + (cols - n), blank);
             }
             Some(index) if index - history < usize::from(self.rows) => {
-                dst.extend_from_slice(&self.screen().lines[index - history]);
+                dst.extend_from_slice(&self.screen().lines[index - history].cells);
             }
             _ => dst.resize(dst.len() + cols, blank),
         }
@@ -718,7 +1204,7 @@ impl Term {
     fn append_visible(&self, row: u16, dst: &mut Vec<Cell>) {
         let cols = usize::from(self.cols);
         if self.view_offset == 0 {
-            dst.extend_from_slice(&self.screen().lines[usize::from(row)]);
+            dst.extend_from_slice(&self.screen().lines[usize::from(row)].cells);
             return;
         }
         let blank = Cell::blank(self.default_fg.pack(), self.default_bg.pack());
@@ -727,13 +1213,13 @@ impl Term {
         let start = total - self.view_offset - usize::from(self.rows);
         let index = start + usize::from(row);
         if index < history {
-            let src = &self.scrollback[index];
+            let src = &self.scrollback[index].cells;
             let n = src.len().min(cols);
             dst.extend_from_slice(&src[..n]);
             dst.resize(dst.len() + (cols - n), blank);
         } else {
             let live = (index - history) as u16;
-            dst.extend_from_slice(&self.screen().lines[usize::from(live)]);
+            dst.extend_from_slice(&self.screen().lines[usize::from(live)].cells);
         }
     }
 
@@ -760,11 +1246,11 @@ impl Term {
     }
 
     fn cell(&self, row: u16, col: u16) -> Cell {
-        self.screen().lines[usize::from(row)][usize::from(col)]
+        self.screen().lines[usize::from(row)].cells[usize::from(col)]
     }
 
     fn write_cell(&mut self, row: u16, col: u16, cell: Cell) {
-        self.screen_mut().lines[usize::from(row)][usize::from(col)] = cell;
+        self.screen_mut().lines[usize::from(row)].cells[usize::from(col)] = cell;
         self.mark(row);
     }
 
@@ -780,6 +1266,19 @@ impl Term {
     }
 
     fn linefeed(&mut self) {
+        let row = usize::from(self.cursor.row);
+        self.screen_mut().lines[row].wrapped = false;
+        self.linefeed_inner();
+    }
+
+    fn wrap_line(&mut self) {
+        let row = usize::from(self.cursor.row);
+        self.screen_mut().lines[row].wrapped = true;
+        self.carriage_return();
+        self.linefeed_inner();
+    }
+
+    fn linefeed_inner(&mut self) {
         self.pending_wrap = false;
         if self.cursor.row == self.scroll_bot {
             self.scroll_region(self.scroll_top, self.scroll_bot, 1);
@@ -809,7 +1308,7 @@ impl Term {
             fresh.reserve(shift);
             for _ in 0..shift {
                 let mut line = self.alloc_line();
-                line.resize(cols, blank);
+                line.cells.resize(cols, blank);
                 fresh.push(line);
             }
         }
@@ -843,24 +1342,29 @@ impl Term {
         }
     }
 
-    fn alloc_line(&mut self) -> Vec<Cell> {
-        let mut line = self
-            .line_pool
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(usize::from(self.cols)));
-        line.clear();
+    fn alloc_line(&mut self) -> Line {
+        let mut line = self.line_pool.pop().unwrap_or_else(|| Line {
+            cells: Vec::with_capacity(usize::from(self.cols)),
+            wrapped: false,
+            links: Vec::new(),
+        });
+        line.cells.clear();
+        line.wrapped = false;
+        line.links.clear();
         line
     }
 
-    fn recycle(&mut self, mut line: Vec<Cell>) {
+    fn recycle(&mut self, mut line: Line) {
         if self.line_pool.len() < 128 {
-            line.clear();
+            line.cells.clear();
+            line.wrapped = false;
+            line.links.clear();
             self.line_pool.push(line);
         }
     }
 
-    fn remember(&mut self, line: Vec<Cell>) {
-        self.pending.push(crate::npu::pack_entry(&line));
+    fn remember(&mut self, line: Line) {
+        self.pending.push(crate::npu::pack_entry(&line.cells));
         self.scrollback.push_back(line);
         while self.scrollback.len() > MAX_SCROLLBACK {
             if let Some(old) = self.scrollback.pop_front() {
@@ -889,9 +1393,14 @@ impl Term {
             return;
         }
         let blank = self.blank();
-        let end_col = usize::from(to.min(self.cols));
+        let end_col = to.min(self.cols);
+        let cols = self.cols;
         let line = &mut self.screen_mut().lines[usize::from(row)];
-        line[usize::from(from)..end_col].fill(blank);
+        line.cells[usize::from(from)..usize::from(end_col)].fill(blank);
+        line.clear_links(from, end_col);
+        if end_col >= cols {
+            line.wrapped = false;
+        }
         self.mark(row);
     }
 
@@ -901,9 +1410,11 @@ impl Term {
         if cell.flags & WIDE != 0 && col + 1 < self.cols {
             self.write_cell(row, col, blank);
             self.write_cell(row, col + 1, blank);
+            self.screen_mut().lines[usize::from(row)].clear_links(col, col + 2);
         } else if cell.flags & SPACER != 0 && col > 0 {
             self.write_cell(row, col - 1, blank);
             self.write_cell(row, col, blank);
+            self.screen_mut().lines[usize::from(row)].clear_links(col - 1, col + 1);
         }
     }
 
@@ -913,16 +1424,17 @@ impl Term {
             return;
         }
         if self.pending_wrap && self.autowrap {
-            self.carriage_return();
-            self.linefeed();
+            self.wrap_line();
         }
         if self.cursor.col + width > self.cols {
             if self.autowrap {
-                self.carriage_return();
-                self.linefeed();
+                self.wrap_line();
             } else {
                 return;
             }
+        }
+        if self.insert_mode {
+            self.insert_cells(width);
         }
         self.clear_wide_at(self.cursor.row, self.cursor.col);
         if width == 2 && self.cursor.col + 1 < self.cols {
@@ -932,9 +1444,11 @@ impl Term {
         if width == 2 {
             flags |= WIDE;
         }
+        let row = self.cursor.row;
+        let col = self.cursor.col;
         self.write_cell(
-            self.cursor.row,
-            self.cursor.col,
+            row,
+            col,
             Cell {
                 cp: ch as u32,
                 fg: self.pen.fg.pack(),
@@ -942,10 +1456,10 @@ impl Term {
                 flags,
             },
         );
-        if width == 2 && self.cursor.col + 1 < self.cols {
+        if width == 2 && col + 1 < self.cols {
             self.write_cell(
-                self.cursor.row,
-                self.cursor.col + 1,
+                row,
+                col + 1,
                 Cell {
                     cp: 0,
                     fg: self.pen.fg.pack(),
@@ -954,7 +1468,13 @@ impl Term {
                 },
             );
         }
-        let next = self.cursor.col + width;
+        let link_end = col.saturating_add(width).min(self.cols);
+        if let Some(uri) = self.hyperlink.clone() {
+            self.screen_mut().lines[usize::from(row)].set_link(col, link_end, &uri);
+        } else {
+            self.screen_mut().lines[usize::from(row)].clear_links(col, link_end);
+        }
+        let next = col + width;
         if next >= self.cols {
             self.cursor.col = self.cols - width;
             self.pending_wrap = self.autowrap;
@@ -967,6 +1487,7 @@ impl Term {
     fn reset_soft(&mut self) {
         let blank = Cell::blank(self.default_fg.pack(), self.default_bg.pack());
         self.pen = Pen::reset(self.default_fg, self.default_bg);
+        self.hyperlink = None;
         self.primary = Screen::new(self.cols, self.rows, blank);
         self.alt = Screen::new(self.cols, self.rows, blank);
         self.alt_on = false;
@@ -979,7 +1500,10 @@ impl Term {
         self.cursor_visible = true;
         self.app_cursor = false;
         self.origin_mode = false;
+        self.insert_mode = false;
         self.pending_wrap = false;
+        self.last_char = None;
+        self.tab_stops = default_tab_stops(self.cols);
         self.bracketed_paste = false;
         self.mouse_normal = false;
         self.mouse_button = false;
@@ -995,6 +1519,8 @@ impl Term {
         if enable == self.alt_on {
             return;
         }
+        self.hyperlink = None;
+        self.last_char = None;
         if enable {
             self.primary_cursor = self.cursor;
             let blank = self.blank();
@@ -1109,10 +1635,56 @@ impl Term {
             }
         }
     }
+    fn soft_reset_modes(&mut self) {
+        self.pen = Pen::reset(self.default_fg, self.default_bg);
+        self.hyperlink = None;
+        self.last_char = None;
+        self.scroll_top = 0;
+        self.scroll_bot = self.rows - 1;
+        self.autowrap = true;
+        self.cursor_visible = true;
+        self.app_cursor = false;
+        self.origin_mode = false;
+        self.insert_mode = false;
+        self.pending_wrap = false;
+        self.tab_stops = default_tab_stops(self.cols);
+    }
+
+    fn tab_forward(&mut self, count: u16) {
+        self.pending_wrap = false;
+        let last_col = self.cols.saturating_sub(1);
+        for _ in 0..count.max(1) {
+            if self.cursor.col >= last_col {
+                self.cursor.col = last_col;
+                break;
+            }
+            let mut next = usize::from(self.cursor.col) + 1;
+            let limit = usize::from(last_col);
+            while next < limit && !self.tab_stops.get(next).copied().unwrap_or(false) {
+                next += 1;
+            }
+            self.cursor.col = next as u16;
+        }
+    }
+
+    fn tab_backward(&mut self, count: u16) {
+        self.pending_wrap = false;
+        for _ in 0..count.max(1) {
+            if self.cursor.col == 0 {
+                break;
+            }
+            let mut prev = usize::from(self.cursor.col) - 1;
+            while prev > 0 && !self.tab_stops.get(prev).copied().unwrap_or(false) {
+                prev -= 1;
+            }
+            self.cursor.col = prev as u16;
+        }
+    }
 }
 
 impl Perform for Term {
     fn print(&mut self, ch: char) {
+        self.last_char = Some(ch);
         if self.put_ascii(ch) {
             return;
         }
@@ -1130,14 +1702,7 @@ impl Perform for Term {
                     self.cursor.col -= 1;
                 }
             }
-            b'\t' => {
-                let next = ((self.cursor.col / 8) + 1) * 8;
-                self.cursor.col = next.min(self.cols.saturating_sub(1));
-                if next >= self.cols {
-                    self.pending_wrap = self.autowrap;
-                    self.cursor.col = self.cols.saturating_sub(1);
-                }
-            }
+            b'\t' => self.tab_forward(1),
             _ => {}
         }
     }
@@ -1152,6 +1717,10 @@ impl Perform for Term {
                 'l' => self.dec_mode(params, false),
                 _ => {}
             }
+            return;
+        }
+        if intermediates == [b'!'] && action == 'p' {
+            self.soft_reset_modes();
             return;
         }
         if !intermediates.is_empty() {
@@ -1175,17 +1744,25 @@ impl Perform for Term {
         match action {
             'A' => {
                 let n = p(0, 1);
-                let floor = if self.origin_mode { self.scroll_top } else { 0 };
+                let floor = if self.origin_mode || self.cursor.row >= self.scroll_top {
+                    self.scroll_top
+                } else {
+                    0
+                };
                 let row = self.cursor.row.saturating_sub(n).max(floor);
                 self.move_to(row, self.cursor.col);
             }
-            'B' => {
+            'B' | 'e' => {
                 let n = p(0, 1);
-                let ceil = if self.origin_mode { self.scroll_bot } else { self.rows - 1 };
+                let ceil = if self.origin_mode || self.cursor.row <= self.scroll_bot {
+                    self.scroll_bot
+                } else {
+                    self.rows - 1
+                };
                 let row = self.cursor.row.saturating_add(n).min(ceil);
                 self.move_to(row, self.cursor.col);
             }
-            'C' => {
+            'C' | 'a' => {
                 let n = p(0, 1);
                 let col = self.cursor.col.saturating_add(n).min(self.cols - 1);
                 self.move_to(self.cursor.row, col);
@@ -1205,7 +1782,7 @@ impl Perform for Term {
                 let row = self.cursor.row.saturating_sub(n);
                 self.move_to(row, 0);
             }
-            'G' => {
+            'G' | '`' => {
                 let col = p(0, 1).saturating_sub(1).min(self.cols - 1);
                 self.move_to(self.cursor.row, col);
             }
@@ -1219,7 +1796,36 @@ impl Perform for Term {
                 }
                 self.move_to(row, col);
             }
+            'I' => self.tab_forward(p(0, 1)),
+            'Z' => self.tab_backward(p(0, 1)),
+            'b' => {
+                if let Some(ch) = self.last_char {
+                    let max = usize::from(self.cols).saturating_mul(usize::from(self.rows));
+                    let n = usize::from(p(0, 1)).min(max);
+                    for _ in 0..n {
+                        self.print(ch);
+                    }
+                }
+            }
+            'g' => match raw(0) {
+                0 => {
+                    if let Some(slot) = self.tab_stops.get_mut(usize::from(self.cursor.col)) {
+                        *slot = false;
+                    }
+                }
+                3 => self.tab_stops.fill(false),
+                _ => {}
+            },
+            'h' | 'l' => {
+                let enable = action == 'h';
+                for group in params.iter() {
+                    if group.first().copied() == Some(4) {
+                        self.insert_mode = enable;
+                    }
+                }
+            }
             'J' => {
+                self.pending_wrap = false;
                 let mode = raw(0);
                 match mode {
                     0 => {
@@ -1250,6 +1856,7 @@ impl Perform for Term {
                 }
             }
             'K' => {
+                self.pending_wrap = false;
                 let mode = raw(0);
                 match mode {
                     0 => self.clear_span(self.cursor.row, self.cursor.col, self.cols),
@@ -1259,24 +1866,35 @@ impl Perform for Term {
                 }
             }
             'L' => {
+                self.pending_wrap = false;
                 if (self.scroll_top..=self.scroll_bot).contains(&self.cursor.row) {
+                    self.cursor.col = 0;
                     self.scroll_region(self.cursor.row, self.scroll_bot, -(p(0, 1) as i16));
                 }
             }
             'M' => {
+                self.pending_wrap = false;
                 if (self.scroll_top..=self.scroll_bot).contains(&self.cursor.row) {
+                    self.cursor.col = 0;
                     self.scroll_region(self.cursor.row, self.scroll_bot, p(0, 1) as i16);
                 }
             }
-            'P' => self.delete_cells(p(0, 1)),
+            'P' => {
+                self.pending_wrap = false;
+                self.delete_cells(p(0, 1));
+            }
             'S' => self.scroll_region(self.scroll_top, self.scroll_bot, p(0, 1) as i16),
             'T' => self.scroll_region(self.scroll_top, self.scroll_bot, -(p(0, 1) as i16)),
             'X' => {
+                self.pending_wrap = false;
                 let n = p(0, 1);
                 let end = self.cursor.col.saturating_add(n).min(self.cols);
                 self.clear_span(self.cursor.row, self.cursor.col, end);
             }
-            '@' => self.insert_cells(p(0, 1)),
+            '@' => {
+                self.pending_wrap = false;
+                self.insert_cells(p(0, 1));
+            }
             'd' => {
                 let row = p(0, 1).saturating_sub(1).min(self.rows - 1);
                 self.move_to(row, self.cursor.col);
@@ -1322,6 +1940,11 @@ impl Perform for Term {
             b'8' => self.move_to(self.saved.row, self.saved.col),
             b'c' => self.reset_soft(),
             b'D' => self.linefeed(),
+            b'H' => {
+                if let Some(slot) = self.tab_stops.get_mut(usize::from(self.cursor.col)) {
+                    *slot = true;
+                }
+            }
             b'M' => {
                 if self.cursor.row == self.scroll_top {
                     self.scroll_region(self.scroll_top, self.scroll_bot, -1);
@@ -1352,6 +1975,10 @@ impl Perform for Term {
                 format!("\x1b]{code};rgb:{r:04x}/{g:04x}/{b:04x}\x1b\\").as_bytes(),
             );
         }
+        if params[0] == b"8" {
+            self.hyperlink = parse_osc8_uri(params);
+            return;
+        }
         if params[0] == b"0" || params[0] == b"2" {
             let title = String::from_utf8_lossy(params[1]);
             let title = title.trim().to_string();
@@ -1366,7 +1993,8 @@ impl Perform for Term {
 impl Term {
     fn delete_cells(&mut self, n: u16) {
         let row = self.cursor.row;
-        let col = usize::from(self.cursor.col);
+        let col_u16 = self.cursor.col;
+        let col = usize::from(col_u16);
         let cols = usize::from(self.cols);
         let n = usize::from(n).min(cols.saturating_sub(col));
         if n == 0 {
@@ -1374,23 +2002,29 @@ impl Term {
         }
         let blank = self.blank();
         let line = &mut self.screen_mut().lines[usize::from(row)];
-        line.copy_within(col + n..cols, col);
-        line[cols - n..].fill(blank);
+        line.cells.copy_within(col + n..cols, col);
+        line.cells[cols - n..].fill(blank);
+        line.shift_links_left(col_u16, n as u16);
+        line.wrapped = false;
         self.mark(row);
     }
 
     fn insert_cells(&mut self, n: u16) {
         let row = self.cursor.row;
-        let col = usize::from(self.cursor.col);
-        let cols = usize::from(self.cols);
+        let col_u16 = self.cursor.col;
+        let col = usize::from(col_u16);
+        let cols_u16 = self.cols;
+        let cols = usize::from(cols_u16);
         let n = usize::from(n).min(cols.saturating_sub(col));
         if n == 0 {
             return;
         }
         let blank = self.blank();
         let line = &mut self.screen_mut().lines[usize::from(row)];
-        line.copy_within(col..cols - n, col + n);
-        line[col..col + n].fill(blank);
+        line.cells.copy_within(col..cols - n, col + n);
+        line.cells[col..col + n].fill(blank);
+        line.shift_links_right(col_u16, n as u16, cols_u16);
+        line.wrapped = false;
         self.mark(row);
     }
 
@@ -1398,7 +2032,7 @@ impl Term {
     #[inline(always)]
     fn put_ascii(&mut self, ch: char) -> bool {
         let byte = ch as u32;
-        if byte < 0x20 || byte >= 0x7f || self.pending_wrap {
+        if byte < 0x20 || byte >= 0x7f || self.pending_wrap || self.insert_mode || self.hyperlink.is_some() {
             return false;
         }
         let row = self.cursor.row;
@@ -1408,10 +2042,11 @@ impl Term {
         }
         let row_i = usize::from(row);
         let col_i = usize::from(col);
-        if self.screen().lines[row_i][col_i].flags & (WIDE | SPACER) != 0 {
+        let line = &self.screen().lines[row_i];
+        if line.cells[col_i].flags & (WIDE | SPACER) != 0 || !line.links.is_empty() {
             return false;
         }
-        self.screen_mut().lines[row_i][col_i] = Cell {
+        self.screen_mut().lines[row_i].cells[col_i] = Cell {
             cp: byte,
             fg: self.pen.fg.pack(),
             bg: self.pen.bg.pack(),
@@ -1465,17 +2100,14 @@ fn columns(ch: char) -> u16 {
 fn url_covering(cells: &[Cell], col: usize) -> Option<String> {
     let mut text = String::new();
     let mut columns = Vec::new();
-    let mut cursor = 0usize;
-    for cell in cells {
+    for (index, cell) in cells.iter().enumerate() {
         if cell.flags & SPACER != 0 {
-            cursor += 1;
             continue;
         }
         let ch = char::from_u32(cell.cp).filter(|ch| !ch.is_control()).unwrap_or(' ');
         let width = if cell.flags & WIDE != 0 { 2 } else { 1 };
-        columns.push((text.len(), cursor, cursor + width));
+        columns.push((text.len(), index, index + width));
         text.push(ch);
-        cursor += width;
     }
     let mut index = 0;
     while index < text.len() {
@@ -1662,12 +2294,236 @@ fn apply_color(pen: &mut Pen, foreground: bool, spec: &[u16]) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FrameLine {
+    indent: usize,
+    content_end: usize,
+    start_abs: usize,
+    end_abs: usize,
+}
+
+fn is_blank_cell(cell: Cell) -> bool {
+    (cell.cp == 0 || cell.cp == u32::from(b' ')) && (cell.flags & (WIDE | SPACER) == 0)
+}
+
+fn is_vertical_border(cell: Cell) -> bool {
+    matches!(char::from_u32(cell.cp), Some('│' | '┃' | '║'))
+}
+
+fn cell_char_at(cells: &[Cell], col: usize) -> Option<(usize, char)> {
+    let cell = *cells.get(col)?;
+    let pos = if cell.flags & SPACER != 0 {
+        col.checked_sub(1)?
+    } else {
+        col
+    };
+    let cell = *cells.get(pos)?;
+    if cell.cp == 0 {
+        return None;
+    }
+    let ch = char::from_u32(cell.cp).filter(|ch| !ch.is_control())?;
+    Some((pos, ch))
+}
+
+fn frame_slice(
+    line: &Line,
+    region_lo: usize,
+    region_hi: usize,
+    left_border: Option<(usize, u32)>,
+    right_border: Option<(usize, u32)>,
+) -> Option<FrameLine> {
+    if let Some((col, cp)) = left_border
+        && !line.cells.get(col).is_some_and(|cell| cell.cp == cp)
+    {
+        return None;
+    }
+    if let Some((col, cp)) = right_border
+        && !line.cells.get(col).is_some_and(|cell| cell.cp == cp)
+    {
+        return None;
+    }
+    let hi = region_hi.min(line.cells.len());
+    if region_lo >= hi {
+        return None;
+    }
+    let mut start_abs = region_lo;
+    while start_abs < hi && is_blank_cell(line.cells[start_abs]) {
+        start_abs += 1;
+    }
+    let mut end_abs = hi;
+    while end_abs > start_abs && is_blank_cell(line.cells[end_abs - 1]) {
+        end_abs -= 1;
+    }
+    if start_abs >= end_abs {
+        return None;
+    }
+    Some(FrameLine {
+        indent: start_abs - region_lo,
+        content_end: end_abs - region_lo,
+        start_abs,
+        end_abs,
+    })
+}
+
+fn is_non_delim_at(cells: &[Cell], col: usize) -> bool {
+    cell_char_at(cells, col).is_some_and(|(_, ch)| !is_link_delim(ch) && !is_vertical_border(cells[col]))
+}
+
+fn token_covering_col(cells: &[Cell], start_abs: usize, end_abs: usize, col: usize) -> Option<(usize, usize)> {
+    let (pos, ch) = cell_char_at(cells, col)?;
+    if pos < start_abs || pos >= end_abs || is_link_delim(ch) {
+        return None;
+    }
+    let mut tok_start = pos;
+    while tok_start > start_abs {
+        let prev = tok_start - 1;
+        let check = if cells[prev].flags & SPACER != 0 && prev > start_abs {
+            prev - 1
+        } else {
+            prev
+        };
+        if !is_non_delim_at(cells, check) {
+            break;
+        }
+        tok_start = check;
+    }
+    let mut tok_end = pos + if cells[pos].flags & WIDE != 0 { 2 } else { 1 };
+    tok_end = tok_end.min(end_abs);
+    while tok_end < end_abs {
+        if !is_non_delim_at(cells, tok_end) {
+            break;
+        }
+        let step = if cells[tok_end].flags & WIDE != 0 { 2 } else { 1 };
+        tok_end = (tok_end + step).min(end_abs);
+    }
+    Some((tok_start, tok_end))
+}
+
+fn trailing_token_start(cells: &[Cell], start_abs: usize, end_abs: usize) -> Option<usize> {
+    if start_abs >= end_abs {
+        return None;
+    }
+    let last = end_abs - 1;
+    let check = if cells[last].flags & SPACER != 0 && last > start_abs {
+        last - 1
+    } else {
+        last
+    };
+    if !is_non_delim_at(cells, check) {
+        return None;
+    }
+    let (tok_start, _) = token_covering_col(cells, start_abs, end_abs, check)?;
+    Some(tok_start)
+}
+
+fn leading_token_end(cells: &[Cell], start_abs: usize, end_abs: usize) -> Option<usize> {
+    if start_abs >= end_abs || !is_non_delim_at(cells, start_abs) {
+        return None;
+    }
+    let (_, tok_end) = token_covering_col(cells, start_abs, end_abs, start_abs)?;
+    Some(tok_end)
+}
+
+fn token_text(cells: &[Cell], from: usize, to: usize) -> String {
+    let mut out = String::new();
+    for cell in &cells[from..to.min(cells.len())] {
+        if cell.flags & SPACER != 0 {
+            continue;
+        }
+        if let Some(ch) = char::from_u32(cell.cp).filter(|ch| cell.cp != 0 && !ch.is_control()) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn starts_with_scheme(text: &str) -> bool {
+    text.starts_with("https://") || text.starts_with("http://")
+}
+
+fn is_scheme_prefix(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() < "https://".len()
+        && ("https://".starts_with(text) || "http://".starts_with(text))
+}
+
+/// True when `line` ended early at a URL break character (`-`, `/`, `&`, `?`, `=`)
+/// because the next unbreakable segment of the URL did not fit before `wrap_col`.
+fn broke_at_url_sep(line: &Line, frame: FrameLine, next_head: &str, wrap_col: usize) -> bool {
+    let Some((_, last_ch)) = cell_char_at(&line.cells, frame.end_abs.saturating_sub(1)) else {
+        return false;
+    };
+    if !matches!(last_ch, '-' | '/' | '&' | '?' | '=') {
+        return false;
+    }
+    let next_chunk_len = next_head
+        .find(['-', '/', '&', '?', '='])
+        .map_or(next_head.chars().count(), |byte| next_head[..byte].chars().count() + 1);
+    next_chunk_len > 0 && frame.content_end + next_chunk_len > wrap_col
+}
+
+fn parse_osc8_uri(params: &[&[u8]]) -> Option<Arc<str>> {
+    if params.len() < 3 {
+        return None;
+    }
+    let mut uri = String::new();
+    for (index, part) in params[2..].iter().enumerate() {
+        if index > 0 {
+            uri.push(';');
+        }
+        uri.push_str(&String::from_utf8_lossy(part));
+        if uri.len() > MAX_OSC8_URI_LEN {
+            return None;
+        }
+    }
+    if uri.is_empty() || uri.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+    Some(Arc::from(uri))
+}
+
+fn classify_osc8(uri: &str) -> Option<String> {
+    if starts_with_scheme(uri) {
+        let scheme = if uri.starts_with("https://") { "https://".len() } else { "http://".len() };
+        return (uri.len() > scheme).then(|| uri.to_string());
+    }
+    if let Some(path) = file_url_path(uri) {
+        return is_file_token(&path).then_some(path);
+    }
+    None
+}
+
+fn default_tab_stops(cols: u16) -> Vec<bool> {
+    (0..usize::from(cols)).map(|col| col > 0 && col % 8 == 0).collect()
+}
+
+fn resize_tab_stops(stops: &mut Vec<bool>, cols: u16) {
+    let target = usize::from(cols);
+    let old = stops.len();
+    stops.resize(target, false);
+    for col in old..target {
+        stops[col] = col > 0 && col % 8 == 0;
+    }
+}
+
 fn resize_screen(screen: &mut Screen, cols: u16, rows: u16, blank: Cell) {
     let mut next = Screen::new(cols, rows, blank);
     let copy_rows = usize::from(screen.rows.min(rows));
     let copy_cols = usize::from(screen.cols.min(cols));
+    let same_width = cols == screen.cols;
     for row in 0..copy_rows {
-        next.lines[row][..copy_cols].copy_from_slice(&screen.lines[row][..copy_cols]);
+        next.lines[row].cells[..copy_cols].copy_from_slice(&screen.lines[row].cells[..copy_cols]);
+        next.lines[row].wrapped = same_width && screen.lines[row].wrapped;
+        let limit = copy_cols as u16;
+        for span in &screen.lines[row].links {
+            if span.start < limit {
+                next.lines[row].links.push(HyperlinkSpan {
+                    start: span.start,
+                    end: span.end.min(limit),
+                    uri: Arc::clone(&span.uri),
+                });
+            }
+        }
     }
     next.graphics = std::mem::take(&mut screen.graphics);
     *screen = next;
@@ -2037,6 +2893,202 @@ mod tests {
         let second = term.link_at(0, 46).expect("second address");
         assert_eq!(second, "http://exemplo.test/a");
         assert_eq!(term.link_at(0, 70), None);
+    }
+
+    #[test]
+    fn soft_wrapped_multiline_url_is_clickable_on_every_line() {
+        let url = concat!(
+            "https://accounts.google.com/o/oauth2/v2/auth?",
+            "access_type=offline&client_id=1234567890-abcdef.apps.googleusercontent.com",
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback",
+            "&response_type=code&scope=openid%20email%20profile&state=xyz987654321"
+        );
+        let mut term = Term::new(40, 8);
+        term.advance(format!("Abra {url}. Depois volte.").as_bytes());
+        assert_eq!(term.link_at(0, 0), None);
+        // Every wrapped row of the URL (0..=6) returns the complete address.
+        assert_eq!(term.link_at(0, 6).as_deref(), Some(url));
+        assert_eq!(term.link_at(1, 0).as_deref(), Some(url));
+        assert_eq!(term.link_at(2, 20).as_deref(), Some(url));
+        assert_eq!(term.link_at(3, 39).as_deref(), Some(url));
+        assert_eq!(term.link_at(5, 10).as_deref(), Some(url));
+        // Tail row: inside the URL returns the full URL; prose after it returns None.
+        let tail_row = ((5 + url.len()) / 40) as u16;
+        let tail_end_col = ((5 + url.len()) % 40) as u16;
+        assert_eq!(term.link_at(tail_row, 0).as_deref(), Some(url));
+        assert_eq!(term.link_at(tail_row, tail_end_col.saturating_sub(1)).as_deref(), Some(url));
+        assert_eq!(term.link_at(tail_row, (tail_end_col + 3).min(39)), None);
+    }
+
+    #[test]
+    fn soft_wrapped_url_stays_clickable_across_scrollback_boundary() {
+        let url = concat!(
+            "https://example.com/very/long/path/with/segments/",
+            "alpha/beta/gamma/delta/epsilon/zeta/eta/theta/iota"
+        );
+        let mut term = Term::new(30, 3);
+        term.advance(format!("{url}\r\nfinal").as_bytes());
+        // Top line(s) of the URL are now in scrollback; visible rows still resolve the full URL.
+        assert_eq!(term.link_at(0, 5).as_deref(), Some(url));
+        assert_eq!(term.link_at(1, 0).as_deref(), Some(url));
+        assert_eq!(term.link_at(2, 0), None);
+        // Scroll up so the tail of the URL is below the visible screen.
+        term.scroll_view(2);
+        assert_eq!(term.link_at(0, 10).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn soft_wrapped_long_path_is_clickable_on_wrapped_lines() {
+        let path = "/home/gutopardini/Git/personal/rustty/src/graphics/very_long_module_name.rs";
+        let mut term = Term::new(30, 4);
+        term.advance(format!("erro em {path}:128:9").as_bytes());
+        assert_eq!(term.link_at(0, 10).as_deref(), Some(path));
+        assert_eq!(term.link_at(1, 5).as_deref(), Some(path));
+        assert_eq!(term.link_at(2, 15).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn osc8_hyperlink_works_across_lines_and_sgr_reset() {
+        let uri = "https://example.com/auth;v=1?token=abcdef1234567890";
+        let mut term = Term::new(20, 4);
+        term.advance(
+            format!("\x1b]8;id=1;{uri}\x1b\\\x1b[36mClick this very\x1b[0m long link\x1b]8;;\x1b\\ plain")
+                .as_bytes(),
+        );
+        assert_eq!(term.link_at(0, 0).as_deref(), Some(uri));
+        assert_eq!(term.link_at(0, 19).as_deref(), Some(uri));
+        assert_eq!(term.link_at(1, 0).as_deref(), Some(uri));
+        assert_eq!(term.link_at(1, 4).as_deref(), Some(uri));
+        assert_eq!(term.link_at(1, 7), None);
+
+        // Overwriting a cell clears its OSC 8 link span.
+        term.advance(b"\x1b[1;1HXXXXX");
+        assert_eq!(term.link_at(0, 0), None);
+        assert_eq!(term.link_at(0, 6).as_deref(), Some(uri));
+    }
+
+    #[test]
+    fn tui_hard_wrapped_urls_are_clickable_on_all_lines() {
+        let url = concat!(
+            "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline",
+            "&client_id=681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+            "&redirect_uri=https://localhost:43215/oauth2/callback&response_type=code&scope=openid"
+        );
+        // 1. Full-width CUP wrap (no terminal autowrap).
+        let mut cup = Term::new(60, 6);
+        for (row, chunk) in url.as_bytes().chunks(60).enumerate() {
+            cup.advance(format!("\x1b[{};1H", row + 1).as_bytes());
+            cup.advance(chunk);
+        }
+        for row in 0..4u16 {
+            assert_eq!(cup.link_at(row, 5).as_deref(), Some(url), "cup row {row}");
+        }
+
+        // 2. Fixed-column indented wrap (width 76 inside a 160-col terminal) with trailing text line.
+        let mut indented = Term::new(160, 8);
+        let mut row = 1;
+        for chunk in url.as_bytes().chunks(74) {
+            indented.advance(format!("\x1b[{row};1H  ").as_bytes());
+            indented.advance(chunk);
+            row += 1;
+        }
+        indented.advance(format!("\x1b[{row};1H  Press Enter to continue").as_bytes());
+        for r in 0..4u16 {
+            assert_eq!(indented.link_at(r, 4).as_deref(), Some(url), "indented row {r}");
+        }
+        // Unrelated indented line below must NOT be part of the URL.
+        assert_eq!(indented.link_at(4, 4), None);
+
+        // 3. Box-bordered wrap (`│  ...  │`).
+        let mut boxed = Term::new(80, 8);
+        boxed.advance("  ╭──────────────────────────────────────────────────────────────╮\r\n".as_bytes());
+        let inner = 60usize;
+        for chunk in url.as_bytes().chunks(inner) {
+            let text = std::str::from_utf8(chunk).unwrap();
+            boxed.advance(format!("  │ {text:<inner$} │\r\n").as_bytes());
+        }
+        boxed.advance("  ╰──────────────────────────────────────────────────────────────╯".as_bytes());
+        for r in 1..=4u16 {
+            assert_eq!(boxed.link_at(r, 5).as_deref(), Some(url), "boxed row {r}");
+        }
+        // Borders and space outside the URL are not clickable.
+        assert_eq!(boxed.link_at(1, 2), None);
+        assert_eq!(boxed.link_at(5, 10), None);
+
+        // 4. Hyphen-broken TUI wrap (e.g. `textwrap` breaking at `-` before the right edge).
+        let mut hyphen = Term::new(80, 6);
+        let part0 = "https://accounts.google.com/o/oauth2/v2/auth?client_id=681255809395-";
+        let part1 = "oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com&redirect_uri=htt";
+        let part2 = "p%3A%2F%2Flocalhost%3A43215%2Fcallback";
+        let expected = format!("{part0}{part1}{part2}");
+        hyphen.advance(format!("  {part0}\r\n  {part1}\r\n  {part2}").as_bytes());
+        for r in 0..3u16 {
+            assert_eq!(hyphen.link_at(r, 5).as_deref(), Some(expected.as_str()), "hyphen row {r}");
+        }
+    }
+
+    #[test]
+    fn separate_lines_do_not_merge_into_false_multiline_links() {
+        let mut term = Term::new(80, 6);
+        term.advance(
+            concat!(
+                "https://github.com/gutopardini/rustty\r\n",
+                "https://github.com/gutopardini/wayshot\r\n",
+                "  https://example.com/short\r\n",
+                "  Next step: run cargo test\r\n",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(term.link_at(0, 10).as_deref(), Some("https://github.com/gutopardini/rustty"));
+        assert_eq!(term.link_at(1, 10).as_deref(), Some("https://github.com/gutopardini/wayshot"));
+        assert_eq!(term.link_at(2, 10).as_deref(), Some("https://example.com/short"));
+        assert_eq!(term.link_at(3, 5), None);
+    }
+
+    #[test]
+    fn wide_emoji_before_url_keeps_click_columns_aligned() {
+        let mut term = Term::new(80, 2);
+        term.advance("🔗 https://example.com/docs".as_bytes());
+        // Emoji occupies cols 0..2, space at col 2, URL starts at col 3.
+        assert_eq!(term.link_at(0, 0), None);
+        assert_eq!(term.link_at(0, 2), None);
+        assert_eq!(term.link_at(0, 3).as_deref(), Some("https://example.com/docs"));
+        assert_eq!(term.link_at(0, 26).as_deref(), Some("https://example.com/docs"));
+        assert_eq!(term.link_at(0, 27), None);
+    }
+
+    #[test]
+    fn rep_repeats_characters_and_spaces_used_by_tui_diff_renderers() {
+        let mut term = Term::new(40, 2);
+        term.advance(b"w\x1b[15b");
+        assert_eq!(text(&term), "wwwwwwwwwwwwwwww");
+        assert_eq!(term.cursor.col, 16);
+
+        // Overwrite with spaces via REP so no stray characters remain behind.
+        term.advance(b"\x1b[1;5H \x1b[11b");
+        assert_eq!(text(&term), "wwww            ");
+        assert_eq!(term.cursor.col, 16);
+    }
+
+    #[test]
+    fn tab_stops_and_cbt_cht_never_trigger_spurious_line_wrap() {
+        let mut term = Term::new(16, 2);
+        // Tabbing to the right margin stops at col 15 without setting pending_wrap.
+        term.advance(b"ab\t\tZ");
+        assert_eq!(term.cursor.row, 0);
+        assert_eq!(term.cell(0, 15).cp, u32::from(b'Z'));
+
+        // CHT (CSI I) and CBT (CSI Z) move cleanly between 8-column stops.
+        term.advance(b"\x1b[1;1H\x1b[2IX");
+        assert_eq!(term.cell(0, 15).cp, u32::from(b'X'));
+        term.advance(b"\x1b[ZY");
+        assert_eq!(term.cell(0, 8).cp, u32::from(b'Y'));
+
+        // Insert mode (CSI 4 h / l) shifts characters right when printing.
+        term.advance(b"\x1b[2;1Habcd\x1b[2;2H\x1b[4hX\x1b[4l");
+        assert_eq!(term.cell(1, 0).cp, u32::from(b'a'));
+        assert_eq!(term.cell(1, 1).cp, u32::from(b'X'));
+        assert_eq!(term.cell(1, 2).cp, u32::from(b'b'));
     }
 
     #[test]

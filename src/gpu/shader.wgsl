@@ -49,6 +49,7 @@ struct Glyph {
 @group(0) @binding(3) var atlas: texture_2d<f32>;
 @group(0) @binding(4) var atlas_samp: sampler;
 @group(0) @binding(5) var agent_icons: texture_2d<f32>;
+@group(0) @binding(6) var icon_samp: sampler;
 
 const CURSOR_CELL: u32 = 0x80000000u;
 const EXTRA_QUAD: u32 = 0x40000000u;
@@ -208,9 +209,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         if (icon_pos.x < 0.0 || icon_pos.x > 1.0 || icon_pos.y < 0.0 || icon_pos.y > 1.0) {
             return tab_color(in.bg, in.local, in.flags);
         }
-        let uv = vec2<f32>((f32(in.slot) + clamp(icon_pos.x, 0.001, 0.999)) / 7.0, clamp(icon_pos.y, 0.001, 0.999));
-        let icon = textureSampleLevel(agent_icons, atlas_samp, uv, 0.0);
-        let painted = mix(in.bg, vec4<f32>(icon.rgb, 1.0), icon.a);
+        let uv = vec2<f32>((f32(in.slot) + clamp(icon_pos.x, 0.008, 0.992)) / 7.0, clamp(icon_pos.y, 0.008, 0.992));
+        let icon = textureSampleLevel(agent_icons, icon_samp, uv, 0.0);
+        let painted = in.bg * (1.0 - icon.a) + icon;
         return mix(unpack_color(u.composer_accent), painted, tab_cover(in.local, in.flags));
     }
     let coverage = textureSampleLevel(atlas, atlas_samp, in.uv, 0.0).r;

@@ -12,6 +12,8 @@ pub const PILL: u32 = 1;
 pub const BUTTON: u32 = 2;
 /// A dialog body: the settings panel or the close confirmation.
 pub const SHEET: u32 = 3;
+/// A subtle vertical hairline separating two inactive tabs inside the capsule.
+pub const DIVIDER: u32 = 4;
 
 pub const ICON_NONE: f32 = 0.0;
 pub const ICON_GEAR: f32 = 1.0;
@@ -20,7 +22,7 @@ pub const ICON_MINIMIZE: f32 = 3.0;
 pub const ICON_MAXIMIZE: f32 = 4.0;
 pub const ICON_RESTORE: f32 = 5.0;
 
-const MAX_SHAPES: usize = 16;
+const MAX_SHAPES: usize = 32;
 
 /// A rounded rectangle in physical pixels.
 #[repr(C)]

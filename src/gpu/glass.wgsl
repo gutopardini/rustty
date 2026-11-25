@@ -55,6 +55,7 @@ const CONTAINER: u32 = 0u;
 const PILL: u32 = 1u;
 const BUTTON: u32 = 2u;
 const SHEET: u32 = 3u;
+const DIVIDER: u32 = 4u;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -179,6 +180,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // 0 at the top edge of the shape, 1 at the bottom.
     let t = clamp((p.y - shape.rect.y) / max(shape.rect.w, 1.0), 0.0, 1.0);
     let depth = -d;
+
+    if (shape.kind == DIVIDER) {
+        let tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+        let a = select(0.14, 0.16, light) * cover;
+        return vec4<f32>(tint * a, a);
+    }
 
     if (shape.kind == PILL) {
         // The selected tab is sunk into the glass: darker than the capsule, shaded at the

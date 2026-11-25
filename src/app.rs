@@ -26,8 +26,8 @@ use crate::color::{self, Theme};
 use crate::confirm::{self, Choice, Dialog};
 use crate::font::{Atlas, Face};
 use crate::gpu::{
-    GlassShape, Renderer, GLASS_BUTTON, GLASS_CONTAINER, GLASS_PILL, GLASS_SHEET, ICON_CLOSE, ICON_MAXIMIZE,
-    ICON_MINIMIZE, ICON_RESTORE,
+    GlassShape, Renderer, GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_PILL, GLASS_SHEET, ICON_CLOSE,
+    ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
 };
 use crate::input::{self, Input};
 use crate::npu::{Indexer, Scheduler};
@@ -354,6 +354,7 @@ struct App {
     title_bar: TitleBar,
     last_title_click: Option<Instant>,
     settings_hot: bool,
+    bar_hover: Option<tabs::BarHover>,
     link_cell: Option<(u16, u16)>,
     hover_icon: CursorIcon,
     /// Ends of the selection as `(col, absolute line)`. See `Term::view_top`.
@@ -565,6 +566,7 @@ impl App {
             }
         }
         self.tabs.remove(index);
+        self.bar_hover = None;
         self.confirm_dirty |= self.confirm_close;
         if self.tabs.is_empty() {
             return;
@@ -729,7 +731,18 @@ impl App {
                     cursor: *cursor,
                     cursor_on: *on,
                 });
-                tabs::render_bar_in(&titles, &agents, active, cols, theme, self.ui.glass, track, edit, &custom)
+                tabs::render_bar_in(
+                    &titles,
+                    &agents,
+                    active,
+                    cols,
+                    theme,
+                    self.ui.glass,
+                    track,
+                    edit,
+                    &custom,
+                    self.bar_hover,
+                )
             };
             gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar);
             let caption = if let Some((_, text, _, _)) = edited.as_ref().filter(|(index, ..)| *index == active) {
@@ -2204,9 +2217,9 @@ fn glass_shapes(
         // Each tab is an equal slice of the capsule. The pill is that slice inset by
         // the same gap on every side, so its curve shares a center with the capsule's.
         let count = bar.spans.len();
+        let seg = (x1 - x0) / count as f32;
         if let Some(index) = (bar.selected < count).then_some(bar.selected) {
             let gap = (tune.gap * scale).round();
-            let seg = (x1 - x0) / count as f32;
             let left = x0 + seg * index as f32 + gap;
             let right = x0 + seg * (index as f32 + 1.0) - gap;
             let pill_h = (cap_h - 2.0 * gap).max(1.0);
@@ -2215,6 +2228,16 @@ fn glass_shapes(
                     GlassShape::new(left, bar_y + gap, right - left, pill_h, GLASS_PILL)
                         .with_radius((radius - gap).max(0.0)),
                 );
+            }
+        }
+        // Subtle vertical hairlines separate adjacent inactive tabs, vanishing beside the active pill.
+        let div_w = (1.0 * scale).max(1.0);
+        let div_h = (cap_h * 0.44).max(6.0);
+        let div_y = bar_y + (cap_h - div_h) * 0.5;
+        for index in 1..count {
+            if index != bar.selected && index - 1 != bar.selected {
+                let div_x = (x0 + seg * index as f32 - div_w * 0.5).round();
+                shapes.push(GlassShape::new(div_x, div_y, div_w, div_h, GLASS_DIVIDER));
             }
         }
     }
@@ -2412,6 +2435,22 @@ impl ApplicationHandler<Wake> for App {
                     self.bar_dirty = true;
                     self.redraw();
                 }
+                let bar_hover = if self.tabs.len() > 1
+                    && !self.ui.open
+                    && !self.confirm_close
+                    && self.tab_drag.is_none()
+                    && self.is_bar_y(position.y)
+                {
+                    let col = strip_col(position.x, self.face.cell_w(), self.bar.cells.len());
+                    tabs::hover(&self.bar, col)
+                } else {
+                    None
+                };
+                if bar_hover != self.bar_hover {
+                    self.bar_hover = bar_hover;
+                    self.bar_dirty = true;
+                    self.redraw();
+                }
                 let cell = if self.ui.open
                     || self.confirm_close
                     || self.is_title_y(position.y)
@@ -2432,11 +2471,16 @@ impl ApplicationHandler<Wake> for App {
                     }
                 }
                 let on_label = self.tab_drag.is_none() && self.hovering_label_edit(position.x, position.y);
-                let label_cursor = on_label || (self.tab_edit.is_some() && cell.is_none() && self.hover_icon == CursorIcon::Text);
-                if self.tab_drag.is_none() && (cell != self.link_cell || label_cursor) {
+                let on_close = self.tab_drag.is_none() && bar_hover.is_some_and(|item| item.close);
+                let bar_cursor = on_label
+                    || on_close
+                    || (cell.is_none() && matches!(self.hover_icon, CursorIcon::Text | CursorIcon::Pointer));
+                if self.tab_drag.is_none() && (cell != self.link_cell || bar_cursor) {
                     self.link_cell = cell;
                     let icon = if on_label {
                         CursorIcon::Text
+                    } else if on_close {
+                        CursorIcon::Pointer
                     } else if cell.is_some() && self.link_at(position.x, position.y).is_some() {
                         CursorIcon::Pointer
                     } else if cell.is_some() {
@@ -2450,6 +2494,12 @@ impl ApplicationHandler<Wake> for App {
                             window.set_cursor(icon);
                         }
                     }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.bar_hover.take().is_some() || std::mem::replace(&mut self.settings_hot, false) {
+                    self.bar_dirty = true;
+                    self.redraw();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -2596,6 +2646,7 @@ pub fn run() -> anyhow::Result<()> {
         },
         last_title_click: None,
         settings_hot: false,
+        bar_hover: None,
         link_cell: None,
         hover_icon: CursorIcon::Default,
         selection: None,
@@ -2650,7 +2701,7 @@ mod tests {
         existing_file, glass_bar_height, glass_shapes, publish_frame, resize_edge, strip_col,
     };
     use crate::desktop::ButtonLayout;
-    use crate::gpu::{GLASS_BUTTON, GLASS_CONTAINER, GLASS_PILL, GLASS_SHEET};
+    use crate::gpu::{GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_PILL, GLASS_SHEET};
 
     #[test]
     fn glass_bars_are_taller_than_the_text() {
@@ -2708,10 +2759,12 @@ mod tests {
         let track = super::glass_track_cols(100, size.width, 10, tune.margin);
         assert_eq!(track, (1, 99));
         for active in [0usize, 2] {
-            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track), None, &[]);
+            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track), None, &[], None);
             let shapes = glass_shapes(&bar, &title, size, 40, 10, 1.0, false, false, &tune);
             let container = shapes[0];
             let pill = shapes[1];
+            let dividers: Vec<_> = shapes.iter().filter(|shape| shape.kind == GLASS_DIVIDER).collect();
+            assert_eq!(dividers.len(), 1);
             let gap = tune.gap;
             let edge = if active == 0 {
                 container.rect[0] + gap

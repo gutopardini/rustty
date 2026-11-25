@@ -18,8 +18,8 @@ mod images;
 
 use frame::Frame;
 pub use glass::{
-    GlassShape, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER, ICON_CLOSE, ICON_GEAR, ICON_MAXIMIZE,
-    ICON_MINIMIZE, ICON_RESTORE, PILL as GLASS_PILL, SHEET as GLASS_SHEET,
+    GlassShape, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER, DIVIDER as GLASS_DIVIDER, ICON_CLOSE,
+    ICON_GEAR, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE, PILL as GLASS_PILL, SHEET as GLASS_SHEET,
 };
 use glass::Glass;
 use images::Images;
@@ -54,6 +54,7 @@ pub struct Renderer {
     _agent_tex: wgpu::Texture,
     agent_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    icon_sampler: wgpu::Sampler,
     gpu_cells: Vec<GpuCell>,
     cols: u16,
     rows: u16,
@@ -198,10 +199,16 @@ impl Renderer {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -314,6 +321,16 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let icon_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("agent-icons"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
 
         let bind = make_bind(
             &device,
@@ -324,6 +341,7 @@ impl Renderer {
             &atlas_view,
             &agent_view,
             &sampler,
+            &icon_sampler,
         );
         let bar_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tab-uniforms"),
@@ -346,6 +364,7 @@ impl Renderer {
             &atlas_view,
             &agent_view,
             &sampler,
+            &icon_sampler,
         );
         let title_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("title-uniforms"),
@@ -368,6 +387,7 @@ impl Renderer {
             &atlas_view,
             &agent_view,
             &sampler,
+            &icon_sampler,
         );
         let frame = (config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied)
             .then(|| Frame::new(&device, config.format));
@@ -389,6 +409,7 @@ impl Renderer {
             _agent_tex: agent_tex,
             agent_view,
             sampler,
+            icon_sampler,
             gpu_cells: Vec::new(),
             cols: 0,
             rows: 0,
@@ -515,6 +536,7 @@ impl Renderer {
                 &self.atlas_view,
                 &self.agent_view,
                 &self.sampler,
+                &self.icon_sampler,
             );
             DialogLayer {
                 uniforms,
@@ -978,6 +1000,7 @@ impl Renderer {
             &self.atlas_view,
             &self.agent_view,
             &self.sampler,
+            &self.icon_sampler,
         );
     }
 }
@@ -1035,6 +1058,7 @@ fn make_bind(
     atlas_view: &wgpu::TextureView,
     agent_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    icon_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rustty-cells"),
@@ -1063,6 +1087,10 @@ fn make_bind(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(agent_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(icon_sampler),
             },
         ],
     })

@@ -126,6 +126,16 @@ Anything else goes to the shell.
 
 A click on an `http://` or `https://` address opens it in the browser. A click on a file path opens that file in the default application for its type. A trailing `:line` or `:line:column` is ignored, and a relative path is resolved from the shell's directory. An application that is already open receives the target. A new window appears only when none is open.
 
+## Roadmap
+
+Planned features and open areas for feedback and contributions:
+
+- **Task completion & attention alerts:** detect when a background tab finishes a task or needs user input (via terminal notifications / BEL / agent signals), trigger native GNOME and KDE desktop notifications, show an unread badge, and highlight or tint the tab in the bottom bar.
+- **File drag-and-drop:** drop files and folders onto the terminal window to insert shell-escaped paths directly into the active session.
+- **Chrome-style tab & session restore:** reopen recently closed tabs and automatically restore open windows, tabs, custom labels, and working directories after an abrupt close or crash.
+- **Right-click "Open with…" on paths and files:** context menu on clicked file paths and links to pick which installed application should open the target and configure per-type defaults.
+- **NPU scrollback search:** run scrollback search on the Intel NPU once a compiled `RTY1` command buffer graph is integrated.
+
 ## Install
 
 You need Rust, `pkg-config`, Vulkan, and FreeType.

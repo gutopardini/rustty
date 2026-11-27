@@ -120,15 +120,19 @@ impl Session {
     }
 
     /// Scrolls this tab, or returns bytes the program asked to receive instead.
-    fn wheel(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Option<Vec<u8>> {
+    fn wheel(&self, steps: isize, col: u16, row: u16, pixel: (u32, u32)) -> Follow {
         let frames = Arc::clone(&self.frames);
         let mut term = self.term.lock().unwrap_or_else(|err| err.into_inner());
         if let Some(bytes) = term.wheel_write(steps, col, row, pixel) {
-            return Some(bytes);
+            return Follow::Program(bytes);
         }
+        let before = term.view_top();
         term.scroll_view(steps);
-        publish_frame(&mut term, &frames);
-        None
+        let top = (term.view_top() != before).then(|| term.view_top());
+        if top.is_some() {
+            publish_frame(&mut term, &frames);
+        }
+        Follow::History(top)
     }
 
     fn take_frame(&self) -> Option<Snapshot> {
@@ -335,7 +339,7 @@ const LABEL_BLINK: Duration = Duration::from_millis(530);
 type Point = (u16, u64);
 
 /// Pause between steps of the scroll that follows a selection dragged past the grid.
-const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(35);
 
 struct App {
     tabs: Vec<Tab>,
@@ -384,6 +388,8 @@ struct App {
     hover_icon: CursorIcon,
     /// Ends of the selection as `(col, absolute line)`. See `Term::view_top`.
     selection: Option<(Point, Point)>,
+    /// Last click point in the grid, kept across scrolling so click -> scroll -> Shift+click works.
+    selection_anchor: Option<Point>,
     selecting: bool,
     press_moved: bool,
     press_cell: Point,
@@ -1464,8 +1470,18 @@ impl App {
             Some(Input::Copy) => self.copy_selection(),
             Some(Input::Paste) => self.paste(false),
             Some(Input::Scroll(delta)) => {
-                self.clear_selection();
-                self.tabs[active].session.update(|term| term.scroll_view(delta));
+                let top = self.tabs[active].session.update(|term| {
+                    term.scroll_view(delta);
+                    term.view_top()
+                });
+                self.view_top = top;
+                if self.selecting {
+                    if let Some((x, y)) = self.cursor {
+                        self.extend_selection(x, y);
+                    }
+                } else if self.selection.is_some() {
+                    self.selection_dirty = true;
+                }
                 self.redraw();
             }
             Some(Input::NewTab) => {
@@ -1489,10 +1505,9 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.tabs.is_empty() || self.selecting {
+        if self.tabs.is_empty() {
             return;
         }
-        self.clear_selection();
         let active = self.active.min(self.tabs.len() - 1);
         let cell_h = self.face.cell_h().max(1) as f32;
         let raw = match delta {
@@ -1505,7 +1520,7 @@ impl App {
             return;
         }
         self.wheel_frac -= steps as f32;
-        if self.ui.open && self.wheel_on_panel() {
+        if !self.selecting && self.ui.open && self.wheel_on_panel() {
             let delta = -(steps.clamp(-32, 32) as i16);
             if self.keys_page {
                 self.scroll_keys(delta);
@@ -1516,29 +1531,39 @@ impl App {
                 return;
             }
         }
-        let (col, row, pixel) = self
-            .cursor
-            .and_then(|(x, y)| {
-                let (col, row) = self.cell_at(x, y)?;
-                let grid_x = x - f64::from(self.grid_left);
-                let grid_y = y - f64::from(self.grid_top());
-                Some((col + 1, row + 1, (grid_x as u32 + 1, grid_y as u32 + 1)))
-            })
-            .unwrap_or((1, 1, (1, 1)));
+        let (col, row, pixel) = self.autoscroll_pointer();
         // Shift keeps the wheel on this tab's history even when the program grabbed the mouse.
-        let report = if self.mods.shift_key() {
-            self.tabs[active].session.update(|term| term.scroll_view(steps));
-            None
+        let follow = if self.mods.shift_key() {
+            let top = self.tabs[active].session.update(|term| {
+                let before = term.view_top();
+                term.scroll_view(steps);
+                (term.view_top() != before).then(|| term.view_top())
+            });
+            Follow::History(top)
+        } else if self.selecting {
+            self.tabs[active].session.follow_selection(steps, col, row, pixel)
         } else {
             self.tabs[active].session.wheel(steps, col, row, pixel)
         };
-        if let Some(bytes) = report {
-            if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
-                tracing::warn!(%err, "pty write");
+        match follow {
+            Follow::Program(bytes) => {
+                if let Err(err) = self.tabs[active].session.pty.write_all(&bytes) {
+                    tracing::warn!(%err, "pty write");
+                }
             }
-            return;
+            Follow::History(Some(top)) => {
+                self.view_top = top;
+                if self.selecting {
+                    if let Some((x, y)) = self.cursor {
+                        self.extend_selection(x, y);
+                    }
+                } else if self.selection.is_some() {
+                    self.selection_dirty = true;
+                }
+                self.redraw();
+            }
+            Follow::History(None) => {}
         }
-        self.redraw();
     }
 
     fn scrollbar(&self, window: &Window, size: PhysicalSize<u32>) -> Scrollbar {
@@ -1559,15 +1584,18 @@ impl App {
         let moved = self.tabs[active].session.update(|term| {
             let height = term.scroll_metrics().1;
             if height <= 0.0 || height >= 1.0 {
-                return false;
+                return None;
             }
             term.scroll_to(fraction);
-            true
+            Some(term.view_top())
         });
-        if !moved {
+        let Some(top) = moved else {
             return false;
+        };
+        self.view_top = top;
+        if self.selection.is_some() {
+            self.selection_dirty = true;
         }
-        self.clear_selection();
         self.scroll_drag = true;
         self.redraw();
         true
@@ -1847,7 +1875,14 @@ impl App {
             return;
         }
         let active = self.active.min(self.tabs.len() - 1);
-        self.tabs[active].session.update(|term| term.scroll_to(fraction));
+        let top = self.tabs[active].session.update(|term| {
+            term.scroll_to(fraction);
+            term.view_top()
+        });
+        self.view_top = top;
+        if self.selection.is_some() {
+            self.selection_dirty = true;
+        }
         self.redraw();
     }
 
@@ -1948,7 +1983,7 @@ impl App {
         (cell.0, self.view_top + u64::from(cell.1))
     }
 
-    /// Lines to scroll while a selection is dragged above or below the grid. Positive reveals
+    /// Lines to scroll while a selection is dragged to or past the grid edges. Positive reveals
     /// older lines. The farther the pointer is from the edge, the faster the view moves.
     fn autoscroll_lines(&self) -> isize {
         let Some((_, y)) = self.cursor.filter(|_| self.selecting) else {
@@ -1957,14 +1992,7 @@ impl App {
         let cell_h = f64::from(self.face.cell_h().max(1));
         let top = f64::from(self.grid_top());
         let bottom = top + f64::from(self.grid_rows) * cell_h;
-        let lines = |distance: f64| (1.0 + distance / cell_h).min(8.0) as isize;
-        if y < top {
-            lines(top - y)
-        } else if y >= bottom {
-            -lines(y - bottom)
-        } else {
-            0
-        }
+        autoscroll_velocity(y, top, bottom, cell_h, self.press_moved)
     }
 
     /// One step of the scroll that follows the selection. Returns false when neither this
@@ -2060,7 +2088,11 @@ impl App {
             self.copy_selection();
             return;
         }
-        self.clear_selection();
+        self.selection_text = None;
+        if self.selection.take().is_some() {
+            self.selection_dirty = true;
+            self.redraw();
+        }
         if let Some(url) = self.cursor.and_then(|(x, y)| self.link_at(x, y)) {
             self.pending_link = Some((Instant::now() + Duration::from_millis(400), url));
             return;
@@ -2089,8 +2121,13 @@ impl App {
         self.press_moved = false;
         let count = self.note_click(cell);
         if self.mods.shift_key() {
-            let anchor = self.selection.map(|(anchor, _)| anchor).unwrap_or(point);
+            let anchor = self
+                .selection
+                .map(|(anchor, _)| anchor)
+                .or(self.selection_anchor)
+                .unwrap_or(point);
             self.anchor_cell = anchor;
+            self.selection_anchor = Some(anchor);
             self.selection = Some((anchor, point));
             self.selection_text = None;
             self.press_moved = point != anchor;
@@ -2107,9 +2144,19 @@ impl App {
             };
             let span = (self.point(span.0), self.point(span.1));
             self.anchor_cell = span.0;
+            self.selection_anchor = Some(span.0);
             self.selection = Some(span);
             self.selection_text = None;
             self.press_moved = true;
+            self.selection_dirty = true;
+            self.redraw();
+            return true;
+        }
+        // Start fresh on a plain click so dragging never extends a stale previous selection,
+        // while saving the click point as the anchor for a later scroll + Shift+click.
+        self.selection_anchor = Some(point);
+        self.selection_text = None;
+        if self.selection.take().is_some() {
             self.selection_dirty = true;
             self.redraw();
         }
@@ -2118,10 +2165,10 @@ impl App {
 
     fn extend_selection(&mut self, x: f64, y: f64) {
         let cell = self.point(self.clamped_cell(x, y));
-        if cell == self.press_cell {
+        if !self.press_moved && cell == self.press_cell {
             return;
         }
-        let anchor = self.selection.map(|(anchor, _)| anchor).unwrap_or(self.anchor_cell);
+        let anchor = self.anchor_cell;
         if self.selection == Some((anchor, cell)) {
             return;
         }
@@ -2161,6 +2208,7 @@ impl App {
 
     fn clear_selection(&mut self) {
         self.selection_text = None;
+        self.selection_anchor = None;
         self.selecting = false;
         self.autoscroll_at = None;
         self.press_moved = false;
@@ -2422,6 +2470,25 @@ impl App {
 
 fn ordered(a: Point, b: Point) -> (Point, Point) {
     if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
+}
+
+/// Lines per autoscroll tick when dragging a selection near or past the vertical edges of the grid.
+/// Positive reveals older lines (scrolling up), negative reveals newer lines (scrolling down).
+fn autoscroll_velocity(y: f64, top: f64, bottom: f64, cell_h: f64, moved: bool) -> isize {
+    let cell_h = cell_h.max(1.0);
+    let edge = if moved { (cell_h * 0.4).min(12.0) } else { 0.0 };
+    let ramp = |distance: f64| (1.0 + distance / cell_h).min(10.0) as isize;
+    if y < top {
+        ramp(top - y)
+    } else if y >= bottom {
+        -ramp(y - bottom)
+    } else if moved && y < top + edge {
+        1
+    } else if moved && y >= bottom - edge {
+        -1
+    } else {
+        0
+    }
 }
 
 /// A web address opens in the browser. A file path opens in the default application for its type.
@@ -3009,7 +3076,7 @@ impl ApplicationHandler<Wake> for App {
                     self.drag_tab(position.x);
                 }
                 let title_col = strip_col(position.x, self.face.cell_w(), self.title_bar.cells.len());
-                let on_title = self.is_title_y(position.y);
+                let on_title = !self.selecting && self.is_title_y(position.y);
                 let hot = on_title && self.title_bar.settings.contains(&title_col);
                 let lim_hot = on_title && self.title_bar.limits.contains(&title_col);
                 if hot != self.settings_hot || lim_hot != self.limits_hot {
@@ -3019,6 +3086,7 @@ impl ApplicationHandler<Wake> for App {
                     self.redraw();
                 }
                 let bar_hover = if self.tabs.len() > 1
+                    && !self.selecting
                     && !self.ui.open
                     && !self.limits_open
                     && !self.confirm_close
@@ -3316,6 +3384,7 @@ pub fn run() -> anyhow::Result<()> {
         link_cell: None,
         hover_icon: CursorIcon::Default,
         selection: None,
+        selection_anchor: None,
         selecting: false,
         view_top: 0,
         autoscroll_at: None,
@@ -3366,8 +3435,8 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Mutex, PhysicalSize, ResizeDirection, Scrollbar, Term, bar_contains_y, bar_height,
-        existing_file, glass_bar_height, publish_frame, push_glass_title_shapes,
+        Mutex, PhysicalSize, ResizeDirection, Scrollbar, Term, autoscroll_velocity, bar_contains_y,
+        bar_height, existing_file, glass_bar_height, publish_frame, push_glass_title_shapes,
         push_tab_bar_shapes, resize_edge, strip_col, tooltip_layout,
     };
     use crate::desktop::ButtonLayout;
@@ -3551,6 +3620,23 @@ mod tests {
         assert_eq!(resize_edge(2189.0, 700.0, size, 2.0), None);
         assert_eq!(scroll.hit(2199.0, 700.0), None);
         assert_eq!(resize_edge(2199.0, 700.0, size, 2.0), Some(ResizeDirection::East));
+    }
+
+    #[test]
+    fn autoscroll_triggers_past_edges_and_gently_inside_edge_band_after_move() {
+        // Middle of the grid never autoscrolls.
+        assert_eq!(autoscroll_velocity(200.0, 40.0, 540.0, 20.0, true), 0);
+        // Clicking near an edge without moving never triggers edge-band autoscroll.
+        assert_eq!(autoscroll_velocity(44.0, 40.0, 540.0, 20.0, false), 0);
+        assert_eq!(autoscroll_velocity(536.0, 40.0, 540.0, 20.0, false), 0);
+        // Dragging into the edge band scrolls gently (1 line/tick).
+        assert_eq!(autoscroll_velocity(44.0, 40.0, 540.0, 20.0, true), 1);
+        assert_eq!(autoscroll_velocity(536.0, 40.0, 540.0, 20.0, true), -1);
+        // Dragging past the edge ramps speed up to 10 lines/tick.
+        assert!(autoscroll_velocity(0.0, 40.0, 540.0, 20.0, true) >= 3);
+        assert!(autoscroll_velocity(580.0, 40.0, 540.0, 20.0, true) <= -3);
+        assert_eq!(autoscroll_velocity(-400.0, 40.0, 540.0, 20.0, true), 10);
+        assert_eq!(autoscroll_velocity(980.0, 40.0, 540.0, 20.0, true), -10);
     }
 
     #[test]

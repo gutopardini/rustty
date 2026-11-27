@@ -20,9 +20,10 @@ use frame::Frame;
 pub use glass::{
     GlassShape, BAR as GLASS_BAR, BUTTON as GLASS_BUTTON, CONTAINER as GLASS_CONTAINER,
     DIVIDER as GLASS_DIVIDER, DOT as GLASS_DOT, ICON_CLOSE, ICON_GEAR, ICON_LIMITS_CRIT,
-    ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
+    ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_PLUS, ICON_RESTORE,
     LIMITS_CARD as GLASS_LIMITS_CARD, LIMITS_ICON as GLASS_LIMITS_ICON, PILL as GLASS_PILL,
-    SHEET as GLASS_SHEET,
+    SHEET as GLASS_SHEET, TAB_HOVER as GLASS_TAB_HOVER, TAB_STRIP as GLASS_TAB_STRIP,
+    TOOLTIP as GLASS_TOOLTIP,
 };
 use glass::Glass;
 use images::Images;
@@ -588,6 +589,30 @@ impl Renderer {
         );
     }
 
+    pub fn upload_tooltip(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        tooltip: Option<&crate::tabs::TabTooltip>,
+        pad_x: f32,
+        pad_y: f32,
+    ) {
+        let Some(tooltip) = tooltip else {
+            self.dialog = None;
+            return;
+        };
+        self.upload_overlay_cells_at(
+            atlas,
+            face,
+            pad_x,
+            pad_y,
+            tooltip.cols,
+            tooltip.rows,
+            &tooltip.cells,
+            true,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upload_overlay_cells(
         &mut self,
@@ -595,6 +620,25 @@ impl Renderer {
         face: &Face,
         origin_col: u16,
         origin_row: u16,
+        cols: u16,
+        rows: u16,
+        source: &[crate::cell::Cell],
+        transparent_bg: bool,
+    ) {
+        let cell_w = atlas.cell_w() as f32;
+        let cell_h = atlas.cell_h() as f32;
+        let pad_x = self.left_w + f32::from(origin_col) * cell_w;
+        let pad_y = self.top_h + self.grid_pad_top + f32::from(origin_row) * cell_h;
+        self.upload_overlay_cells_at(atlas, face, pad_x, pad_y, cols, rows, source, transparent_bg);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_overlay_cells_at(
+        &mut self,
+        atlas: &mut Atlas,
+        face: &Face,
+        pad_x: f32,
+        pad_y: f32,
         cols: u16,
         rows: u16,
         source: &[crate::cell::Cell],
@@ -648,8 +692,8 @@ impl Renderer {
             rows: u32::from(rows),
             atlas_w: Atlas::SIZE,
             atlas_h: Atlas::SIZE,
-            pad_x: self.left_w + f32::from(origin_col) * cell_w,
-            pad_y: self.top_h + self.grid_pad_top + f32::from(origin_row) * cell_h,
+            pad_x,
+            pad_y,
             cell_w,
             cell_h,
             surf_w,
@@ -696,7 +740,7 @@ impl Renderer {
         }
     }
 
-    pub fn upload_bar(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: Rgb, edge: Rgb) {
+    pub fn upload_bar(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: Rgb, edge: Rgb, bottom_pad: f32) {
         self.cell_px_w = atlas.cell_w() as f32;
         self.cell_px_h = atlas.cell_h() as f32;
         let count = cells.len().min(self.bar_gpu.len());
@@ -714,7 +758,8 @@ impl Renderer {
         self.bar_count = count as u32;
         let uniform = self.bar_uniform.clone();
         let pad_y = (self.config.height as f32 - self.chrome_h).max(0.0);
-        self.write_strip_uniforms(&uniform, self.bar_count.max(1), pad_y, self.chrome_h, strip, edge);
+        let strip_h = (self.chrome_h - bottom_pad.max(0.0)).max(1.0);
+        self.write_strip_uniforms(&uniform, self.bar_count.max(1), pad_y, strip_h, strip, edge, true);
     }
 
     pub fn upload_title(&mut self, atlas: &mut Atlas, face: &Face, cells: &[crate::cell::Cell], strip: Rgb) {
@@ -735,7 +780,7 @@ impl Renderer {
         self.title_count = count as u32;
         let uniform = self.title_uniform.clone();
         let height = self.top_h;
-        self.write_strip_uniforms(&uniform, self.title_count.max(1), 0.0, height, strip, strip);
+        self.write_strip_uniforms(&uniform, self.title_count.max(1), 0.0, height, strip, strip, self.glass.is_some());
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -1080,7 +1125,17 @@ impl Renderer {
         uniforms
     }
 
-    fn write_strip_uniforms(&self, buf: &wgpu::Buffer, cols: u32, pad_y: f32, strip_h: f32, strip: Rgb, edge: Rgb) {
+    #[allow(clippy::too_many_arguments)]
+    fn write_strip_uniforms(
+        &self,
+        buf: &wgpu::Buffer,
+        cols: u32,
+        pad_y: f32,
+        strip_h: f32,
+        strip: Rgb,
+        edge: Rgb,
+        transparent_bg: bool,
+    ) {
         let cell_w = self.cell_px_w.max(1.0);
         let glyph_h = self.cell_px_h.max(1.0);
         let cell_h = strip_h.max(glyph_h);
@@ -1110,7 +1165,7 @@ impl Renderer {
             sel_hi: 0,
             scroll_y0: 0.0,
             scroll_y1: 0.0,
-            glass: u32::from(self.glass.is_some()),
+            glass: u32::from(transparent_bg),
             glass_key: strip.pack(),
             _glass_pad: [0; 2],
         };

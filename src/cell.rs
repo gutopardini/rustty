@@ -25,6 +25,11 @@ pub const QUAD: u32 = 1 << 8;
 pub const TALL: u32 = 1 << 9;
 /// Body of a tab. The shader draws the rounded rectangle.
 pub const TAB: u32 = 1 << 10;
+/// Smooth horizontal fade on overflowing tab titles (2 bits: 1 start, 2 end, 3 single-cell).
+pub const FADE_SHIFT: u32 = 11;
+pub const FADE_START: u32 = 1 << FADE_SHIFT;
+pub const FADE_END: u32 = 2 << FADE_SHIFT;
+pub const FADE_SINGLE: u32 = 3 << FADE_SHIFT;
 /// Active tab: the top stays square and meets the terminal background.
 pub const TAB_ACTIVE: u32 = 1 << 13;
 /// Cells to the left end, 4 bits.

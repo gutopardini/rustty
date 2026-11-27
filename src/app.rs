@@ -26,9 +26,10 @@ use crate::color::{self, Theme};
 use crate::confirm::{self, Choice, Dialog};
 use crate::font::{Atlas, Face};
 use crate::gpu::{
-    GlassShape, Renderer, GLASS_BAR, GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_DOT,
-    GLASS_LIMITS_CARD, GLASS_LIMITS_ICON, GLASS_PILL, GLASS_SHEET, ICON_CLOSE, ICON_LIMITS_CRIT,
-    ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_RESTORE,
+    GlassShape, Renderer, GLASS_BAR, GLASS_BUTTON, GLASS_DIVIDER, GLASS_DOT, GLASS_LIMITS_CARD,
+    GLASS_LIMITS_ICON, GLASS_SHEET, GLASS_TAB_HOVER, GLASS_TAB_STRIP, GLASS_TOOLTIP, ICON_CLOSE,
+    ICON_LIMITS_CRIT, ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_MAXIMIZE, ICON_MINIMIZE, ICON_PLUS,
+    ICON_RESTORE,
 };
 use crate::input::{self, Input};
 use crate::limits::{self, Health as LimitsHealth, Popover, PopoverHit};
@@ -188,6 +189,7 @@ fn pty_loop(
     frames: Arc<Mutex<Option<Snapshot>>>,
 ) {
     let mut buf = [0u8; 64 * 1024];
+    let mut pending = Vec::new();
     loop {
         let mut master_flags = PollFlags::POLLIN | PollFlags::POLLHUP;
         if pty.has_writes() {
@@ -226,20 +228,7 @@ fn pty_loop(
                     break;
                 }
                 Ok(n) => {
-                    let mut pending = Vec::with_capacity(n);
-                    pending.extend_from_slice(&buf[..n]);
-                    while pending.len() < 1024 * 1024 {
-                        let mut probe = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
-                        match nix::poll::poll(&mut probe, PollTimeout::ZERO) {
-                            Ok(ready) if ready > 0 => {}
-                            _ => break,
-                        }
-                        match nix::unistd::read(&fd, &mut buf) {
-                            Ok(0) | Err(Errno::EAGAIN) | Err(Errno::EINTR) => break,
-                            Ok(more) => pending.extend_from_slice(&buf[..more]),
-                            Err(_) => break,
-                        }
-                    }
+                    fill_pending(&fd, &mut buf, n, &mut pending);
                     let mut offset = 0;
                     while offset < pending.len() {
                         let (used, job) = {
@@ -298,6 +287,25 @@ struct Tab {
     label: Option<String>,
     agent: Option<Agent>,
     session: Session,
+}
+
+/// Appends bytes already read, then drains whatever else is waiting, up to 1 MiB.
+/// `pending` keeps its allocation across reads.
+fn fill_pending(fd: &std::os::fd::OwnedFd, buf: &mut [u8], first: usize, pending: &mut Vec<u8>) {
+    pending.clear();
+    pending.extend_from_slice(&buf[..first]);
+    while pending.len() < 1024 * 1024 {
+        let mut probe = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+        match nix::poll::poll(&mut probe, PollTimeout::ZERO) {
+            Ok(ready) if ready > 0 => {}
+            _ => break,
+        }
+        match nix::unistd::read(fd, buf) {
+            Ok(0) | Err(Errno::EAGAIN) | Err(Errno::EINTR) => break,
+            Ok(more) => pending.extend_from_slice(&buf[..more]),
+            Err(_) => break,
+        }
+    }
 }
 
 fn visible_title(tab: &Tab) -> String {
@@ -369,6 +377,9 @@ struct App {
     last_limits_cmd: Option<Instant>,
     last_screen_capture: Option<(String, u8, Option<u8>)>,
     bar_hover: Option<tabs::BarHover>,
+    tooltip_shown: bool,
+    tooltip_at: Option<Instant>,
+    tooltip_uploaded: bool,
     link_cell: Option<(u16, u16)>,
     hover_icon: CursorIcon,
     /// Ends of the selection as `(col, absolute line)`. See `Term::view_top`.
@@ -552,6 +563,8 @@ impl App {
             return;
         }
         self.active = index;
+        self.tooltip_shown = false;
+        self.tooltip_at = None;
         self.clear_selection();
         for (tab_index, tab) in self.tabs.iter().enumerate() {
             tab.session.visible.store(tab_index == index, Ordering::Relaxed);
@@ -582,6 +595,8 @@ impl App {
         }
         self.tabs.remove(index);
         self.bar_hover = None;
+        self.tooltip_shown = false;
+        self.tooltip_at = None;
         self.confirm_dirty |= self.confirm_close;
         if self.tabs.is_empty() {
             return;
@@ -743,7 +758,8 @@ impl App {
         let chrome_h = scrollbar.top as f32;
         let theme = color::theme(self.ui.style);
         let selection = self.selection_span();
-        let tab_bar_h = self.tab_bar_height() as f32;
+        let tab_bar_px = self.tab_bar_height();
+        let tab_bar_h = tab_bar_px as f32;
         let Some(gpu) = &mut self.gpu else {
             return;
         };
@@ -777,7 +793,7 @@ impl App {
             let cols = (size.width / cell_w).clamp(1, 1024) as u16;
             let one_tab = self.tabs.len() <= 1;
             self.bar = if one_tab {
-                Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 }
+                Bar { cells: Vec::new(), spans: Vec::new(), new_tab: None, selected: 0 }
             } else {
                 let track = self.ui.glass.then(|| {
                     let margin = (self.ui.glass_tune.margin * window.scale_factor() as f32).round();
@@ -802,7 +818,8 @@ impl App {
                     self.bar_hover,
                 )
             };
-            gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar);
+            let bottom_pad = (4.0 * window.scale_factor() as f32).round();
+            gpu.upload_bar(&mut self.atlas, &self.face, &self.bar.cells, theme.bar, theme.bar, bottom_pad);
             let caption = if let Some((_, text, _, _)) = edited.as_ref().filter(|(index, ..)| *index == active) {
                 text.clone()
             } else {
@@ -865,7 +882,14 @@ impl App {
         } else {
             self.panel = None;
         }
+        let scale = window.scale_factor();
+        let tune = self.ui.glass_tune;
+        let light = is_light(theme);
+        let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
+        let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
+        let mut tooltip_card: Option<[f32; 4]> = None;
         if draw_confirm || self.tab_edit.is_some() {
+            self.tooltip_uploaded = false;
             self.close_dialog = if self.confirm_close {
                 confirm::render(self.grid_cols, self.grid_rows, theme, self.tabs.len())
             } else if let Some(edit) = &self.tab_edit {
@@ -886,6 +910,7 @@ impl App {
             gpu.upload_dialog(&mut self.atlas, &self.face, self.close_dialog.as_ref());
             self.confirm_dirty = false;
         } else if self.limits_dirty || self.limits_open {
+            self.tooltip_uploaded = false;
             if self.limits_open {
                 let anchor = (!self.title_bar.limits.is_empty()).then_some(self.title_bar.settings.end.max(self.title_bar.limits.end));
                 self.limits_popover = limits::render_popover(
@@ -903,18 +928,48 @@ impl App {
             }
             gpu.upload_popover(&mut self.atlas, &self.face, self.limits_popover.as_ref());
             self.limits_dirty = false;
+        } else if !self.ui.open
+            && !self.confirm_close
+            && self.tab_edit.is_none()
+            && self.tab_drag.is_none()
+            && self.tooltip_shown
+            && let Some(tabs::BarHover::Tab { tab, .. }) = self.bar_hover
+            && let Some(span) = self.bar.spans.get(tab)
+            && let Some(tab_state) = self.tabs.get(tab)
+        {
+            let full_title = visible_title(tab_state);
+            let max_cols = ((size.width / self.face.cell_w().max(1)).saturating_sub(4)).clamp(1, 72) as u16;
+            if let Some(tooltip) = tabs::render_tooltip(&full_title, max_cols, span.start, theme) {
+                let (rect, tx, ty) = tooltip_layout(&tooltip, size, tab_bar_px, cell, scale);
+                gpu.upload_tooltip(&mut self.atlas, &self.face, Some(&tooltip), tx, ty);
+                self.tooltip_uploaded = true;
+                tooltip_card = Some(rect);
+            } else if self.tooltip_uploaded {
+                gpu.upload_tooltip(&mut self.atlas, &self.face, None, 0.0, 0.0);
+                self.tooltip_uploaded = false;
+            }
+        } else if self.tooltip_uploaded {
+            gpu.upload_tooltip(&mut self.atlas, &self.face, None, 0.0, 0.0);
+            self.tooltip_uploaded = false;
         }
-        let scale = window.scale_factor();
-        let tune = self.ui.glass_tune;
-        let light = is_light(theme);
-        let cell = (self.face.cell_w().max(1) as f32, self.face.cell_h().max(1) as f32);
-        let origin = (self.grid_left as f32, (scrollbar.top + self.grid_pad_top) as f32);
         let limits_health = self.limits_snap.health();
-        let mut shapes = if self.ui.glass {
-            glass_shapes(
-                &self.bar,
+        let mut shapes = Vec::with_capacity(16);
+        push_tab_bar_shapes(
+            &mut shapes,
+            &self.bar,
+            self.bar_hover,
+            size,
+            tab_bar_px,
+            self.face.cell_w().max(1),
+            scale,
+            theme,
+            self.ui.glass,
+            light,
+        );
+        if self.ui.glass {
+            push_glass_title_shapes(
+                &mut shapes,
                 &self.title_bar,
-                size,
                 scrollbar.top,
                 self.face.cell_w().max(1),
                 scale,
@@ -923,10 +978,8 @@ impl App {
                 limits_health,
                 window.is_maximized(),
                 &tune,
-            )
-        } else {
-            Vec::new()
-        };
+            );
+        }
         if self.ui.glass
             && let Some(panel) = &self.panel
         {
@@ -983,6 +1036,19 @@ impl App {
             && let Some(popover) = &self.limits_popover
         {
             push_limits_shapes(&mut shapes, popover, origin, cell, scale, theme, self.ui.glass, light, &tune);
+        } else if let Some(rect) = tooltip_card {
+            let (card_rgb, card_alpha) = if self.ui.glass && !light {
+                (crate::color::Rgb::new(0x14, 0x17, 0x1E), tune.dialog.max(0.92))
+            } else if self.ui.glass {
+                (theme.panel, tune.dialog.max(0.94))
+            } else {
+                (theme.panel, 1.0)
+            };
+            shapes.push(
+                GlassShape::new(rect[0], rect[1], rect[2], rect[3], GLASS_TOOLTIP)
+                    .with_radius(8.0 * scale as f32)
+                    .with_tint(card_rgb, card_alpha),
+            );
         }
         gpu.set_glass_shapes(&shapes, overlay, scale as f32, light, &tune);
         if let Err(err) = gpu.render(show_terminal && self.presented_tab == Some(tab_id)) {
@@ -1533,6 +1599,8 @@ impl App {
         if self.ui.open || self.limits_open {
             return false;
         }
+        self.tooltip_shown = false;
+        self.tooltip_at = None;
         self.focus_tab(index);
         self.tab_drag = Some(TabDrag { index, origin_x: x, armed: false });
         true
@@ -2171,9 +2239,16 @@ impl App {
         }
         if self.is_bar_y(y) {
             let col = strip_col(x, self.face.cell_w(), self.bar.cells.len());
+            self.tooltip_shown = false;
+            self.tooltip_at = None;
             match tabs::hit(&self.bar, col) {
                 Some(BarHit::Select(index)) => self.focus_tab(index),
                 Some(BarHit::Close(index)) => self.close_tab(index),
+                Some(BarHit::NewTab) => {
+                    if let Err(err) = self.open_tab() {
+                        tracing::warn!(%err, "new tab");
+                    }
+                }
                 None => {}
             }
             return;
@@ -2578,13 +2653,152 @@ fn push_limits_shapes(
     }
 }
 
-/// The glass under the bars: a capsule around the tabs with a pill on the selected one,
-/// a round button behind the AI limits icon, the settings gear, and each window control.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(180);
+
+/// Builds the Chrome-style bottom tab bar shapes (strip + inverted concave active tab,
+/// hover highlight, close circle hover, vertical dividers, and the `+` new-tab button).
 #[allow(clippy::too_many_arguments)]
-fn glass_shapes(
+fn push_tab_bar_shapes(
+    shapes: &mut Vec<GlassShape>,
     bar: &Bar,
-    title: &TitleBar,
+    hover: Option<tabs::BarHover>,
     size: PhysicalSize<u32>,
+    chrome_h: u32,
+    cell_w: u32,
+    scale: f64,
+    theme: Theme,
+    glass: bool,
+    light: bool,
+) {
+    if bar.spans.is_empty() || chrome_h == 0 {
+        return;
+    }
+    let cw = cell_w.max(1) as f32;
+    let s = scale as f32;
+    let chrome = chrome_h as f32;
+    let bottom_pad = (4.0 * s).round();
+    let bar_y = size.height as f32 - chrome;
+    let tab_h = (chrome - bottom_pad).max(1.0);
+    let (active_x0, active_x1) = bar
+        .spans
+        .get(bar.selected)
+        .map(|span| (f32::from(span.start) * cw, f32::from(span.end) * cw))
+        .unwrap_or((0.0, 0.0));
+    let radius = (9.0 * s).min(tab_h * 0.36).min(active_x0.max(4.0 * s));
+    let (strip_rgb, strip_alpha) = if glass {
+        let alpha = if light { 0.11 } else { 0.34 };
+        (crate::color::Rgb::new(0x00, 0x00, 0x00), alpha)
+    } else {
+        (theme.bar, 1.0)
+    };
+    shapes.push(
+        GlassShape::new(0.0, bar_y, size.width as f32, chrome, GLASS_TAB_STRIP)
+            .with_radius(radius)
+            .with_icon(active_x0)
+            .with_lit(active_x1)
+            .with_tint(strip_rgb, strip_alpha),
+    );
+
+    let hovered_tab = match hover {
+        Some(tabs::BarHover::Tab { tab, .. }) => Some(tab),
+        _ => None,
+    };
+    if let Some(index) = hovered_tab
+        && index != bar.selected
+        && let Some(span) = bar.spans.get(index)
+    {
+        let hx0 = f32::from(span.start) * cw + 3.0 * s;
+        let hx1 = f32::from(span.end) * cw - 3.0 * s;
+        let hy0 = bar_y + 3.0 * s;
+        let hh = (tab_h - 6.0 * s).max(1.0);
+        if hx1 - hx0 >= 2.0 {
+            shapes.push(
+                GlassShape::new(hx0, hy0, hx1 - hx0, hh, GLASS_TAB_HOVER)
+                    .with_radius((7.0 * s).min(hh * 0.5))
+                    .with_lit(if light { 0.06 } else { 0.08 }),
+            );
+        }
+    }
+
+    if let Some(tabs::BarHover::Tab { tab, close: true }) = hover
+        && let Some(span) = bar.spans.get(tab)
+        && let Some(col) = span.close
+    {
+        let cx = (f32::from(col) + 0.5) * cw;
+        let cy = bar_y + tab_h * 0.5;
+        let side = (tab_h * 0.62).clamp(16.0 * s, 24.0 * s);
+        shapes.push(
+            GlassShape::new(cx - side * 0.5, cy - side * 0.5, side, side, GLASS_TAB_HOVER)
+                .with_lit(if light { 0.11 } else { 0.14 }),
+        );
+    }
+
+    let div_w = (1.0 * s).max(1.0);
+    let div_h = (tab_h * 0.48).max(8.0);
+    let div_y = bar_y + (tab_h - div_h) * 0.5;
+    let count = bar.spans.len();
+    for index in 1..count {
+        let touch_active = index == bar.selected || index - 1 == bar.selected;
+        let touch_hover = hovered_tab == Some(index) || hovered_tab == Some(index - 1);
+        if !touch_active && !touch_hover {
+            let div_x = (f32::from(bar.spans[index].start) * cw - div_w * 0.5).round();
+            shapes.push(GlassShape::new(div_x, div_y, div_w, div_h, GLASS_DIVIDER));
+        }
+    }
+    if let Some(last) = bar.spans.last()
+        && bar.new_tab.is_some()
+        && count - 1 != bar.selected
+        && hovered_tab != Some(count - 1)
+        && hover != Some(tabs::BarHover::NewTab)
+    {
+        let div_x = (f32::from(last.end) * cw - div_w * 0.5).round();
+        shapes.push(GlassShape::new(div_x, div_y, div_w, div_h, GLASS_DIVIDER));
+    }
+
+    if let Some(range) = &bar.new_tab {
+        let new_tab_hot = hover == Some(tabs::BarHover::NewTab);
+        let cx = (f32::from(range.start) + f32::from(range.end)) * 0.5 * cw;
+        let cy = bar_y + tab_h * 0.5;
+        let side = (tab_h * 0.72).clamp(18.0 * s, 28.0 * s);
+        let plus_color = if new_tab_hot { theme.fg } else { theme.tab_fg };
+        shapes.push(
+            GlassShape::new(cx - side * 0.5, cy - side * 0.5, side, side, GLASS_TAB_HOVER)
+                .with_icon(ICON_PLUS)
+                .with_lit(if new_tab_hot { if light { 0.10 } else { 0.13 } } else { 0.0 })
+                .with_tint(plus_color, if new_tab_hot { 0.96 } else { 0.82 }),
+        );
+    }
+}
+
+/// Computes `(card_rect, text_x, text_y)` for a tab tooltip anchored just above the hovered tab.
+fn tooltip_layout(
+    tooltip: &tabs::TabTooltip,
+    size: PhysicalSize<u32>,
+    bar_h: u32,
+    cell: (f32, f32),
+    scale: f64,
+) -> ([f32; 4], f32, f32) {
+    let s = scale as f32;
+    let pad_x = (10.0 * s).round();
+    let pad_y = (6.0 * s).round();
+    let text_w = f32::from(tooltip.cols) * cell.0;
+    let text_h = f32::from(tooltip.rows) * cell.1;
+    let card_w = text_w + 2.0 * pad_x;
+    let card_h = text_h + 2.0 * pad_y;
+    let margin = (8.0 * s).round();
+    let ideal_x = f32::from(tooltip.anchor_col) * cell.0;
+    let max_x = (size.width as f32 - margin - card_w).max(margin);
+    let card_x = ideal_x.clamp(margin, max_x).round();
+    let bar_y = size.height as f32 - bar_h as f32;
+    let card_y = (bar_y - 8.0 * s - card_h).max(margin).round();
+    ([card_x, card_y, card_w, card_h], card_x + pad_x, card_y + pad_y)
+}
+
+/// Round glass buttons behind the AI limits icon, the settings gear, and each window control.
+#[allow(clippy::too_many_arguments)]
+fn push_glass_title_shapes(
+    shapes: &mut Vec<GlassShape>,
+    title: &TitleBar,
     chrome_h: u32,
     cell_w: u32,
     scale: f64,
@@ -2593,49 +2807,12 @@ fn glass_shapes(
     limits_health: LimitsHealth,
     maximized: bool,
     tune: &crate::settings::GlassTune,
-) -> Vec<GlassShape> {
+) {
     let cw = cell_w as f32;
     let scale = scale as f32;
     let chrome = chrome_h as f32;
     let inset = (tune.inset * scale).round();
     let cap_h = (chrome - 2.0 * inset).max(1.0);
-    let bar_y = size.height as f32 - chrome + inset;
-    // Clear of the window's round corner, which is 15 logical pixels.
-    let side_margin = (tune.margin * scale).round();
-    let mut shapes = Vec::with_capacity(8);
-    if !bar.spans.is_empty() {
-        let x0 = side_margin.min(size.width as f32 * 0.5);
-        let x1 = (size.width as f32 - side_margin).max(x0 + 1.0);
-        let container = GlassShape::new(x0, bar_y, x1 - x0, cap_h, GLASS_CONTAINER);
-        let radius = container.radius;
-        shapes.push(container);
-        // Each tab is an equal slice of the capsule. The pill is that slice inset by
-        // the same gap on every side, so its curve shares a center with the capsule's.
-        let count = bar.spans.len();
-        let seg = (x1 - x0) / count as f32;
-        if let Some(index) = (bar.selected < count).then_some(bar.selected) {
-            let gap = (tune.gap * scale).round();
-            let left = x0 + seg * index as f32 + gap;
-            let right = x0 + seg * (index as f32 + 1.0) - gap;
-            let pill_h = (cap_h - 2.0 * gap).max(1.0);
-            if right - left >= 1.0 {
-                shapes.push(
-                    GlassShape::new(left, bar_y + gap, right - left, pill_h, GLASS_PILL)
-                        .with_radius((radius - gap).max(0.0)),
-                );
-            }
-        }
-        // Subtle vertical hairlines separate adjacent inactive tabs, vanishing beside the active pill.
-        let div_w = (1.0 * scale).max(1.0);
-        let div_h = (cap_h * 0.44).max(6.0);
-        let div_y = bar_y + (cap_h - div_h) * 0.5;
-        for index in 1..count {
-            if index != bar.selected && index - 1 != bar.selected {
-                let div_x = (x0 + seg * index as f32 - div_w * 0.5).round();
-                shapes.push(GlassShape::new(div_x, div_y, div_w, div_h, GLASS_DIVIDER));
-            }
-        }
-    }
     // The addon icon, the gear and the window buttons share one size and one rule for their center.
     let maximize = if maximized { ICON_RESTORE } else { ICON_MAXIMIZE };
     let buttons = [
@@ -2667,7 +2844,6 @@ fn glass_shapes(
             (_, None) => button.lit(settings_lit).with_gear(),
         });
     }
-    shapes
 }
 
 /// A glass sheet behind a block of grid cells `(col, row, cols, rows)`, grown by `pad` pixels.
@@ -2855,6 +3031,24 @@ impl ApplicationHandler<Wake> for App {
                     None
                 };
                 if bar_hover != self.bar_hover {
+                    let prev_tab = match self.bar_hover {
+                        Some(tabs::BarHover::Tab { tab, .. }) => Some(tab),
+                        _ => None,
+                    };
+                    let next_tab = match bar_hover {
+                        Some(tabs::BarHover::Tab { tab, .. }) => Some(tab),
+                        _ => None,
+                    };
+                    if next_tab != prev_tab {
+                        if next_tab.is_some() {
+                            if !self.tooltip_shown {
+                                self.tooltip_at = Some(Instant::now() + TOOLTIP_DELAY);
+                            }
+                        } else {
+                            self.tooltip_shown = false;
+                            self.tooltip_at = None;
+                        }
+                    }
                     self.bar_hover = bar_hover;
                     self.bar_dirty = true;
                     self.redraw();
@@ -2880,7 +3074,11 @@ impl ApplicationHandler<Wake> for App {
                     }
                 }
                 let on_label = self.tab_drag.is_none() && self.hovering_label_edit(position.x, position.y);
-                let on_close = self.tab_drag.is_none() && bar_hover.is_some_and(|item| item.close);
+                let on_bar_btn = self.tab_drag.is_none()
+                    && matches!(
+                        bar_hover,
+                        Some(tabs::BarHover::Tab { close: true, .. } | tabs::BarHover::NewTab)
+                    );
                 let on_popover_hit = self.limits_open
                     && self
                         .cell_at(position.x, position.y)
@@ -2888,7 +3086,7 @@ impl ApplicationHandler<Wake> for App {
                         .is_some();
                 let on_top_btn = self.limits_hot || self.settings_hot;
                 let bar_cursor = on_label
-                    || on_close
+                    || on_bar_btn
                     || on_popover_hit
                     || on_top_btn
                     || (cell.is_none() && matches!(self.hover_icon, CursorIcon::Text | CursorIcon::Pointer));
@@ -2896,7 +3094,7 @@ impl ApplicationHandler<Wake> for App {
                     self.link_cell = cell;
                     let icon = if on_label {
                         CursorIcon::Text
-                    } else if on_close || on_popover_hit || on_top_btn {
+                    } else if on_bar_btn || on_popover_hit || on_top_btn {
                         CursorIcon::Pointer
                     } else if cell.is_some() && self.link_at(position.x, position.y).is_some() {
                         CursorIcon::Pointer
@@ -2915,9 +3113,11 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 let cleared_bar = self.bar_hover.take().is_some();
+                let cleared_tip = std::mem::replace(&mut self.tooltip_shown, false);
+                self.tooltip_at = None;
                 let cleared_settings = std::mem::replace(&mut self.settings_hot, false);
                 let cleared_limits = std::mem::replace(&mut self.limits_hot, false);
-                if cleared_bar || cleared_settings || cleared_limits {
+                if cleared_bar || cleared_tip || cleared_settings || cleared_limits {
                     self.bar_dirty = true;
                     self.redraw();
                 }
@@ -3023,6 +3223,16 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
         }
+        if let Some(at) = self.tooltip_at {
+            if now >= at {
+                self.tooltip_at = None;
+                self.tooltip_shown = true;
+                self.bar_dirty = true;
+                self.redraw();
+            } else {
+                until = until.min(at);
+            }
+        }
         if let Some((at, url)) = self.pending_link.clone() {
             if now >= at {
                 self.pending_link = None;
@@ -3077,7 +3287,7 @@ pub fn run() -> anyhow::Result<()> {
         grid_cols: 80,
         grid_rows: 24,
         bar_dirty: true,
-        bar: Bar { cells: Vec::new(), spans: Vec::new(), selected: 0 },
+        bar: Bar { cells: Vec::new(), spans: Vec::new(), new_tab: None, selected: 0 },
         title_bar: TitleBar {
             cells: Vec::new(),
             minimize: 0..0,
@@ -3100,6 +3310,9 @@ pub fn run() -> anyhow::Result<()> {
         last_limits_cmd: None,
         last_screen_capture: None,
         bar_hover: None,
+        tooltip_shown: false,
+        tooltip_at: None,
+        tooltip_uploaded: false,
         link_cell: None,
         hover_icon: CursorIcon::Default,
         selection: None,
@@ -3154,10 +3367,13 @@ pub fn run() -> anyhow::Result<()> {
 mod tests {
     use super::{
         Mutex, PhysicalSize, ResizeDirection, Scrollbar, Term, bar_contains_y, bar_height,
-        existing_file, glass_bar_height, glass_shapes, publish_frame, resize_edge, strip_col,
+        existing_file, glass_bar_height, publish_frame, push_glass_title_shapes,
+        push_tab_bar_shapes, resize_edge, strip_col, tooltip_layout,
     };
     use crate::desktop::ButtonLayout;
-    use crate::gpu::{GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_PILL, GLASS_SHEET};
+    use crate::gpu::{
+        GLASS_BUTTON, GLASS_DIVIDER, GLASS_SHEET, GLASS_TAB_HOVER, GLASS_TAB_STRIP, ICON_PLUS,
+    };
 
     #[test]
     fn glass_bars_are_taller_than_the_text() {
@@ -3168,16 +3384,17 @@ mod tests {
     }
 
     #[test]
-    fn glass_capsule_holds_the_tabs_and_the_pill_marks_the_active_one() {
+    fn chrome_tab_bar_draws_strip_dividers_and_new_tab_button() {
         let theme = crate::color::theme(0);
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
         let bar = crate::tabs::render_bar(&titles, &[], 1, 100, theme, true);
         let title = crate::titlebar::render("shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, false, true);
         let size = PhysicalSize::new(1000, 600);
-        let shapes = glass_shapes(
-            &bar,
+        let mut shapes = Vec::new();
+        push_tab_bar_shapes(&mut shapes, &bar, None, size, 40, 10, 1.0, theme, true, false);
+        push_glass_title_shapes(
+            &mut shapes,
             &title,
-            size,
             40,
             10,
             1.0,
@@ -3187,86 +3404,49 @@ mod tests {
             false,
             &crate::settings::GlassTune::default(),
         );
+        // Active tab is middle (1): strip + divider after last inactive tab (before '+') + '+' button + 2 title buttons.
         let kinds: Vec<u32> = shapes.iter().map(|shape| shape.kind).collect();
-        assert_eq!(kinds, vec![GLASS_CONTAINER, GLASS_PILL, GLASS_BUTTON, GLASS_BUTTON]);
-        let [container, pill, settings, close] = [shapes[0], shapes[1], shapes[2], shapes[3]];
-        // The capsule sits inside the bottom bar with the same margin on both sides.
-        assert_eq!(container.rect[1], 600.0 - 40.0 + 4.0);
-        assert_eq!(container.rect[3], 32.0);
-        assert_eq!(container.rect[0], 1000.0 - container.rect[0] - container.rect[2]);
-        // The pill is the middle third, inset by the same gap the capsule uses on its curve.
-        let gap = 4.0;
-        let seg = container.rect[2] / 3.0;
-        assert!((pill.rect[0] - (container.rect[0] + seg + gap)).abs() < 0.01);
-        assert!((pill.rect[2] - (seg - 2.0 * gap)).abs() < 0.01);
-        assert_eq!(pill.rect[1], container.rect[1] + gap);
-        assert_eq!(pill.rect[3], container.rect[3] - 2.0 * gap);
-        assert!((pill.radius - (container.radius - gap)).abs() < 0.01);
-        // The gear is a button like close: same circle, same height, one button apart.
-        assert!(settings.lit > 0.0 && settings.icon == crate::gpu::ICON_GEAR && container.icon == 0.0);
+        assert_eq!(kinds, vec![GLASS_TAB_STRIP, GLASS_DIVIDER, GLASS_TAB_HOVER, GLASS_BUTTON, GLASS_BUTTON]);
+        let [strip, divider, plus, settings, close] = [shapes[0], shapes[1], shapes[2], shapes[3], shapes[4]];
+        assert_eq!(strip.rect, [0.0, 560.0, 1000.0, 40.0]);
+        assert_eq!(strip.icon, f32::from(bar.spans[1].start) * 10.0);
+        assert_eq!(strip.lit, f32::from(bar.spans[1].end) * 10.0);
+        assert!((divider.rect[0] - (f32::from(bar.spans[2].end) * 10.0 - 0.5)).abs() < 1.0);
+        assert_eq!(plus.icon, ICON_PLUS);
+        assert!(settings.lit > 0.0 && settings.icon == crate::gpu::ICON_GEAR);
         assert_eq!(close.icon, crate::gpu::ICON_CLOSE);
         assert!(title.cells.iter().all(|cell| cell.cp != u32::from('\u{00D7}')));
         assert_eq!(settings.rect[1..], close.rect[1..]);
         let step = f32::from(title.close.end - title.close.start) * 10.0;
         assert!((close.rect[0] - settings.rect[0] - step).abs() < 0.01);
-        // The close button is a circle around the × in the title bar.
         assert!(close.rect[1] < 40.0 && close.rect[2] == close.rect[3]);
-        let mark = f32::from(title.close.start + 1) * 10.0 + 5.0;
-        assert!((close.rect[0] + close.rect[2] * 0.5 - mark).abs() < 0.01);
     }
 
     #[test]
-    fn glass_end_pills_share_the_capsule_curve() {
+    fn chrome_dividers_vanish_next_to_active_and_hovered_tabs() {
         let theme = crate::color::theme(0);
-        let tune = crate::settings::GlassTune::default();
         let titles = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
-        let title = crate::titlebar::render(
-            "shell", None, 100, theme, false, &ButtonLayout::parse("appmenu:close"), true, false, true,
-        );
         let size = PhysicalSize::new(1000, 600);
-        let track = super::glass_track_cols(100, size.width, 10, tune.margin);
-        assert_eq!(track, (1, 99));
-        for active in [0usize, 2] {
-            let bar = crate::tabs::render_bar_in(&titles, &[], active, 100, theme, true, Some(track), None, &[], None);
-            let shapes = glass_shapes(
-                &bar,
-                &title,
-                size,
-                40,
-                10,
-                1.0,
-                false,
-                false,
-                crate::limits::Health::Ok,
-                false,
-                &tune,
-            );
-            let container = shapes[0];
-            let pill = shapes[1];
-            let dividers: Vec<_> = shapes.iter().filter(|shape| shape.kind == GLASS_DIVIDER).collect();
-            assert_eq!(dividers.len(), 1);
-            let gap = tune.gap;
-            let edge = if active == 0 {
-                container.rect[0] + gap
-            } else {
-                container.rect[0] + container.rect[2] - gap
-            };
-            let pill_edge = if active == 0 { pill.rect[0] } else { pill.rect[0] + pill.rect[2] };
-            assert!((pill_edge - edge).abs() < 0.01, "{active}");
-            let cap = if active == 0 {
-                container.rect[0] + container.radius
-            } else {
-                container.rect[0] + container.rect[2] - container.radius
-            };
-            let pill_cap = if active == 0 {
-                pill.rect[0] + pill.radius
-            } else {
-                pill.rect[0] + pill.rect[2] - pill.radius
-            };
-            assert!((pill_cap - cap).abs() < 0.01, "{active} capsule {cap} pill {pill_cap}");
-            assert_eq!(bar.spans[active].start, if active == 0 { 1 } else { bar.spans[1].end });
-            assert_eq!(bar.spans.last().expect("tabs").end, 99);
-        }
+        // Active = 0 -> divider between 1 and 2, plus divider between 2 and '+' (2 total).
+        let bar = crate::tabs::render_bar(&titles, &[], 0, 100, theme, false);
+        let mut shapes = Vec::new();
+        push_tab_bar_shapes(&mut shapes, &bar, None, size, 36, 10, 1.0, theme, false, false);
+        let dividers: Vec<_> = shapes.iter().filter(|shape| shape.kind == GLASS_DIVIDER).collect();
+        assert_eq!(dividers.len(), 2);
+
+        // Active = 2 (last tab) -> divider only between 0 and 1 (no divider before '+').
+        let bar_last = crate::tabs::render_bar(&titles, &[], 2, 100, theme, false);
+        let mut shapes_last = Vec::new();
+        push_tab_bar_shapes(&mut shapes_last, &bar_last, None, size, 36, 10, 1.0, theme, false, false);
+        let dividers_last: Vec<_> = shapes_last.iter().filter(|shape| shape.kind == GLASS_DIVIDER).collect();
+        assert_eq!(dividers_last.len(), 1);
+
+        // Tooltip stays inside the window and sits above the bottom bar.
+        let tip = crate::tabs::render_tooltip("Full tab title for hover card", 60, 1, theme).expect("tip");
+        let (rect, tx, ty) = tooltip_layout(&tip, size, 36, (10.0, 20.0), 1.0);
+        assert!(rect[0] >= 8.0);
+        assert!(rect[1] + rect[3] < 600.0 - 36.0);
+        assert!(tx > rect[0] && ty > rect[1]);
     }
 
     #[test]

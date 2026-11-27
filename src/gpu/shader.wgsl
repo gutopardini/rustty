@@ -228,6 +228,14 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     }
     var bg = tab_color(in.bg, in.local, in.flags);
     ink = ink * tab_cover(in.local, in.flags);
+    let fade_mode = (in.flags >> 11u) & 3u;
+    if (fade_mode == 1u) {
+        ink = ink * mix(1.0, 0.48, in.local.x);
+    } else if (fade_mode == 2u) {
+        ink = ink * mix(0.48, 0.04, in.local.x);
+    } else if (fade_mode == 3u) {
+        ink = ink * mix(1.0, 0.06, in.local.x);
+    }
     if (u.composer.z != 0u && (in.flags & (CURSOR_CELL | SELECTED | 1u)) == 0u) {
         let pad = vec2<f32>(u.pad_x, u.pad_y);
         let cell_size = vec2<f32>(u.cell_w, u.cell_h);

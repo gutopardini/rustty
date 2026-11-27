@@ -11,9 +11,9 @@ use rustty::confirm;
 use rustty::desktop::ButtonLayout;
 use rustty::font::{Atlas, Face};
 use rustty::gpu::{
-    GlassShape, Renderer, GLASS_BAR, GLASS_BUTTON, GLASS_CONTAINER, GLASS_DIVIDER, GLASS_DOT,
-    GLASS_LIMITS_CARD, GLASS_LIMITS_ICON, GLASS_PILL, GLASS_SHEET, ICON_CLOSE, ICON_LIMITS_CRIT,
-    ICON_LIMITS_OK, ICON_LIMITS_WARN,
+    GlassShape, Renderer, GLASS_BAR, GLASS_BUTTON, GLASS_DIVIDER, GLASS_DOT, GLASS_LIMITS_CARD,
+    GLASS_LIMITS_ICON, GLASS_SHEET, GLASS_TAB_HOVER, GLASS_TAB_STRIP, ICON_CLOSE,
+    ICON_LIMITS_CRIT, ICON_LIMITS_OK, ICON_LIMITS_WARN, ICON_PLUS,
 };
 use rustty::limits::{self, Entry, Health, Popover, Snapshot as LimitsSnapshot, SubLimit};
 use rustty::settings::{self, GlassTune};
@@ -324,7 +324,7 @@ fn render_shot(
     gpu.upload(atlas, face, &snap, false, theme.accent, 0..0);
 
     let bar = tabs::render_bar(titles, agents, active, strip_cols, theme, true);
-    gpu.upload_bar(atlas, face, &bar.cells, theme.bar, theme.bar);
+    gpu.upload_bar(atlas, face, &bar.cells, theme.bar, theme.bar, 4.0);
 
     let title = titlebar::render(
         &titles[active],
@@ -347,6 +347,7 @@ fn render_shot(
         &title,
         chrome_h,
         face.cell_w().max(1),
+        theme,
         matches!(overlay_mode, Overlay::Settings),
         matches!(overlay_mode, Overlay::Limits(_)),
         health,
@@ -450,6 +451,7 @@ fn build_bar_shapes(
     title: &TitleBar,
     chrome_h: u32,
     cell_w: u32,
+    theme: Theme,
     settings_lit: bool,
     limits_lit: bool,
     health: Health,
@@ -459,31 +461,49 @@ fn build_bar_shapes(
     let chrome = chrome_h as f32;
     let inset = tune.inset.round();
     let cap_h = (chrome - 2.0 * inset).max(1.0);
-    let bar_y = HEIGHT as f32 - chrome + inset;
-    let side_margin = tune.margin.round();
+    let bottom_pad = 4.0;
+    let bar_y = HEIGHT as f32 - chrome;
+    let tab_h = (chrome - bottom_pad).max(1.0);
     let mut shapes = Vec::new();
     if !bar.spans.is_empty() {
-        let x0 = side_margin;
-        let x1 = WIDTH as f32 - side_margin;
-        let container = GlassShape::new(x0, bar_y, x1 - x0, cap_h, GLASS_CONTAINER);
-        let radius = container.radius;
-        shapes.push(container);
-        let count = bar.spans.len();
-        let seg = (x1 - x0) / count as f32;
-        let gap = tune.gap.round();
-        let left = x0 + seg * bar.selected as f32 + gap;
-        let right = x0 + seg * (bar.selected as f32 + 1.0) - gap;
+        let (active_x0, active_x1) = bar
+            .spans
+            .get(bar.selected)
+            .map(|span| (f32::from(span.start) * cw, f32::from(span.end) * cw))
+            .unwrap_or((0.0, 0.0));
+        let radius = 9.0_f32.min(tab_h * 0.36).min(active_x0.max(4.0));
         shapes.push(
-            GlassShape::new(left, bar_y + gap, right - left, cap_h - 2.0 * gap, GLASS_PILL)
-                .with_radius((radius - gap).max(0.0)),
+            GlassShape::new(0.0, bar_y, WIDTH as f32, chrome, GLASS_TAB_STRIP)
+                .with_radius(radius)
+                .with_icon(active_x0)
+                .with_lit(active_x1)
+                .with_tint(Rgb::new(0x00, 0x00, 0x00), 0.34),
         );
-        let div_h = (cap_h * 0.44).max(6.0);
-        let div_y = bar_y + (cap_h - div_h) * 0.5;
+        let div_h = (tab_h * 0.48).max(8.0);
+        let div_y = bar_y + (tab_h - div_h) * 0.5;
+        let count = bar.spans.len();
         for index in 1..count {
             if index != bar.selected && index - 1 != bar.selected {
-                let div_x = (x0 + seg * index as f32 - 0.5).round();
+                let div_x = (f32::from(bar.spans[index].start) * cw - 0.5).round();
                 shapes.push(GlassShape::new(div_x, div_y, 1.0, div_h, GLASS_DIVIDER));
             }
+        }
+        if let Some(last) = bar.spans.last()
+            && bar.new_tab.is_some()
+            && count - 1 != bar.selected
+        {
+            let div_x = (f32::from(last.end) * cw - 0.5).round();
+            shapes.push(GlassShape::new(div_x, div_y, 1.0, div_h, GLASS_DIVIDER));
+        }
+        if let Some(range) = &bar.new_tab {
+            let cx = (f32::from(range.start) + f32::from(range.end)) * 0.5 * cw;
+            let cy = bar_y + tab_h * 0.5;
+            let side = (tab_h * 0.72).clamp(18.0, 28.0);
+            shapes.push(
+                GlassShape::new(cx - side * 0.5, cy - side * 0.5, side, side, GLASS_TAB_HOVER)
+                    .with_icon(ICON_PLUS)
+                    .with_tint(theme.tab_fg, 0.82),
+            );
         }
     }
     let lim_icon = health_icon(health);

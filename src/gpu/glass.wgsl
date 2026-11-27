@@ -60,6 +60,9 @@ const LIMITS_ICON: u32 = 5u;
 const LIMITS_CARD: u32 = 6u;
 const BAR: u32 = 7u;
 const DOT: u32 = 8u;
+const TAB_STRIP: u32 = 9u;
+const TAB_HOVER: u32 = 10u;
+const TOOLTIP: u32 = 11u;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -248,6 +251,80 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     // 0 at the top edge of the shape, 1 at the bottom.
     let t = clamp((p.y - shape.rect.y) / max(shape.rect.w, 1.0), 0.0, 1.0);
     let depth = -d;
+
+    if (shape.kind == TAB_STRIP) {
+        let y_top = shape.rect.y;
+        let y_end = shape.rect.y + shape.rect.w;
+        if (p.y < y_top - 0.5 || p.y > y_end + 0.5 || p.x < shape.rect.x || p.x > shape.rect.x + shape.rect.z) {
+            return vec4<f32>(0.0);
+        }
+        let bottom_pad = round(4.0 * s);
+        let y_bot = max(y_end - bottom_pad, y_top + 2.0);
+        let x0 = shape.icon;
+        let x1 = shape.lit;
+        var d_active = p.y - y_top;
+        if (x1 > x0 + 2.0) {
+            let rad = min(shape.radius, min((x1 - x0) * 0.35, (y_bot - y_top) * 0.45));
+            let cx = (x0 + x1) * 0.5;
+            let hx = (x1 - x0) * 0.5;
+            let bx = abs(p.x - cx) - (hx - rad);
+            let by = p.y - (y_bot - rad);
+            let body_d = length(max(vec2<f32>(bx, by), vec2<f32>(0.0))) + min(max(bx, by), 0.0) - rad;
+            let dl = vec2<f32>(p.x - (x0 - rad), (y_top + rad) - p.y);
+            let d_left_bar = length(max(dl, vec2<f32>(0.0))) + min(max(dl.x, dl.y), 0.0) - rad;
+            let dr = vec2<f32>((x1 + rad) - p.x, (y_top + rad) - p.y);
+            let d_right_bar = length(max(dr, vec2<f32>(0.0))) + min(max(dr.x, dr.y), 0.0) - rad;
+            let d_flares = max(-min(d_left_bar, d_right_bar), p.y - (y_top + rad));
+            d_active = min(body_d, d_flares);
+        }
+        let top_clip = clamp(p.y - y_top + 0.5, 0.0, 1.0);
+        let bar_cover = clamp(d_active + 0.5, 0.0, 1.0) * top_clip;
+        let bar_a = shape.tint.a * bar_cover;
+        var out = vec4<f32>(shape.tint.rgb * bar_a, bar_a);
+        let rim_w = 1.0 * s;
+        let rim = (1.0 - smoothstep(0.0, rim_w, abs(d_active))) * top_clip;
+        let rim_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+        let rim_a = rim * select(0.11, 0.13, light);
+        out = over(vec4<f32>(rim_tint * rim_a, rim_a), out);
+        return out;
+    }
+
+    if (shape.kind == TAB_HOVER) {
+        var out = vec4<f32>(0.0);
+        if (shape.lit > 0.005) {
+            let hover_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+            let ha = shape.lit * cover;
+            out = vec4<f32>(hover_tint * ha, ha);
+        }
+        let icon = u32(shape.icon + 0.5);
+        if (icon == 9u) {
+            let side = 2.0 * min(half.x, half.y);
+            let arm = 0.23 * side;
+            let stroke = max(0.078 * side, 1.25 * s);
+            let h = segment_distance(p, center - vec2<f32>(arm, 0.0), center + vec2<f32>(arm, 0.0));
+            let v = segment_distance(p, center - vec2<f32>(0.0, arm), center + vec2<f32>(0.0, arm));
+            let d_plus = min(h, v) - 0.5 * stroke;
+            let mark = clamp(0.5 - d_plus, 0.0, 1.0);
+            let ink_col = select(vec3<f32>(look.ink), shape.tint.rgb, shape.tint.a > 0.0);
+            let base_a = select(look.ink_alpha, shape.tint.a, shape.tint.a > 0.0);
+            let a = mark * base_a;
+            return over(vec4<f32>(ink_col * a, a), out);
+        }
+        return out;
+    }
+
+    if (shape.kind == TOOLTIP) {
+        let spread = max(6.0 * s, 0.001);
+        let d_drop = sd_round(p - vec2<f32>(0.0, 3.0 * s), center, half, r);
+        let drop = (1.0 - smoothstep(-0.3 * spread, spread, d_drop)) * select(0.42, 0.22, light);
+        var card = vec4<f32>(0.0, 0.0, 0.0, drop * (1.0 - cover));
+        let body = vec4<f32>(shape.tint.rgb * shape.tint.a, shape.tint.a) * cover;
+        card = over(body, card);
+        let border_tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);
+        let rim = (1.0 - smoothstep(0.0, 1.05 * s, abs(d))) * select(0.15, 0.16, light);
+        card = over(vec4<f32>(border_tint * rim, rim), card);
+        return card;
+    }
 
     if (shape.kind == DIVIDER) {
         let tint = select(vec3<f32>(1.0), vec3<f32>(0.0), light);

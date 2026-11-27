@@ -22,6 +22,12 @@ pub const LIMITS_CARD: u32 = 6;
 pub const BAR: u32 = 7;
 /// Crisp colored status dot (`icon > 0.5` = subtle glass glow).
 pub const DOT: u32 = 8;
+/// Full-width Chrome-style bottom tab strip with inverted concave fillets for the active tab.
+pub const TAB_STRIP: u32 = 9;
+/// Subtle hover highlight for inactive tabs, circular close/new-tab buttons (and vector `+`).
+pub const TAB_HOVER: u32 = 10;
+/// Floating tooltip card anchored above a hovered tab.
+pub const TOOLTIP: u32 = 11;
 
 pub const ICON_NONE: f32 = 0.0;
 pub const ICON_GEAR: f32 = 1.0;
@@ -32,8 +38,9 @@ pub const ICON_RESTORE: f32 = 5.0;
 pub const ICON_LIMITS_OK: f32 = 6.0;
 pub const ICON_LIMITS_WARN: f32 = 7.0;
 pub const ICON_LIMITS_CRIT: f32 = 8.0;
+pub const ICON_PLUS: f32 = 9.0;
 
-const MAX_SHAPES: usize = 64;
+const MAX_SHAPES: usize = 128;
 
 /// A rounded rectangle in physical pixels.
 #[repr(C)]
@@ -83,6 +90,11 @@ impl GlassShape {
 
     pub fn with_amount(mut self, value: f32) -> Self {
         self.lit = value.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn with_lit(mut self, value: f32) -> Self {
+        self.lit = value;
         self
     }
 }

@@ -4,7 +4,7 @@
 
 A performance-focused CLI for LLMs. Written in Rust, drawn on the GPU, with the NPU on the roadmap.
 
-<img src="docs/rustty-glass.png?v=2" alt="Rustty in Glass mode" width="820">
+<img src="docs/rustty-glass.png?v=3" alt="Rustty in Glass mode" width="820">
 
 </div>
 
@@ -22,11 +22,11 @@ The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. 
 
 <div align="center">
 
-<img src="docs/rustty-appearance.png?v=2" alt="Appearance panel with Glass mode on and the Ink style" width="820">
+<img src="docs/rustty-appearance.png?v=3" alt="Appearance panel with Glass mode on and the Ink style" width="820">
 
 </div>
 
-The same panel turns on **Glass mode**. The window becomes translucent and the desktop behind it is blurred by the compositor through `ext-background-effect-v1`, which GNOME 51 and Plasma 6.7 offer. The tabs sit in a glass capsule, the active one in a pill, and the gear and window buttons become round glass. The shapes are drawn in a shader. Text and explicit colors stay opaque. With Glass mode off, the window is opaque.
+The same panel turns on **Glass mode**. The window becomes translucent and the desktop behind it is blurred by the compositor through `ext-background-effect-v1`, which GNOME 51 and Plasma 6.7 offer. The bottom tab bar adopts compact, Chrome-inspired tabs with concave curves connecting the active tab seamlessly to the terminal, subtle dividers, a `+` new-tab button, smooth title overflow fade, and hover tooltips, while the top bar controls become round glass. The shapes are drawn in a shader. Text and explicit colors stay opaque. With Glass mode off, the window is opaque.
 
 With Glass mode on, **Look** in that panel opens the glass controls. `[-]` and `[+]` change the value for the style on screen, and the window follows at once. **Restore default** puts every glass value back. The same values are stored in `ui.conf`. A pair there is the dark theme, then the light theme.
 
@@ -38,7 +38,7 @@ The window is a grid of cells, not a texture of the whole frame. A dirty row is 
 
 <div align="center">
 
-<img src="docs/rustty-agents.png?v=2" alt="Tabs for Claude, Codex, Antigravity, and Cursor Agent" width="820">
+<img src="docs/rustty-agents.png?v=3" alt="Tabs for Claude, Codex, Antigravity, and Cursor Agent" width="820">
 
 </div>
 
@@ -50,7 +50,7 @@ Next to the settings gear sits a colored three-layer icon (`Ctrl+Shift+L`). Its 
 
 <div align="center">
 
-<img src="docs/rustty-limits.png" alt="AI Limits popover in Glass mode showing Claude, Codex, Gemini, and Cursor quotas" width="820">
+<img src="docs/rustty-limits.png?v=3" alt="AI Limits popover in Glass mode showing Claude, Codex, Gemini, and Cursor quotas" width="820">
 
 </div>
 
@@ -118,7 +118,7 @@ The close button on the title bar asks before it closes the window when more tha
 
 <div align="center">
 
-<img src="docs/rustty-close.png?v=2" alt="Confirmation before closing three open tabs" width="820">
+<img src="docs/rustty-close.png?v=3" alt="Confirmation before closing three open tabs" width="820">
 
 </div>
 

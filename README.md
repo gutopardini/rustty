@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/brand/rustty-lockup.svg?v=4" alt="Rustty" width="280">
+<img src="assets/brand/rustty-lockup.svg?v=5" alt="Rustty" width="280">
 
 A performance-focused CLI for LLMs. Written in Rust, drawn on the GPU, with the NPU on the roadmap.
 
-<img src="docs/rustty-glass.png?v=4" alt="Rustty in Glass mode" width="820">
+<img src="docs/rustty-glass.png?v=5" alt="Rustty in Glass mode" width="820">
 
 </div>
 
@@ -18,7 +18,7 @@ Each tab is its own shell. The starting directory is `cwd` in `~/.config/rustty/
 rustty
 ```
 
-The gear at the end of the tab strip, or `Ctrl+,`, opens font, size, and theme. The choice is stored in the same file.
+The gear in the title bar, or `Ctrl+,`, opens font, size, and theme. The choice is stored in the same file.
 
 <div align="center">
 
@@ -50,7 +50,7 @@ Next to the settings gear sits a colored three-layer icon (`Ctrl+Shift+L`). Its 
 
 <div align="center">
 
-<img src="docs/rustty-limits.png?v=4" alt="AI Limits popover in Glass mode showing Claude, Codex, Gemini, and Cursor quotas" width="820">
+<img src="docs/rustty-limits.png?v=5" alt="AI Limits popover in Glass mode showing Claude, Codex, Gemini, and Cursor quotas" width="820">
 
 </div>
 

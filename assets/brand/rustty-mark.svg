@@ -1,4 +1,4 @@
 <?xml version='1.0' encoding='utf-8'?>
-<svg xmlns="http://www.w3.org/2000/svg" width="280" height="224" viewBox="124 144 272 224" role="img" aria-labelledby="title"><title id="title">Rustty mark</title><path d="M150 168 L266 242 C276 248 276 264 266 270 L150 344 L150 307 L230 256 L150 205 Z" fill="#f0a77d" />
-  <rect x="306" y="168" width="64" height="176" rx="13" fill="#f0a77d" />
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="224" viewBox="124 144 272 224" role="img" aria-labelledby="title"><title id="title">Rustty mark</title><path d="M144 162 L268 241 C279 248 279 264 268 271 L144 350 L144 310 L230 256 L144 202 Z" fill="#f0a77d" />
+  <rect x="306" y="162" width="66" height="188" rx="14" fill="#f0a77d" />
 </svg>

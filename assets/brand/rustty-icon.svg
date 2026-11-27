@@ -15,36 +15,36 @@
       <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
     </radialGradient>
 
-    <!-- Lower subtle warm copper glass depth -->
-    <radialGradient id="copperAmbient" cx="210" cy="264" r="158" gradientUnits="userSpaceOnUse">
+    <!-- Warm copper ambient glow inside the glass -->
+    <radialGradient id="copperAmbient" cx="206" cy="262" r="165" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#ff8a4c" stop-opacity="0.34"/>
       <stop offset="55%" stop-color="#e56b38" stop-opacity="0.10"/>
       <stop offset="100%" stop-color="#e56b38" stop-opacity="0"/>
     </radialGradient>
 
     <!-- Right-side cool cyan ambient bounce -->
-    <radialGradient id="cyanAmbient" cx="348" cy="256" r="146" gradientUnits="userSpaceOnUse">
+    <radialGradient id="cyanAmbient" cx="352" cy="256" r="150" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#4fdcff" stop-opacity="0.24"/>
       <stop offset="55%" stop-color="#38bdf8" stop-opacity="0.07"/>
       <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
     </radialGradient>
 
     <!-- Corner ambient edge tints inside the squircle -->
-    <radialGradient id="tlCyan" cx="70" cy="70" r="210" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.30"/>
+    <radialGradient id="tlCyan" cx="56" cy="56" r="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.34"/>
       <stop offset="100%" stop-color="#67e8f9" stop-opacity="0"/>
     </radialGradient>
-    <radialGradient id="trViolet" cx="445" cy="85" r="200" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#b282ff" stop-opacity="0.24"/>
+    <radialGradient id="trViolet" cx="456" cy="76" r="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#b282ff" stop-opacity="0.26"/>
       <stop offset="100%" stop-color="#b282ff" stop-opacity="0"/>
     </radialGradient>
-    <radialGradient id="brCopper" cx="440" cy="440" r="215" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#f7a274" stop-opacity="0.30"/>
+    <radialGradient id="brCopper" cx="452" cy="452" r="225" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f7a274" stop-opacity="0.32"/>
       <stop offset="100%" stop-color="#f7a274" stop-opacity="0"/>
     </radialGradient>
 
     <!-- Iridescent Liquid Glass rim: cyan -> violet -> warm copper -->
-    <linearGradient id="rimMain" x1="48" y1="48" x2="464" y2="464" gradientUnits="userSpaceOnUse">
+    <linearGradient id="rimMain" x1="36" y1="36" x2="476" y2="476" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#7ef0ff"/>
       <stop offset="28%" stop-color="#60c5ff"/>
       <stop offset="56%" stop-color="#ad89fa"/>
@@ -53,49 +53,49 @@
     </linearGradient>
 
     <!-- Cross-diagonal sheen so top-right leans violet and bottom-left leans cool indigo -->
-    <linearGradient id="rimCross" x1="464" y1="48" x2="48" y2="464" gradientUnits="userSpaceOnUse">
+    <linearGradient id="rimCross" x1="476" y1="36" x2="36" y2="476" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#c49bff" stop-opacity="0.92"/>
       <stop offset="35%" stop-color="#a78bfa" stop-opacity="0.15"/>
       <stop offset="65%" stop-color="#6396f8" stop-opacity="0.15"/>
       <stop offset="100%" stop-color="#9ca6ff" stop-opacity="0.88"/>
     </linearGradient>
 
-    <!-- Specular thin glass highlight on top/bottom rim -->
-    <linearGradient id="rimSpec" x1="72" y1="36" x2="440" y2="476" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#d8fbff" stop-opacity="0.95"/>
-      <stop offset="32%" stop-color="#c4b5fd" stop-opacity="0.55"/>
-      <stop offset="68%" stop-color="#e2a896" stop-opacity="0.45"/>
-      <stop offset="100%" stop-color="#ffe0c9" stop-opacity="0.90"/>
+    <!-- Crisp specular rim highlight -->
+    <linearGradient id="rimSpec" x1="60" y1="32" x2="452" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#e0fcff" stop-opacity="0.95"/>
+      <stop offset="34%" stop-color="#c4b5fd" stop-opacity="0.58"/>
+      <stop offset="68%" stop-color="#e2a896" stop-opacity="0.48"/>
+      <stop offset="100%" stop-color="#ffe4cf" stop-opacity="0.92"/>
     </linearGradient>
 
     <!-- Molten copper prompt chevron -->
-    <linearGradient id="copperPrompt" x1="146" y1="162" x2="278" y2="348" gradientUnits="userSpaceOnUse">
+    <linearGradient id="copperPrompt" x1="142" y1="158" x2="278" y2="354" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#ffe2c6"/>
       <stop offset="38%" stop-color="#ffa975"/>
       <stop offset="74%" stop-color="#ea7e4d"/>
       <stop offset="100%" stop-color="#c95b32"/>
     </linearGradient>
-    <linearGradient id="copperEdge" x1="146" y1="162" x2="278" y2="348" gradientUnits="userSpaceOnUse">
+    <linearGradient id="copperEdge" x1="142" y1="158" x2="278" y2="354" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#fff1e2" stop-opacity="0.95"/>
       <stop offset="50%" stop-color="#ffc096" stop-opacity="0.72"/>
       <stop offset="100%" stop-color="#ff9966" stop-opacity="0.55"/>
     </linearGradient>
 
     <!-- Frosted translucent block cursor catching warm copper (left) and cool cyan (right) -->
-    <linearGradient id="cursorFill" x1="306" y1="166" x2="372" y2="346" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#dce7f5" stop-opacity="0.30"/>
-      <stop offset="48%" stop-color="#8b9ab2" stop-opacity="0.22"/>
-      <stop offset="100%" stop-color="#7ce5ff" stop-opacity="0.36"/>
+    <linearGradient id="cursorFill" x1="306" y1="162" x2="374" y2="350" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#dce7f5" stop-opacity="0.32"/>
+      <stop offset="48%" stop-color="#8b9ab2" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#7ce5ff" stop-opacity="0.40"/>
     </linearGradient>
-    <linearGradient id="cursorRim" x1="306" y1="166" x2="372" y2="346" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#ffd9bd" stop-opacity="0.78"/>
-      <stop offset="45%" stop-color="#c8d8ee" stop-opacity="0.55"/>
-      <stop offset="100%" stop-color="#80ecff" stop-opacity="0.95"/>
+    <linearGradient id="cursorRim" x1="306" y1="162" x2="374" y2="350" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffd9bd" stop-opacity="0.80"/>
+      <stop offset="45%" stop-color="#c8d8ee" stop-opacity="0.58"/>
+      <stop offset="100%" stop-color="#80ecff" stop-opacity="0.96"/>
     </linearGradient>
 
-    <!-- Soft glows -->
-    <filter id="rimGlow" x="-14%" y="-14%" width="128%" height="128%">
-      <feGaussianBlur stdDeviation="5.5"/>
+    <!-- Internal soft glows (stay cleanly clipped inside the squircle) -->
+    <filter id="innerRimGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="8"/>
     </filter>
     <filter id="promptGlow" x="-30%" y="-30%" width="160%" height="160%">
       <feGaussianBlur stdDeviation="11"/>
@@ -105,39 +105,39 @@
     </filter>
 
     <clipPath id="squircleClip">
-      <rect x="40" y="40" width="432" height="432" rx="108"/>
+      <rect x="32" y="32" width="448" height="448" rx="112"/>
     </clipPath>
   </defs>
 
-  <!-- Soft iridescent outer halo -->
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimMain)" stroke-width="11" opacity="0.46" filter="url(#rimGlow)"/>
-
-  <!-- Frosted obsidian squircle body + internal reflections -->
+  <!-- Everything cleanly clipped inside one exact rounded squircle: razor-smooth edges at every size -->
   <g clip-path="url(#squircleClip)">
-    <rect x="40" y="40" width="432" height="432" fill="url(#glassBody)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#tlCyan)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#trViolet)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#brCopper)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#topFrost)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#copperAmbient)"/>
-    <rect x="40" y="40" width="432" height="432" fill="url(#cyanAmbient)"/>
-    <!-- Subtle inner glass bezel depth -->
-    <rect x="49" y="49" width="414" height="414" rx="99" fill="none" stroke="#000000" stroke-width="7" opacity="0.28"/>
-    <rect x="46" y="46" width="420" height="420" rx="102" fill="none" stroke="url(#rimSpec)" stroke-width="2.4" opacity="0.58"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#glassBody)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#tlCyan)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#trViolet)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#brCopper)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#topFrost)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#copperAmbient)"/>
+    <rect x="32" y="32" width="448" height="448" fill="url(#cyanAmbient)"/>
+
+    <!-- Soft luminous inner glass refraction around the rim -->
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimMain)" stroke-width="22" opacity="0.45" filter="url(#innerRimGlow)"/>
+
+    <!-- Subtle inner glass groove for thickness -->
+    <rect x="46" y="46" width="420" height="420" rx="98" fill="none" stroke="#000000" stroke-width="8" opacity="0.30"/>
+
+    <!-- Iridescent liquid-glass bezel flush to the exact outer squircle edge -->
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimMain)" stroke-width="24"/>
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimCross)" stroke-width="24" opacity="0.52"/>
+    <rect x="34" y="34" width="444" height="444" rx="110" fill="none" stroke="url(#rimSpec)" stroke-width="3.5" opacity="0.90"/>
+
+    <!-- Warm glow under the molten copper prompt -->
+    <path d="M144 162 L268 241 C279 248 279 264 268 271 L144 350 L144 310 L230 256 L144 202 Z" fill="#ff8447" opacity="0.62" filter="url(#promptGlow)"/>
+
+    <!-- Subtle cyan glow under the frosted glass block cursor -->
+    <rect x="306" y="162" width="66" height="188" rx="14" fill="#5ee7ff" opacity="0.32" filter="url(#cursorGlow)"/>
   </g>
 
-  <!-- Crisp iridescent liquid-glass bezel -->
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimMain)" stroke-width="12"/>
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimCross)" stroke-width="12" opacity="0.52"/>
-  <rect x="37" y="37" width="438" height="438" rx="111" fill="none" stroke="url(#rimSpec)" stroke-width="2.6" opacity="0.88"/>
-
-  <!-- Warm glow under the molten copper prompt -->
-  <path d="M150 168 L266 242 C276 248 276 264 266 270 L150 344 L150 307 L230 256 L150 205 Z" fill="#ff8447" opacity="0.62" filter="url(#promptGlow)"/>
-
-  <!-- Subtle cyan glow under the frosted glass block cursor -->
-  <rect x="306" y="168" width="64" height="176" rx="13" fill="#5ee7ff" opacity="0.30" filter="url(#cursorGlow)"/>
-
   <!-- Main prompt & cursor elements (referenced by render-brand-assets.sh) -->
-  <path id="prompt" d="M150 168 L266 242 C276 248 276 264 266 270 L150 344 L150 307 L230 256 L150 205 Z" fill="url(#copperPrompt)" stroke="url(#copperEdge)" stroke-width="2.5" stroke-linejoin="round"/>
-  <rect id="cursor" x="306" y="168" width="64" height="176" rx="13" fill="url(#cursorFill)" stroke="url(#cursorRim)" stroke-width="3.6"/>
+  <path id="prompt" d="M144 162 L268 241 C279 248 279 264 268 271 L144 350 L144 310 L230 256 L144 202 Z" fill="url(#copperPrompt)" stroke="url(#copperEdge)" stroke-width="2.5" stroke-linejoin="round"/>
+  <rect id="cursor" x="306" y="162" width="66" height="188" rx="14" fill="url(#cursorFill)" stroke="url(#cursorRim)" stroke-width="4"/>
 </svg>

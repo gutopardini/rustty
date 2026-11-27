@@ -16,35 +16,35 @@
     </radialGradient>
 
     
-    <radialGradient id="copperAmbient" cx="210" cy="264" r="158" gradientUnits="userSpaceOnUse">
+    <radialGradient id="copperAmbient" cx="206" cy="262" r="165" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#ff8a4c" stop-opacity="0.34" />
       <stop offset="55%" stop-color="#e56b38" stop-opacity="0.10" />
       <stop offset="100%" stop-color="#e56b38" stop-opacity="0" />
     </radialGradient>
 
     
-    <radialGradient id="cyanAmbient" cx="348" cy="256" r="146" gradientUnits="userSpaceOnUse">
+    <radialGradient id="cyanAmbient" cx="352" cy="256" r="150" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#4fdcff" stop-opacity="0.24" />
       <stop offset="55%" stop-color="#38bdf8" stop-opacity="0.07" />
       <stop offset="100%" stop-color="#38bdf8" stop-opacity="0" />
     </radialGradient>
 
     
-    <radialGradient id="tlCyan" cx="70" cy="70" r="210" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.30" />
+    <radialGradient id="tlCyan" cx="56" cy="56" r="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.34" />
       <stop offset="100%" stop-color="#67e8f9" stop-opacity="0" />
     </radialGradient>
-    <radialGradient id="trViolet" cx="445" cy="85" r="200" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#b282ff" stop-opacity="0.24" />
+    <radialGradient id="trViolet" cx="456" cy="76" r="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#b282ff" stop-opacity="0.26" />
       <stop offset="100%" stop-color="#b282ff" stop-opacity="0" />
     </radialGradient>
-    <radialGradient id="brCopper" cx="440" cy="440" r="215" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#f7a274" stop-opacity="0.30" />
+    <radialGradient id="brCopper" cx="452" cy="452" r="225" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f7a274" stop-opacity="0.32" />
       <stop offset="100%" stop-color="#f7a274" stop-opacity="0" />
     </radialGradient>
 
     
-    <linearGradient id="rimMain" x1="48" y1="48" x2="464" y2="464" gradientUnits="userSpaceOnUse">
+    <linearGradient id="rimMain" x1="36" y1="36" x2="476" y2="476" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#7ef0ff" />
       <stop offset="28%" stop-color="#60c5ff" />
       <stop offset="56%" stop-color="#ad89fa" />
@@ -53,7 +53,7 @@
     </linearGradient>
 
     
-    <linearGradient id="rimCross" x1="464" y1="48" x2="48" y2="464" gradientUnits="userSpaceOnUse">
+    <linearGradient id="rimCross" x1="476" y1="36" x2="36" y2="476" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#c49bff" stop-opacity="0.92" />
       <stop offset="35%" stop-color="#a78bfa" stop-opacity="0.15" />
       <stop offset="65%" stop-color="#6396f8" stop-opacity="0.15" />
@@ -61,41 +61,41 @@
     </linearGradient>
 
     
-    <linearGradient id="rimSpec" x1="72" y1="36" x2="440" y2="476" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#d8fbff" stop-opacity="0.95" />
-      <stop offset="32%" stop-color="#c4b5fd" stop-opacity="0.55" />
-      <stop offset="68%" stop-color="#e2a896" stop-opacity="0.45" />
-      <stop offset="100%" stop-color="#ffe0c9" stop-opacity="0.90" />
+    <linearGradient id="rimSpec" x1="60" y1="32" x2="452" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#e0fcff" stop-opacity="0.95" />
+      <stop offset="34%" stop-color="#c4b5fd" stop-opacity="0.58" />
+      <stop offset="68%" stop-color="#e2a896" stop-opacity="0.48" />
+      <stop offset="100%" stop-color="#ffe4cf" stop-opacity="0.92" />
     </linearGradient>
 
     
-    <linearGradient id="copperPrompt" x1="146" y1="162" x2="278" y2="348" gradientUnits="userSpaceOnUse">
+    <linearGradient id="copperPrompt" x1="142" y1="158" x2="278" y2="354" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#ffe2c6" />
       <stop offset="38%" stop-color="#ffa975" />
       <stop offset="74%" stop-color="#ea7e4d" />
       <stop offset="100%" stop-color="#c95b32" />
     </linearGradient>
-    <linearGradient id="copperEdge" x1="146" y1="162" x2="278" y2="348" gradientUnits="userSpaceOnUse">
+    <linearGradient id="copperEdge" x1="142" y1="158" x2="278" y2="354" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#fff1e2" stop-opacity="0.95" />
       <stop offset="50%" stop-color="#ffc096" stop-opacity="0.72" />
       <stop offset="100%" stop-color="#ff9966" stop-opacity="0.55" />
     </linearGradient>
 
     
-    <linearGradient id="cursorFill" x1="306" y1="166" x2="372" y2="346" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#dce7f5" stop-opacity="0.30" />
-      <stop offset="48%" stop-color="#8b9ab2" stop-opacity="0.22" />
-      <stop offset="100%" stop-color="#7ce5ff" stop-opacity="0.36" />
+    <linearGradient id="cursorFill" x1="306" y1="162" x2="374" y2="350" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#dce7f5" stop-opacity="0.32" />
+      <stop offset="48%" stop-color="#8b9ab2" stop-opacity="0.24" />
+      <stop offset="100%" stop-color="#7ce5ff" stop-opacity="0.40" />
     </linearGradient>
-    <linearGradient id="cursorRim" x1="306" y1="166" x2="372" y2="346" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#ffd9bd" stop-opacity="0.78" />
-      <stop offset="45%" stop-color="#c8d8ee" stop-opacity="0.55" />
-      <stop offset="100%" stop-color="#80ecff" stop-opacity="0.95" />
+    <linearGradient id="cursorRim" x1="306" y1="162" x2="374" y2="350" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffd9bd" stop-opacity="0.80" />
+      <stop offset="45%" stop-color="#c8d8ee" stop-opacity="0.58" />
+      <stop offset="100%" stop-color="#80ecff" stop-opacity="0.96" />
     </linearGradient>
 
     
-    <filter id="rimGlow" x="-14%" y="-14%" width="128%" height="128%">
-      <feGaussianBlur stdDeviation="5.5" />
+    <filter id="innerRimGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur stdDeviation="8" />
     </filter>
     <filter id="promptGlow" x="-30%" y="-30%" width="160%" height="160%">
       <feGaussianBlur stdDeviation="11" />
@@ -105,40 +105,40 @@
     </filter>
 
     <clipPath id="squircleClip">
-      <rect x="40" y="40" width="432" height="432" rx="108" />
+      <rect x="32" y="32" width="448" height="448" rx="112" />
     </clipPath>
   </defs>
 
   
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimMain)" stroke-width="11" opacity="0.46" filter="url(#rimGlow)" />
-
-  
   <g clip-path="url(#squircleClip)">
-    <rect x="40" y="40" width="432" height="432" fill="url(#glassBody)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#tlCyan)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#trViolet)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#brCopper)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#topFrost)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#copperAmbient)" />
-    <rect x="40" y="40" width="432" height="432" fill="url(#cyanAmbient)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#glassBody)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#tlCyan)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#trViolet)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#brCopper)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#topFrost)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#copperAmbient)" />
+    <rect x="32" y="32" width="448" height="448" fill="url(#cyanAmbient)" />
+
     
-    <rect x="49" y="49" width="414" height="414" rx="99" fill="none" stroke="#000000" stroke-width="7" opacity="0.28" />
-    <rect x="46" y="46" width="420" height="420" rx="102" fill="none" stroke="url(#rimSpec)" stroke-width="2.4" opacity="0.58" />
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimMain)" stroke-width="22" opacity="0.45" filter="url(#innerRimGlow)" />
+
+    
+    <rect x="46" y="46" width="420" height="420" rx="98" fill="none" stroke="#000000" stroke-width="8" opacity="0.30" />
+
+    
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimMain)" stroke-width="24" />
+    <rect x="32" y="32" width="448" height="448" rx="112" fill="none" stroke="url(#rimCross)" stroke-width="24" opacity="0.52" />
+    <rect x="34" y="34" width="444" height="444" rx="110" fill="none" stroke="url(#rimSpec)" stroke-width="3.5" opacity="0.90" />
+
+    
+    <path d="M144 162 L268 241 C279 248 279 264 268 271 L144 350 L144 310 L230 256 L144 202 Z" fill="#ff8447" opacity="0.62" filter="url(#promptGlow)" />
+
+    
+    <rect x="306" y="162" width="66" height="188" rx="14" fill="#5ee7ff" opacity="0.32" filter="url(#cursorGlow)" />
   </g>
 
   
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimMain)" stroke-width="12" />
-  <rect x="40" y="40" width="432" height="432" rx="108" fill="none" stroke="url(#rimCross)" stroke-width="12" opacity="0.52" />
-  <rect x="37" y="37" width="438" height="438" rx="111" fill="none" stroke="url(#rimSpec)" stroke-width="2.6" opacity="0.88" />
-
-  
-  <path d="M150 168 L266 242 C276 248 276 264 266 270 L150 344 L150 307 L230 256 L150 205 Z" fill="#ff8447" opacity="0.62" filter="url(#promptGlow)" />
-
-  
-  <rect x="306" y="168" width="64" height="176" rx="13" fill="#5ee7ff" opacity="0.30" filter="url(#cursorGlow)" />
-
-  
-  <path id="prompt" d="M150 168 L266 242 C276 248 276 264 266 270 L150 344 L150 307 L230 256 L150 205 Z" fill="url(#copperPrompt)" stroke="url(#copperEdge)" stroke-width="2.5" stroke-linejoin="round" />
-  <rect id="cursor" x="306" y="168" width="64" height="176" rx="13" fill="url(#cursorFill)" stroke="url(#cursorRim)" stroke-width="3.6" />
+  <path id="prompt" d="M144 162 L268 241 C279 248 279 264 268 271 L144 350 L144 310 L230 256 L144 202 Z" fill="url(#copperPrompt)" stroke="url(#copperEdge)" stroke-width="2.5" stroke-linejoin="round" />
+  <rect id="cursor" x="306" y="162" width="66" height="188" rx="14" fill="url(#cursorFill)" stroke="url(#cursorRim)" stroke-width="4" />
 </svg><g transform="translate(280 38)" fill="#edeae4"><path d="M8.06 140 L25.19 140 L25.19 91.23 C28.94 83.33 35.56 79 43.77 79 C46.94 79 50.25 79.58 52.98 80.73 L52.98 66 C50.97 64.61 48.81 64.31 45.2 64.17 C36.72 64.17 29.8 68.06 25.19 74.83 L25.19 66 L8.06 66 Z M92.86 141 C101.34 141 108.69 138.27 114.31 132.8 L114.31 140 L131.45 140 L131.45 66 L114.31 66 L114.31 118.14 C110.56 123.19 104.95 126.31 97.61 126.31 C87.23 126.31 80.61 119.62 80.61 109.2 L80.61 66 L63.62 66 L63.62 111.78 C63.62 128.91 75.58 141 92.86 141 Z M174.7 141 C192.84 141 206.52 130.78 206.52 117.3 C206.52 105.84 198.59 98.77 183.91 96.64 L170.09 94.66 C162.17 93.53 159 91.27 159 86.45 C159 81.5 164.33 77.97 172.25 77.97 C180.02 77.97 187.38 80.38 195.44 85.33 L203.78 74.38 C194.56 68.03 184.48 65 173.69 65 C155.55 65 143.73 74.08 143.73 87.73 C143.73 99.47 151.38 106.55 166.06 108.67 L179.88 110.64 C187.22 111.64 190.39 114.19 190.39 118.72 C190.39 124.23 184.06 128.05 174.41 128.05 C166.34 128.05 158.42 125.08 150.36 119.28 L141.44 130.5 C149.78 137.27 161.59 141 174.7 141 Z M250.61 141 C254.92 141 260.97 140.28 265 138.98 L265 124.89 C261.27 126.17 258.39 126.61 254.5 126.61 C246.86 126.61 243.98 123.89 243.98 116.59 L243.98 80.27 L265.44 80.27 L265.44 66 L243.98 66 L243.98 43.11 L226.98 47 L226.98 66 L211.58 66 L211.58 80.27 L226.98 80.27 L226.98 120.31 C226.98 133.95 235.2 141 250.61 141 Z M309.61 141 C313.92 141 319.97 140.28 324 138.98 L324 124.89 C320.27 126.17 317.39 126.61 313.5 126.61 C305.86 126.61 302.98 123.89 302.98 116.59 L302.98 80.27 L324.44 80.27 L324.44 66 L302.98 66 L302.98 43.11 L285.98 47 L285.98 66 L270.58 66 L270.58 80.27 L285.98 80.27 L285.98 120.31 C285.98 133.95 294.2 141 309.61 141 Z M341.25 170.73 C356.08 170.73 364.58 164.25 371.78 147.3 L406.91 66 L388.48 66 L366.16 119.34 L346 66 L327.14 66 L356.52 140.27 L354.36 145.28 C351.47 152.31 346.58 155.75 339.66 155.75 C336.78 155.75 335.06 155.61 333.05 155.17 L333.05 170 C334.91 170.44 337.94 170.73 341.25 170.73 Z M407 140" />
 </g></svg>

@@ -14,7 +14,7 @@ from PIL import Image
 # filtering keeps smooth antialiased edges without bleeding into neighboring tiles.
 TILE = 64
 CONTENT = 58
-ALPHA_CLIP = 8
+ALPHA_CLIP = 1
 
 
 def content_box(image):

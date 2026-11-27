@@ -23,14 +23,16 @@ cursor = icon.find(f"{{{svg}}}rect[@id='cursor']")
 if prompt is None or cursor is None:
     raise SystemExit("The icon needs the prompt and cursor elements")
 mark = ET.Element(f"{{{svg}}}svg", {
-    "width": "320", "height": "220", "viewBox": "96 146 310 220",
+    "width": "280", "height": "224", "viewBox": "124 144 272 224",
     "role": "img", "aria-labelledby": "title",
 })
 ET.SubElement(mark, f"{{{svg}}}title", {"id": "title"}).text = "Rustty mark"
 for original in (prompt, cursor):
     shape = copy.deepcopy(original)
     shape.attrib.pop("id", None)
-    shape.set("fill", cursor.get("fill", "#f0a77d"))
+    for attr in ("stroke", "stroke-width", "stroke-linejoin", "filter"):
+        shape.attrib.pop(attr, None)
+    shape.set("fill", "#f0a77d")
     mark.append(shape)
 ET.ElementTree(mark).write(brand / "rustty-mark.svg", encoding="unicode", xml_declaration=True)
 
